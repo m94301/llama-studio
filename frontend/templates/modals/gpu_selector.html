@@ -1,38 +1,94 @@
 <!-- frontend/templates/modals/gpu_selector.html -->
 {% extends "base_modal.html" %}
-{% set title = "Load to which GPU?" %}
+{% set title = "Load to which GPU(s)?" %}
 {% set width = "md" %}
-
 {% block content %}
 <p class="text-sm text-gray-300 mb-6">
     Loading: <span class="font-bold text-blue-400">{{ display_name }}</span>
 </p>
-<div class="space-y-2 mb-6">
+<div class="space-y-2 mb-4" id="gpu-checkbox-list">
     {% for gpu_id, gpu in gpu_data.items() | sort %}
         {% set available = gpu.memory - gpu.allocated %}
-        {% set size_needed = model_config.total_vram or model_config.size_gb or 0 %}
-        {% set can_fit = available >= size_needed and size_needed > 0 %}
-        {% set btn_class = "bg-green-600 hover:bg-green-500 cursor-pointer" if can_fit else "bg-red-600 cursor-not-allowed opacity-50" %}
-        <button hx-post="/api/trigger-load"
-                hx-vals='{"model_name": "{{ model_name }}", "gpu_id": {{ gpu_id }}}'
-                hx-target="#modal-container" hx-swap="innerHTML"
-                {% if not can_fit %}disabled{% endif %}
-                class="w-full p-3 rounded {{ btn_class }} text-white font-bold transition-colors text-left">
-            <div class="flex justify-between items-center">
-                <span>GPU {{ gpu_id }}: {{ gpu.name }}</span>
-                <span class="text-xs">{{ "%.1f"|format(available) }}/{{ "%.1f"|format(gpu.memory) }} GB</span>
+        <label class="flex items-center gap-3 w-full p-3 rounded bg-gray-700 hover:bg-gray-600 cursor-pointer text-white transition-colors">
+            <input type="checkbox" name="gpu_select" value="{{ gpu_id }}"
+                   class="gpu-checkbox w-4 h-4 accent-blue-500"
+                   onchange="updateVramPreview()">
+            <div class="flex-1">
+                <div class="flex justify-between items-center">
+                    <span class="font-bold">GPU {{ gpu_id }}: {{ gpu.name }}</span>
+                    <span class="text-xs text-gray-300">{{ "%.1f"|format(available) }}/{{ "%.1f"|format(gpu.memory) }} GB free</span>
+                </div>
+                <div class="text-xs text-gray-400 mt-1">
+                    {{ "%.0f"|format(gpu.memory_pct) }}% used
+                </div>
             </div>
-            <div class="text-xs text-gray-200 mt-1">
-                {{ "%.0f"|format(gpu.memory_pct) }}% used &bull; {{ "%.1f"|format(size_needed) }} GB needed
-                {{ '✓' if can_fit else '✗ Not enough VRAM' }}
-            </div>
-        </button>
+        </label>
     {% endfor %}
 </div>
+
+<div id="vram-preview" class="text-sm text-gray-300 mb-6 p-3 bg-gray-900 rounded hidden">
+    Combined available: <span id="combined-vram" class="font-bold text-blue-400">0</span> GB
+    &bull; Needed: <span class="font-bold">{{ "%.1f"|format(model_config.total_vram or model_config.size_gb or 0) }}</span> GB
+    &bull; <span id="vram-status" class="font-bold"></span>
+</div>
+
 <div class="flex gap-3 mt-6">
     <button onclick="document.getElementById('modal').remove();"
             class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
         Cancel
     </button>
+    <button id="load-btn"
+            onclick="submitLoad('{{ model_name }}')"
+            disabled
+            class="flex-1 px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold transition-colors">
+        Load
+    </button>
 </div>
+
+<script>
+const gpuVram = {
+    {% for gpu_id, gpu in gpu_data.items() | sort %}
+    {{ gpu_id }}: {{ "%.2f"|format(gpu.memory - gpu.allocated) }},
+    {% endfor %}
+};
+const sizeNeeded = {{ "%.2f"|format(model_config.total_vram or model_config.size_gb or 0) }};
+
+function updateVramPreview() {
+    const checked = [...document.querySelectorAll('.gpu-checkbox:checked')];
+    const preview = document.getElementById('vram-preview');
+    const loadBtn = document.getElementById('load-btn');
+    if (checked.length === 0) {
+        preview.classList.add('hidden');
+        loadBtn.disabled = true;
+        return;
+    }
+    preview.classList.remove('hidden');
+    const combined = checked.reduce((sum, cb) => sum + (gpuVram[cb.value] || 0), 0);
+    document.getElementById('combined-vram').textContent = combined.toFixed(1);
+    const status = document.getElementById('vram-status');
+    if (combined >= sizeNeeded) {
+        status.textContent = '✓ Fits';
+        status.className = 'font-bold text-green-400';
+        loadBtn.disabled = false;
+    } else {
+        status.textContent = '✗ Not enough VRAM';
+        status.className = 'font-bold text-red-400';
+        loadBtn.disabled = true;
+    }
+}
+
+function submitLoad(modelName) {
+    const checked = [...document.querySelectorAll('.gpu-checkbox:checked')];
+    const gpuIds = checked.map(cb => cb.value);
+    const formData = new FormData();
+    formData.append('model_name', modelName);
+    gpuIds.forEach(id => formData.append('gpu_ids', id));
+    fetch('/api/trigger-load', {method: 'POST', body: formData})
+        .then(r => r.text())
+        .then(html => {
+            document.getElementById('modal-container').innerHTML = html;
+            htmx.process(document.getElementById('modal-container'));
+        });
+}
+</script>
 {% endblock %}

@@ -4,7 +4,7 @@ import logging
 import json
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict, List
 import os
 import sys
 import argparse
@@ -660,10 +660,11 @@ async def gpu_selector(model: str):
 async def trigger_load(
     background_tasks: BackgroundTasks,
     model_name: str = Form(),
-    gpu_id: int = Form(),
+    gpu_ids: List[int] = Form(),
 ):
     """Trigger a load operation."""
-    logger.info(f"🚀 Load requested: {model_name} on GPU {gpu_id}")
+    gpu_id = gpu_ids if len(gpu_ids) > 1 else gpu_ids[0]
+    logger.info(f"🚀 Load requested: {model_name} on GPU(s) {gpu_id}")
     try:
         await gpu_manager._set_model_state(model_name, ModelState.LOADING, LoadingPhase.QUEUED)
         background_tasks.add_task(gpu_manager.load_model_to_gpu, model_name, gpu_id)

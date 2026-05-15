@@ -5,7 +5,7 @@ import subprocess
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union
 import httpx
 
 from config_manager import ModelConfig
@@ -21,7 +21,7 @@ class LlamaSession:
         model_config: ModelConfig,
         llama_server_binary: str,
         log_file: Path,
-        gpu_id: int = 0,
+        gpu_id: Union[int, List[int]] = 0,
     ):
         self.model_config = model_config
         self.llama_server_binary = llama_server_binary
@@ -61,7 +61,9 @@ class LlamaSession:
 
             # Set up environment with CUDA_VISIBLE_DEVICES for GPU assignment
             env = os.environ.copy()
-            env['CUDA_VISIBLE_DEVICES'] = str(self.gpu_id)
+            gpu_ids = self.gpu_id if isinstance(self.gpu_id, list) else [self.gpu_id]
+            env['CUDA_VISIBLE_DEVICES'] = ','.join(str(g) for g in gpu_ids)
+            env['GGML_CUDA_ALLREDUCE'] = 'internal'
             logger.debug(f"   CUDA_VISIBLE_DEVICES set to: {self.gpu_id}")
 
             # Spawn process
@@ -75,10 +77,10 @@ class LlamaSession:
 
             self.pid = self.process.pid
             logger.info(f"✓ Process spawned with PID {self.pid}")
-            logger.info(f"   Polling health check at 5s intervals using 120s timeout")
+            logger.info(f"   Polling health check at 5s intervals using 300s timeout")
 
             # Wait for llama-server to be ready
-            await self.wait_ready(timeout=120)
+            await self.wait_ready(timeout=300)
 
             logger.info(f"✓ {self.model_config.name} ready on port {self.model_config.port}")
             return self.pid

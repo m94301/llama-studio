@@ -68,3 +68,19 @@ You can see it in requirements.txt, but just to note it here.  Tried to keep it 
 - jinja2>=3.1.0
 - gguf_parser>=0.0.6
 
+## Multi-GPU Support (tensor split)
+
+This fork adds support for loading models across multiple GPUs using llama-server's tensor split mode.
+
+### How it works
+- In the GPU selector modal, check multiple GPUs to enable tensor split
+- VRAM calculator sums across all selected GPUs to determine if the model fits
+- Load button only activates when combined VRAM is sufficient
+- Automatically sets `CUDA_VISIBLE_DEVICES` for all selected GPUs
+- Works with `-sm tensor` in your launch args
+
+### Example
+Dual RTX 5060 Ti 16GB (32GB combined) loading Qwen3.6-35B (21GB):
+- Select GPU 0 + GPU 1
+- Combined available: ~30GB ✓ Fits
+- Hit Load
