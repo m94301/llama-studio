@@ -119,9 +119,31 @@ def _parse_help_text(help_text: str) -> Dict:
 
 
 def _infer_type(description: str, full_text: str) -> str:
-    """Infer whether an option takes an int or str value."""
-    desc_lower = (description + full_text).lower()
-    if any(word in desc_lower for word in ["number", "count", "size", "layers", "threads", "n ", " n"]):
+    """Infer whether an option takes an int or str value.
+
+    Primary signal: the parameter indicator (the first whitespace-separated token
+    after the flag in llama-server's help output). llama.cpp uses standardized
+    indicators — N / INT / NUM / SIZE for numeric, HOST / PATH / STRING / FILE
+    etc. for textual.
+
+    Falls back to a tight keyword scan of the description only (the looser scan of
+    full_text caused false positives like 'listen (' matching 'n ').
+    """
+    # Extract the parameter indicator (first token in the post-flag remainder)
+    m = re.match(r"\s*(\S+)", full_text or "")
+    if m:
+        param = m.group(1)
+        # All-caps numeric indicators
+        if param in {"N", "INT", "NUM", "NUMBER", "COUNT", "SIZE", "INDEX", "PORT", "LAYERS"}:
+            return "int"
+        # All-caps single word that isn't a known int indicator → string-typed param
+        # (HOST, PATH, STRING, FILE, NAME, TEMPLATE, ALIAS, URL, JSON, etc.)
+        if len(param) >= 2 and param.isalpha() and param.isupper():
+            return "str"
+
+    # Tight description-only fallback: only well-known numeric keywords
+    desc_lower = (description or "").lower()
+    if any(kw in desc_lower for kw in ("number of", "count of", "size of", "layers to", "threads to")):
         return "int"
     return "str"
 

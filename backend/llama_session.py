@@ -21,19 +21,19 @@ class LlamaSession:
         model_config: ModelConfig,
         llama_server_binary: str,
         log_file: Path,
-        gpu_id: int = 0,
+        gpu_ids: Optional[list] = None,
     ):
         self.model_config = model_config
         self.llama_server_binary = llama_server_binary
         self.log_file = log_file
-        self.gpu_id = gpu_id
+        self.gpu_ids = list(gpu_ids) if gpu_ids else [0]
         self.process: Optional[subprocess.Popen] = None
         self.pid: Optional[int] = None
         self.cancelled: bool = False
 
     async def start(self) -> int:
         """
-        Start llama-server process.
+        Start llama-server process by executing the model's shell script.
 
         Returns:
             Process ID
@@ -41,28 +41,36 @@ class LlamaSession:
         Raises:
             RuntimeError: If process fails to start
         """
-        cmd = self._build_command()
+        script_path = self.model_config.script_path
+        cmd = [str(script_path)]
 
         logger.info(f"⏳ Starting {self.model_config.name} on port {self.model_config.port}")
-        logger.debug(f"   Command: {' '.join(cmd)}")
+        logger.debug(f"   Script: {script_path}")
 
         try:
             self.cancelled = False
             # Open log file for writing
             log_file_handle = open(self.log_file, "w")
 
-            # Write the full command to log file for reference
-            full_cmd_str = ' '.join(cmd)
+            # Copy the script contents into the log for debugging visibility
+            try:
+                script_text = script_path.read_text()
+            except Exception as e:
+                script_text = f"<could not read script: {e}>"
             log_file_handle.write(f"{'='*80}\n")
-            log_file_handle.write(f"Launch Command:\n")
-            log_file_handle.write(f"{full_cmd_str}\n")
+            log_file_handle.write(f"Launch script: {script_path}\n")
             log_file_handle.write(f"{'='*80}\n")
+            log_file_handle.write(script_text)
+            log_file_handle.write(f"\n{'='*80}\n")
             log_file_handle.flush()
 
-            # Set up environment with CUDA_VISIBLE_DEVICES for GPU assignment
+            # Set up environment with CUDA_VISIBLE_DEVICES for GPU assignment.
+            # For tensor-split models, gpu_ids contains all GPUs in the order they
+            # should be visible to llama-server (--main-gpu and --tensor-split index
+            # into this visible-devices list).
             env = os.environ.copy()
-            env['CUDA_VISIBLE_DEVICES'] = str(self.gpu_id)
-            logger.debug(f"   CUDA_VISIBLE_DEVICES set to: {self.gpu_id}")
+            env['CUDA_VISIBLE_DEVICES'] = ",".join(str(g) for g in self.gpu_ids)
+            logger.debug(f"   CUDA_VISIBLE_DEVICES set to: {env['CUDA_VISIBLE_DEVICES']}")
 
             # Spawn process
             self.process = subprocess.Popen(
@@ -185,32 +193,6 @@ class LlamaSession:
 
             # Wait before next check
             await asyncio.sleep(check_interval)
-
-    def _build_command(self) -> list:
-        """
-        Build llama-server command from model config.
-
-        Returns:
-            List of command arguments
-        """
-        cmd = [self.llama_server_binary]
-
-        # Model path
-        cmd.extend(["-m", str(self.model_config.model_path)])
-
-        # Launch arguments from config (passed directly, config must include hyphens)
-        # Note: --port and --host are included in launch_args; no need to add them separately
-        logger.debug(f"   launch_args dict: {self.model_config.launch_args}")
-        for key, value in self.model_config.launch_args.items():
-            logger.debug(f"      Adding arg: {key} = {value} (type: {type(value).__name__})")
-            # Handle flag arguments (no value, e.g., --no-mmap) vs. arguments with values
-            if value is None or str(value).strip() == "":
-                cmd.append(key)
-            else:
-                cmd.extend([key, str(value)])
-
-        logger.info(f"   Full command: {' '.join(cmd)}")
-        return cmd
 
     def get_status(self) -> Dict[str, Any]:
         """Get current session status."""

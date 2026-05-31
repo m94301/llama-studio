@@ -1,10 +1,9 @@
 """GPU state management and session coordination."""
 
 import asyncio
-import json
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from enum import Enum
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -54,24 +53,46 @@ class ModelStateSnapshot:
     phase: LoadingPhase
     error_msg: Optional[str] = None
     pid: Optional[int] = None
-    gpu_id: int = -1
+    gpu_ids: List[int] = field(default_factory=list)  # empty when not loaded; multi-entry for split
     timestamp: float = field(default_factory=time.time)
+
+    @property
+    def gpu_id(self) -> int:
+        """Backward-compat scalar accessor: first GPU or -1 if none."""
+        return self.gpu_ids[0] if self.gpu_ids else -1
 
 
 @dataclass
 class LoadedModel:
-    """Represents a loaded model on a GPU."""
+    """Represents a loaded model. May span multiple GPUs when tensor-split is configured."""
 
     name: str
     size_gb: float
     state: ModelState
-    gpu_id: int
+    gpu_ids: List[int]  # empty when not loaded; multi-entry for tensor-split
     port: int
     pid: Optional[int] = None
-    vram_allocated: float = 0.0  # actual GB added to gpu.allocated (total_vram or size_gb)
+    # Per-GPU VRAM allocations (parallel to gpu_ids). Each entry is the GB added to
+    # the corresponding GPU's allocated counter at load time. Captured at load so
+    # unload/cancel releases the same amounts.
+    vram_per_gpu: List[float] = field(default_factory=list)
+
+    @property
+    def gpu_id(self) -> int:
+        """Backward-compat scalar accessor: first GPU or -1 if none."""
+        return self.gpu_ids[0] if self.gpu_ids else -1
+
+    @property
+    def vram_allocated(self) -> float:
+        """Backward-compat: total VRAM across all GPUs."""
+        return sum(self.vram_per_gpu)
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        # Surface scalar for legacy consumers
+        d["gpu_id"] = self.gpu_id
+        d["vram_allocated"] = self.vram_allocated
+        return d
 
 
 @dataclass
@@ -162,7 +183,7 @@ class GpuManager:
                 name=model_name,
                 size_gb=model_config.size_gb,
                 state=ModelState.IDLE,
-                gpu_id=-1,
+                gpu_ids=[],
                 port=model_config.port,
             )
             self.state_info[model_name] = ModelStateSnapshot(
@@ -195,64 +216,45 @@ class GpuManager:
         self.sessions.clear()
         logger.info("✓ All sessions cleaned up")
 
-    async def load_model_to_gpu(self, model_name: str, gpu_id: int = 0) -> None:
+    async def load_model(self, model_name: str, gpu_ids: List[int]) -> None:
         """
-        Load a model to GPU and spawn llama-server session.
+        Load a model and spawn llama-server, distributing VRAM allocation across gpu_ids.
 
         Args:
             model_name: Name of model to load
-            gpu_id: GPU ID to load to (default: 0)
+            gpu_ids: Ordered list of GPU IDs. Length must equal model_config.gpu_count.
+                     For single-GPU models, pass [gpu_id]. For tensor-split, pass all
+                     selected GPUs in the order they should be visible to llama-server.
 
         Raises:
-            ValueError: If model not found or can't be loaded
+            ValueError: If model not found, gpu_ids count mismatches gpu_count, or VRAM insufficient.
         """
-        logger.info(f"🔄 load_model_to_gpu called: model={model_name}, gpu_id={gpu_id}")
-        
+        logger.info(f"🔄 load_model called: model={model_name}, gpu_ids={gpu_ids}")
+
         if model_name not in self.config.get_all_models():
             raise ValueError(f"Model not found: {model_name}")
 
-        # Reload model config from disk to ensure latest values
-        # (in case config was edited since app startup)
-        config_file = self.config.project_root / "config" / "models" / f"{model_name}.json"
-        if config_file.exists():
-            logger.debug(f"   Reloading config from disk: {config_file}")
-            with open(config_file) as f:
-                config_data = json.load(f)
-            logger.debug(f"      Raw JSON from disk: {config_data}")
-
-            # Extract port from launch_args (stored separately in JSON)
-            launch_args = config_data.get("launch_args", {})
-            if "--port" in launch_args:
-                config_data["port"] = launch_args["--port"]
-
-            model_config = ModelConfig(**config_data)
-
-            # Preserve size_gb from existing config (not persisted in JSON)
-            existing_config = self.config.models.get(model_name)
-            if existing_config and existing_config.size_gb:
-                model_config.size_gb = existing_config.size_gb
-
-            # Restore is_configured (not persisted in JSON, computed from port + launch_args)
-            model_config.is_configured = (
-                model_config.launch_args is not None and model_config.port is not None
-            )
-            # Update the in-memory cache
-            self.config.models[model_name] = model_config
-        else:
-            model_config = self.config.get_model_config(model_name)
-            
-        logger.debug(f"   Model config loaded: {model_config.name} ({model_config.size_gb} GB)")
-        logger.debug(f"   Model config launch_args: {model_config.launch_args}")
+        model_config = self.config.get_model_config(model_name)
+        logger.debug(f"   Model config loaded: {model_config.name} ({model_config.size_gb} GB), gpu_count={model_config.gpu_count}")
 
         # Check if already loaded
         if model_name in self.sessions:
             raise ValueError(f"Model {model_name} already loaded")
 
-        # Validate GPU ID
-        if gpu_id not in self.gpus and self.gpus:
-            raise ValueError(f"GPU {gpu_id} not found. Available: {list(self.gpus.keys())}")
+        # Validate gpu_ids count matches model's expected split count
+        expected = model_config.gpu_count
+        if len(gpu_ids) != expected:
+            raise ValueError(
+                f"Model {model_name} declares {expected} GPU(s) via --tensor-split; got {len(gpu_ids)}."
+            )
+        if len(set(gpu_ids)) != len(gpu_ids):
+            raise ValueError(f"Duplicate GPU IDs in selection: {gpu_ids}")
 
-        logger.debug(f"   GPU {gpu_id} validated")
+        # Validate each GPU exists
+        if self.gpus:
+            for gid in gpu_ids:
+                if gid not in self.gpus:
+                    raise ValueError(f"GPU {gid} not found. Available: {list(self.gpus.keys())}")
 
         # Check that port is configured
         if model_config.port is None:
@@ -266,20 +268,26 @@ class GpuManager:
                 f"Port {model_config.port} is already in use. Cannot load {model_name}."
             )
 
-        logger.debug(f"   Port {model_config.port} is available")
+        # Compute per-GPU VRAM need (honors tensor-split weights)
+        per_gpu_need = model_config.per_gpu_vram() or [model_config.total_vram or model_config.size_gb or 0]
+        if len(per_gpu_need) != len(gpu_ids):
+            # Defensive: pad/trim to match (shouldn't normally happen since gpu_count is the source)
+            if len(gpu_ids) == 1:
+                per_gpu_need = [sum(per_gpu_need)]
+            else:
+                per_gpu_need = [(model_config.total_vram or model_config.size_gb or 0) / len(gpu_ids)] * len(gpu_ids)
 
-        # Check GPU has enough VRAM
-        if gpu_id in self.gpus:
-            gpu = self.gpus[gpu_id]
-            available_gb = gpu.memory - gpu.allocated
-            # Use total_vram if calculated, otherwise fall back to file size
-            size_needed = model_config.total_vram or model_config.size_gb or 0
-            if available_gb < size_needed:
-                raise ValueError(
-                    f"GPU {gpu_id} has only {available_gb:.1f} GB available, "
-                    f"but {model_config.name} needs {size_needed:.1f} GB"
-                )
-            logger.debug(f"   GPU {gpu_id} has {available_gb:.1f} GB available")
+        # Check each chosen GPU has enough free VRAM for its share
+        if self.gpus:
+            for gid, need in zip(gpu_ids, per_gpu_need):
+                gpu = self.gpus[gid]
+                available_gb = gpu.memory - gpu.allocated
+                if available_gb < need:
+                    raise ValueError(
+                        f"GPU {gid} has only {available_gb:.1f} GB available, "
+                        f"but {model_config.name} needs {need:.1f} GB on that GPU"
+                    )
+                logger.debug(f"   GPU {gid}: needs {need:.1f} GB, {available_gb:.1f} GB available")
 
         # Ensure model is registered in self.models (models added via rescan after startup won't be)
         if model_name not in self.models:
@@ -287,7 +295,7 @@ class GpuManager:
                 name=model_name,
                 size_gb=model_config.size_gb or 0.0,
                 state=ModelState.IDLE,
-                gpu_id=-1,
+                gpu_ids=[],
                 port=model_config.port or 0,
             )
             self.state_info[model_name] = ModelStateSnapshot(
@@ -324,7 +332,7 @@ class GpuManager:
                 model_config=model_config,
                 llama_server_binary=effective_binary,
                 log_file=log_path,
-                gpu_id=gpu_id,
+                gpu_ids=gpu_ids,
             )
 
             # Store session BEFORE start() so cancel_load can find it
@@ -337,22 +345,23 @@ class GpuManager:
             # Health check phase
             await self._set_model_state(model_name, ModelState.LOADING, LoadingPhase.HEALTH_CHECKING)
             self.models[model_name].pid = pid
-            self.models[model_name].gpu_id = gpu_id
+            self.models[model_name].gpu_ids = list(gpu_ids)
+            self.models[model_name].vram_per_gpu = list(per_gpu_need)
 
-            # Update GPU allocation (if GPU detection available)
-            if self.gpus and gpu_id in self.gpus:
-                # Use total_vram (weights + KV cache) to match the availability check above
-                size_tracked = model_config.total_vram or model_config.size_gb or 0
-                self.gpus[gpu_id].allocated += size_tracked
-                self.models[model_name].vram_allocated = size_tracked
-                # Use current port from config (not stale LoadedModel.port)
-                loaded_model_dict = self.models[model_name].to_dict()
-                loaded_model_dict['port'] = model_config.port
-                self.gpus[gpu_id].loaded_models.append(loaded_model_dict)
+            # Update GPU allocation across all chosen GPUs
+            if self.gpus:
+                for gid, need in zip(gpu_ids, per_gpu_need):
+                    if gid in self.gpus:
+                        self.gpus[gid].allocated += need
+                        loaded_model_dict = self.models[model_name].to_dict()
+                        loaded_model_dict['port'] = model_config.port
+                        # Surface per-GPU share for UI clarity
+                        loaded_model_dict['vram_share'] = need
+                        self.gpus[gid].loaded_models.append(loaded_model_dict)
 
             # Mark as running
             await self._set_model_state(model_name, ModelState.RUNNING, LoadingPhase.RUNNING)
-            logger.info(f"✓ {model_name} loaded on GPU {gpu_id}, PID {pid}")
+            logger.info(f"✓ {model_name} loaded on GPU(s) {gpu_ids}, PID {pid}")
 
             # Broadcast state change for immediate UI update
             asyncio.create_task(event_bus.broadcast({
@@ -408,13 +417,16 @@ class GpuManager:
 
             # Reset GPU allocation if it was partially updated
             model = self.models.get(model_name)
-            if model and model.gpu_id >= 0 and model.gpu_id in self.gpus:
-                gpu = self.gpus[model.gpu_id]
-                gpu.allocated = max(0.0, gpu.allocated - model.vram_allocated)
-                gpu.loaded_models = [
-                    m for m in gpu.loaded_models if m["name"] != model_name
-                ]
-                model.gpu_id = -1
+            if model and model.gpu_ids:
+                for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
+                    if gid in self.gpus:
+                        gpu = self.gpus[gid]
+                        gpu.allocated = max(0.0, gpu.allocated - need)
+                        gpu.loaded_models = [
+                            m for m in gpu.loaded_models if m["name"] != model_name
+                        ]
+                model.gpu_ids = []
+                model.vram_per_gpu = []
                 model.pid = None
 
             # Reset to idle
@@ -455,18 +467,21 @@ class GpuManager:
             session = self.sessions[model_name]
             await session.stop()
 
-            # Update GPU allocation
+            # Update GPU allocation across all GPUs the model was using
             model = self.models[model_name]
-            if model.gpu_id >= 0 and model.gpu_id in self.gpus:
-                gpu = self.gpus[model.gpu_id]
-                gpu.allocated = max(0.0, gpu.allocated - model.vram_allocated)
-                gpu.loaded_models = [
-                    m for m in gpu.loaded_models if m["name"] != model_name
-                ]
+            if model.gpu_ids:
+                for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
+                    if gid in self.gpus:
+                        gpu = self.gpus[gid]
+                        gpu.allocated = max(0.0, gpu.allocated - need)
+                        gpu.loaded_models = [
+                            m for m in gpu.loaded_models if m["name"] != model_name
+                        ]
 
             # Clean up
             del self.sessions[model_name]
-            model.gpu_id = -1
+            model.gpu_ids = []
+            model.vram_per_gpu = []
             model.pid = None
 
             # Mark as idle
@@ -556,7 +571,7 @@ class GpuManager:
                     name=model_name,
                     size_gb=model_config.size_gb or 0.0,
                     state=ModelState.IDLE,
-                    gpu_id=-1,
+                    gpu_ids=[],
                     port=model_config.port or 0,
                 )
                 self.state_info[model_name] = ModelStateSnapshot(
@@ -594,7 +609,7 @@ class GpuManager:
                 self.models[model_name].state = state
 
             pid = self.models[model_name].pid if model_name in self.models else None
-            gpu_id = self.models[model_name].gpu_id if model_name in self.models else -1
+            gpu_ids = list(self.models[model_name].gpu_ids) if model_name in self.models else []
 
             self.state_info[model_name] = ModelStateSnapshot(
                 model_name=model_name,
@@ -602,7 +617,7 @@ class GpuManager:
                 phase=phase,
                 error_msg=error_msg,
                 pid=pid,
-                gpu_id=gpu_id,
+                gpu_ids=gpu_ids,
             )
 
             logger.info(f"📊 State: {model_name} → {state.value} ({phase.value})")
@@ -631,7 +646,7 @@ class GpuManager:
                     state=self.models[model_name].state,
                     phase=LoadingPhase.IDLE,
                     pid=self.models[model_name].pid,
-                    gpu_id=self.models[model_name].gpu_id,
+                    gpu_ids=list(self.models[model_name].gpu_ids),
                 )
             else:
                 return None

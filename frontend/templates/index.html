@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Llama Studio</title>
+    <title>Llama Studio {{ app_version }}</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -417,10 +417,34 @@
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
     <!-- Header -->
+    <!-- Auto-load progress banner: empty unless startup auto-load is running -->
+    <div id="auto-load-banner"
+         hx-get="/api/auto-load-banner"
+         hx-trigger="load, every 2s"
+         hx-swap="innerHTML"></div>
+
     <header class="bg-gray-800 border-b border-gray-700 px-6 py-4">
         <div class="flex justify-between items-center max-w-7xl mx-auto">
-            <h1 class="text-2xl font-bold text-white">🦙 Llama Studio</h1>
-            <div class="flex gap-3">
+            <h1 class="text-2xl font-bold text-white">🦙 Llama Studio <span class="text-sm text-gray-400 font-normal">{{ app_version }}</span></h1>
+            <div class="flex gap-3 items-center">
+                <!-- Store-Current-State button: server-rendered fragment so color/tooltip are correct on first load -->
+                <span id="store-config-btn-wrap"
+                      hx-get="/api/startup-store-button"
+                      hx-trigger="load, every 5s"
+                      hx-swap="innerHTML">
+                    {{ store_button_html | safe }}
+                </span>
+
+                <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
+                       title="Load stored models when Llama Studio starts">
+                    <input type="checkbox"
+                           id="auto-load-checkbox"
+                           {% if auto_load_on_startup %}checked{% endif %}
+                           onchange="toggleAutoLoadOnStartup(this.checked)"
+                           class="w-3.5 h-3.5 rounded cursor-pointer">
+                    <span>Load on startup</span>
+                </label>
+
                 <button type="button"
                         onclick="openSettingsModal()"
                         class="px-4 py-2 rounded font-bold text-sm transition-colors {% if config_incomplete %}bg-red-600 hover:bg-red-500 animate-pulse{% else %}bg-gray-700 hover:bg-gray-600{% endif %}"
@@ -480,6 +504,21 @@
 
     <!-- HTMX Event Handlers -->
     <script>
+        // Persist the "Load on startup" checkbox to app.json
+        async function toggleAutoLoadOnStartup(enabled) {
+            const fd = new FormData();
+            fd.append('enabled', enabled ? 'true' : 'false');
+            try {
+                const r = await fetch('/api/toggle-auto-load', { method: 'POST', body: fd });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+            } catch (e) {
+                console.error('toggle auto-load failed:', e);
+                // Revert UI state on failure
+                document.getElementById('auto-load-checkbox').checked = !enabled;
+                alert('Could not save auto-load setting: ' + e);
+            }
+        }
+
         // Close modal when pressing Escape
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') {

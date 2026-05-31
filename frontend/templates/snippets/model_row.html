@@ -52,6 +52,10 @@
 
     <div class="column column-name">
         <span class="model-display-name">{{ model_config.display_name or model_name }}</span>
+        {% if model_config.gpu_count > 1 %}
+        <span class="inline-block ml-2 text-xs font-bold text-purple-300 bg-purple-900 bg-opacity-40 border border-purple-700 rounded px-1.5 py-0.5 align-middle"
+              title="Tensor-split across {{ model_config.gpu_count }} GPUs">{{ model_config.gpu_count }} GPU</span>
+        {% endif %}
     </div>
     <div class="column column-size">{{ model_config.size_gb or '—' }}{% if model_config.size_gb %} GB{% endif %}</div>
     <div class="column column-vram">

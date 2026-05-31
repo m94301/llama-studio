@@ -5,6 +5,14 @@ This tool allows you to launch various llm models onto various llama-server sess
 
 Currently tested only on NVIDIA devices.  Consider this a MVP (Minimum Viable Product) release
 
+# What's new in 0.2.0
+- **Model configs converted to executable shell scripts. No more JSON for models** Each model lives at `config/models/<name>.sh`. Self-contained, portable, runnable directly from the CLI. Existing JSON configs are migrated automatically on first start (originals kept as `.json.old`).
+- **Paste-in support.** The config modal has an Edit textarea: paste an Unsloth-style snippet and it parses straight into the form.
+- **Multi-GPU model splitting.** Add `--tensor-split a,b,…` to a model's args and the GPU picker switches to multi-slot mode. Per-GPU VRAM share is honored on availability checks.
+- **Auto-load on startup.** "Store this state to autoload" snapshots the currently-loaded set into `app.json`; toggle "Load on startup" and they come back on next launch. Runs in the background so the WebUI is responsive while models load.
+- **Save-while-loaded warning.** Editing a loaded model's config prompts to unload or keep the prior load.
+- **VRAM calculator fix.** Cross-model contamination bug squashed (every modal now reads fresh values).
+
 # Gallery
 ## Main Page
 - GPU Panel: Shows status of all GPU, including Power, Temp, VRAM Usage, and any sessions running on this GPU with URL to llama-server's mini webUI for testing

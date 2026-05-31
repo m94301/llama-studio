@@ -49,7 +49,10 @@ docs/
 config/app.json
 config/llama-server/*.json
 config/models/*.json
+config/models/*.json.old
+config/models/*.sh
 !config/models/default.json
+!config/models/default.sh
 
 # Environment
 .env

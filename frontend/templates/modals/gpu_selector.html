@@ -14,7 +14,7 @@
         {% set can_fit = available >= size_needed and size_needed > 0 %}
         {% set btn_class = "bg-green-600 hover:bg-green-500 cursor-pointer" if can_fit else "bg-red-600 cursor-not-allowed opacity-50" %}
         <button hx-post="/api/trigger-load"
-                hx-vals='{"model_name": "{{ model_name }}", "gpu_id": {{ gpu_id }}}'
+                hx-vals='{"model_name": "{{ model_name }}", "gpu_ids": [{{ gpu_id }}]}'
                 hx-target="#modal-container" hx-swap="innerHTML"
                 {% if not can_fit %}disabled{% endif %}
                 class="w-full p-3 rounded {{ btn_class }} text-white font-bold transition-colors text-left">

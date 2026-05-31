@@ -10,7 +10,7 @@
             {% if gpu.loaded_models %}
                 {% for m in gpu.loaded_models %}
                     <span class="inline-block text-xs bg-gray-700 rounded px-2 py-0.5">
-                        {{ m.name }}<span class="text-gray-500 ml-1.5"> · </span><a href="http://{{ server_host }}:{{ m.port }}" target="_blank" style="color: #0066cc; text-decoration: underline; cursor: pointer; font-weight: bold;">{{ 'http://' ~ server_host ~ ':' ~ m.port }}</a>
+                        {{ m.name }}{% if m.gpu_ids and m.gpu_ids|length > 1 %}<span class="ml-1 text-purple-300" title="Model split across {{ m.gpu_ids|length }} GPUs ({{ m.gpu_ids|join(',') }})">⤧{{ m.gpu_ids|length }}</span>{% endif %}<span class="text-gray-500 ml-1.5"> · </span><a href="http://{{ server_host }}:{{ m.port }}" target="_blank" style="color: #0066cc; text-decoration: underline; cursor: pointer; font-weight: bold;">{{ 'http://' ~ server_host ~ ':' ~ m.port }}</a>
                     </span>
                 {% endfor %}
             {% else %}
