@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# === llama-studio:meta BEGIN ===
+# display_name: Minimax M2.7 Reap 139b Q4 K M
+# block_count: 62
+# max_context: 196608
+# kv_cache_multiplier: 512
+# === llama-studio:meta END ===
+LLAMA_BIN=/home/m6/projects/llama.cpp/build-cuda-avx1/bin/llama-server
+export CUDA_VISIBLE_DEVICES=1,2,3
+
+exec "$LLAMA_BIN" \
+  -m /home/m6/models/dervig/m51Lab-MiniMax-M2.7-REAP-139B-A10B-GGUF/MiniMax-M2.7-REAP-139B-Q4_K_M.gguf \
+  --host 0.0.0.0 \
+  --port 8888 \
+  --ctx-size 4096 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --gpu-layers 999 \
+  --batch-size 512 \
+  --threads 12 \
+  --tensor-split 1,1,1 \
+  --fit off \
+  -dio \
+  --no-mmap \
+  --split-mode layer

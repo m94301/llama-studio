@@ -237,7 +237,14 @@ class ConfigManager:
             raise
 
     async def load_all_models(self) -> Dict[str, ModelConfig]:
-        """Scan config/models/*.sh; for any GGUFs without a script, generate a skeleton."""
+        """Scan config/models/*.sh; for any GGUFs without a script, generate a skeleton.
+
+        Before loading, runs a sync pass over `.sh` / `.sh.old` files: scripts whose
+        model file no longer exists are renamed to `.sh.old` (hidden from the table
+        but preserved); `.sh.old` scripts whose model file has reappeared are
+        promoted back to `.sh`. This keeps the table tidy without trashing user
+        config.
+        """
         if not self.app_config:
             raise RuntimeError("App config not loaded yet. Call load_app_config() first.")
 
@@ -249,6 +256,10 @@ class ConfigManager:
         config_models_dir.mkdir(parents=True, exist_ok=True)
 
         self.models = {}
+
+        # Sync pass: enable/disable scripts based on whether each script's
+        # referenced model file currently exists.
+        self._sync_disabled_scripts(config_models_dir)
 
         # Step 1: find GGUFs to generate skeletons for if missing
         logger.info(f"🔍 Searching for GGUF files in: {models_root}")
@@ -330,6 +341,56 @@ class ConfigManager:
         mc.is_configured = ok
         mc.config_error = reason
         return mc
+
+    def _sync_disabled_scripts(self, config_dir: Path) -> None:
+        """Rename `.sh` ↔ `.sh.old` based on whether each script's model file exists.
+
+        - `.sh` referencing a missing model file → renamed to `.sh.old` (hidden).
+        - `.sh.old` whose model file is now present → renamed back to `.sh` (visible).
+
+        Scripts that fail to parse are left untouched so the user can fix them.
+        If both `Foo.sh` and `Foo.sh.old` exist, the promotion is skipped with a
+        warning (manual intervention required).
+        """
+        # Promote .sh.old → .sh when model file has reappeared
+        for old_path in sorted(config_dir.glob("*.sh.old")):
+            try:
+                text = old_path.read_text()
+                ps = parse_script(text)
+                if not ps.model_path or not Path(ps.model_path).exists():
+                    continue
+                new_path = old_path.with_suffix("")  # strips trailing .old → e.g. Foo.sh.old → Foo.sh
+                if new_path.exists():
+                    logger.warning(
+                        f"⚠ Cannot enable {old_path.name}: {new_path.name} also exists "
+                        f"(manual cleanup needed)"
+                    )
+                    continue
+                old_path.rename(new_path)
+                logger.info(f"   ↑ Enabled {new_path.name} (model file found)")
+            except Exception as e:
+                logger.warning(f"⚠ Could not check {old_path.name}: {e}")
+
+        # Demote .sh → .sh.old when model file is missing
+        for sh_path in sorted(config_dir.glob("*.sh")):
+            try:
+                text = sh_path.read_text()
+                ps = parse_script(text)
+                if not ps.model_path:
+                    continue  # skeleton without a model_path yet; leave it
+                if Path(ps.model_path).exists():
+                    continue
+                disabled_path = sh_path.with_name(sh_path.name + ".old")
+                if disabled_path.exists():
+                    # Both versions present — defer to user; don't clobber.
+                    logger.warning(
+                        f"⚠ Cannot disable {sh_path.name}: {disabled_path.name} already exists"
+                    )
+                    continue
+                sh_path.rename(disabled_path)
+                logger.info(f"   ↓ Disabled {sh_path.name} → {disabled_path.name} (model file missing)")
+            except Exception as e:
+                logger.warning(f"⚠ Could not check {sh_path.name}: {e}")
 
     def _generate_skeleton(self, script_path: Path, model_name: str, gguf_path: Path) -> None:
         """Write a skeleton script for a newly-discovered GGUF."""

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# === llama-studio:meta BEGIN ===
+# display_name: Gemma 4 E4b It Q4 K M
+# block_count: 42
+# max_context: 131072
+# kv_cache_multiplier: 640
+# === llama-studio:meta END ===
+
+LLAMA_BIN=/home/m6/projects/llama.cpp/build-cuda-avx1/bin/llama-server
+
+exec "$LLAMA_BIN" \
+  -m /home/m6/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf \
+  --host 0.0.0.0 \
+  --port 8004 \
+  --ctx-size 4096 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --gpu-layers 999 \
+  --batch-size 512 \
+  --threads 12

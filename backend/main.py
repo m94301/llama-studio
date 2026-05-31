@@ -15,7 +15,7 @@ import socket
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -585,7 +585,6 @@ async def auto_load_banner():
         f'<div class="bg-red-900 border border-red-600 text-red-100 px-4 py-2 text-sm flex items-center gap-3">'
         f'<span class="animate-pulse">⏳</span>'
         f'<span><b>Auto-loading stored models</b> ({cur}/{tot}): <code class="text-red-200">{name}</code></span>'
-        f'<span class="text-xs text-red-300 ml-auto">The WebUI is responsive during loading.</span>'
         f'</div>'
     )
 
