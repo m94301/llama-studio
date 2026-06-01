@@ -333,6 +333,7 @@ class GpuManager:
                 llama_server_binary=effective_binary,
                 log_file=log_path,
                 gpu_ids=gpu_ids,
+                health_timeout=model_config.effective_health_timeout(),
             )
 
             # Store session BEFORE start() so cancel_load can find it

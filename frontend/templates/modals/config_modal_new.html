@@ -19,12 +19,25 @@
 
             <!-- CORE FIELDS SECTION -->
             <fieldset>
-                <!-- Display Name -->
-                <div class="mb-4">
-                    <label class="text-xs font-bold text-gray-400">Display Name</label>
-                    <input type="text" name="display_name"
-                           value="{{ display_name }}"
-                           class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                <!-- Display Name + Health-check Timeout -->
+                <div class="mb-4 flex gap-3 items-end">
+                    <div class="flex-1">
+                        <label class="text-xs font-bold text-gray-400">Display Name</label>
+                        <input type="text" name="display_name"
+                               value="{{ display_name }}"
+                               class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                    </div>
+                    <div class="w-44">
+                        <label class="text-xs font-bold text-gray-400"
+                               title="Per-model startup health-check timeout. Leave blank to use the default.">
+                            Health timeout (s)
+                        </label>
+                        <input type="number" id="health-timeout-input" name="health_timeout"
+                               value="{{ health_timeout if health_timeout is not none else '' }}"
+                               min="1" max="1800" step="1"
+                               placeholder="{{ default_health_timeout }} (default)"
+                               class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                    </div>
                 </div>
 
                 <!-- llama-server Binary Path -->
@@ -527,11 +540,14 @@ function filterOptions(query) {
 
 function serializeFormData() {
     // Core fields
+    const htRaw = document.getElementById('health-timeout-input').value.trim();
     const core = {
         port: parseInt(document.querySelector('input[name="port"]').value) || null,
         display_name: document.querySelector('input[name="display_name"]').value.trim() || null,
         host: document.querySelector('input[name="host"]').value.trim() || "0.0.0.0",
         llama_path: document.getElementById('llama-path-input').value.trim() || "default",
+        // Empty → use default (server treats null/empty as "omit the meta line")
+        health_timeout: htRaw === '' ? null : parseInt(htRaw),
     };
 
     // Launch args: collect all rows (permanent + user-added)
@@ -833,6 +849,10 @@ async function applyPastedScript() {
     // Populate fields (overwrite always — resolved decision #1 applies to display_name; we apply same rule to other fields when present in paste)
     if (result.display_name) {
         document.querySelector('input[name="display_name"]').value = result.display_name;
+    }
+    // Health timeout from meta fence (null = leave blank; user keeps their previous value)
+    if (result.health_timeout !== null && result.health_timeout !== undefined) {
+        document.getElementById('health-timeout-input').value = result.health_timeout;
     }
     if (result.port) {
         document.getElementById('port-input').value = result.port;

@@ -5,7 +5,7 @@ import logging
 import json
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict, Optional
 import os
 import sys
 import argparse
@@ -15,7 +15,7 @@ import socket
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.3"
 
 from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -70,6 +70,10 @@ LEGACY_CONFIGS_DETECTED = False
 # Progress state for the startup auto-load background task. Cleared when complete.
 AUTO_LOAD_PROGRESS: Dict[str, int] = {"active": 0, "current_index": 0, "total": 0}
 AUTO_LOAD_CURRENT_NAME: str = ""
+
+# Progress state for the synchronous rescan operation. Polled by the UI via
+# /api/rescan-progress while the rescan request is in flight.
+RESCAN_STATE: Dict[str, object] = {"active": False, "current": "", "done": 0, "total": 0}
 
 
 @asynccontextmanager
@@ -476,11 +480,42 @@ async def index():
 # ============================================================================
 
 
+@app.get("/api/rescan-progress", response_class=HTMLResponse)
+async def rescan_progress():
+    """Return current rescan status — polled by the UI while a rescan is in flight."""
+    if not RESCAN_STATE.get("active"):
+        return HTMLResponse("")
+    current = RESCAN_STATE.get("current") or "…"
+    done = RESCAN_STATE.get("done", 0)
+    total = RESCAN_STATE.get("total", 0)
+    return HTMLResponse(
+        f'<span class="text-blue-300">⏳ Rescanning ({done}/{total}): '
+        f'<code class="text-blue-200">{current}</code></span>'
+    )
+
+
 @app.post("/api/rescan-models", response_class=HTMLResponse)
 async def rescan_models():
-    """Rescan models directory and regenerate skeleton configs for missing models."""
+    """Rescan models directory and regenerate skeleton configs for missing models.
+
+    Also forces a multiplier refresh on every model so SWA-architecture models
+    pick up any ctx changes made outside the modal-save path (e.g., hand-edits).
+    """
+    # Reset and activate progress state. Workers update `current` as they pick
+    # up each script; the UI polls /api/rescan-progress to read it.
+    config_models_dir = config_manager.project_root / "config" / "models"
+    total = sum(1 for _ in config_models_dir.glob("*.sh")) if config_models_dir.exists() else 0
+    RESCAN_STATE.update({"active": True, "current": "", "done": 0, "total": total})
+
+    def _progress(name: str) -> None:
+        RESCAN_STATE["current"] = name
+        RESCAN_STATE["done"] = int(RESCAN_STATE.get("done", 0)) + 1
+
     try:
-        await config_manager.load_all_models()
+        await config_manager.load_all_models(
+            force_recompute_multiplier=True,
+            on_progress=_progress,
+        )
         # Register any newly discovered models in gpu_manager so state tracking works
         gpu_manager.sync_models_from_config()
         count = len(config_manager.get_all_models())
@@ -495,6 +530,8 @@ async def rescan_models():
             content=f'<span class="text-red-400">✗ Error: {str(e)}</span>',
             status_code=500,
         )
+    finally:
+        RESCAN_STATE.update({"active": False, "current": "", "done": 0, "total": 0})
 
 
 async def _auto_load_startup_models() -> None:
@@ -753,6 +790,7 @@ async def parse_script_endpoint(script_text: str = Form(...)):
             "cache_type_v": cache_type_v,
             "llama_path": suggested_llama_path,  # None if invalid/missing
             "display_name": ps.display_name,
+            "health_timeout": ps.health_timeout,  # None if absent from meta fence
             "advanced": args,
             "warnings": warnings,
         })
@@ -847,6 +885,9 @@ async def config_modal_new(model: str):
             current_ctx=current_ctx,
             current_ctk=current_ctk,
             current_ctv=current_ctv,
+            # Per-model health-check timeout (None → use default at load time)
+            health_timeout=model_config.health_timeout,
+            default_health_timeout=model_config.effective_health_timeout(),
         )
         return HTMLResponse(html)
     except Exception as e:
@@ -888,6 +929,21 @@ async def save_model_config_new(
                 return _error_modal("Port must be between 1 and 65535")
         except (ValueError, TypeError):
             return _error_modal("Port must be a valid number")
+
+        # Optional health-check timeout (seconds). Empty / missing → None (use default).
+        ht_raw = core_data.get("health_timeout")
+        health_timeout: Optional[int] = None
+        if ht_raw not in (None, "", 0):
+            try:
+                ht_val = int(ht_raw)
+            except (ValueError, TypeError):
+                return _error_modal("Health-check timeout must be a whole number of seconds.")
+            from launch_script import HEALTH_TIMEOUT_MIN, HEALTH_TIMEOUT_MAX
+            if ht_val < HEALTH_TIMEOUT_MIN or ht_val > HEALTH_TIMEOUT_MAX:
+                return _error_modal(
+                    f"Health-check timeout must be between {HEALTH_TIMEOUT_MIN} and {HEALTH_TIMEOUT_MAX} seconds."
+                )
+            health_timeout = ht_val
 
         # Parse advanced fields
         try:
@@ -954,6 +1010,7 @@ async def save_model_config_new(
                 model_path=existing_config.model_path,
                 llama_bin=llama_bin,
                 args=launch_args,
+                health_timeout=health_timeout,
             )
         except Exception as e:
             logger.error(f"✗ Failed to save script: {e}", exc_info=True)

@@ -72,6 +72,15 @@ KNOWN_FLAG_ONLY = {
 # Meta fields that are GGUF-derived (integers); user-owned fields are str.
 META_INT_FIELDS = {"block_count", "max_context", "kv_cache_multiplier"}
 
+# Default health-check timeout in seconds. Used when a model's script doesn't
+# declare an explicit `health_timeout` in the meta fence. 120 was the previous
+# hardcoded value in llama_session.py.
+DEFAULT_HEALTH_TIMEOUT = 120
+
+# Bounds for user-set health timeout values (seconds).
+HEALTH_TIMEOUT_MIN = 1
+HEALTH_TIMEOUT_MAX = 1800
+
 
 @dataclass
 class ParsedScript:
@@ -82,6 +91,8 @@ class ParsedScript:
     block_count: Optional[int] = None
     max_context: Optional[int] = None
     kv_cache_multiplier: Optional[int] = None
+    # Optional per-model overrides (None = use default at read time)
+    health_timeout: Optional[int] = None
 
     # Launch-args fence contents
     llama_bin: Optional[str] = None  # binary path used in the exec line
@@ -317,6 +328,13 @@ def parse_script(text: str) -> ParsedScript:
                     setattr(ps, f, int(v))
                 except ValueError:
                     ps.warnings.append(f"meta {f}={v!r} is not an integer")
+        # Optional user-overridable fields
+        ht = meta.get("health_timeout")
+        if ht is not None and ht != "":
+            try:
+                ps.health_timeout = int(ht)
+            except ValueError:
+                ps.warnings.append(f"meta health_timeout={ht!r} is not an integer")
     else:
         ps.warnings.append("meta fence missing")
 
@@ -482,12 +500,15 @@ def render_script(
     model_path: Optional[str],
     args: Dict[str, Optional[str]],
     preserved_body: Optional[str] = None,
+    health_timeout: Optional[int] = None,
 ) -> str:
     """Render a complete script.
 
     `args` should NOT include --model / -m (model_path is rendered separately).
     `preserved_body` is the content between the meta fence and the args fence;
     if None, a default LLAMA_BIN assignment is emitted.
+    `health_timeout`, when set, adds a `# health_timeout: N` line to the meta
+    fence. Pass None to omit (the load logic falls back to DEFAULT_HEALTH_TIMEOUT).
     """
     meta_lines = [META_BEGIN]
     if display_name:
@@ -498,6 +519,8 @@ def render_script(
         meta_lines.append(f"# max_context: {max_context}")
     if kv_cache_multiplier is not None:
         meta_lines.append(f"# kv_cache_multiplier: {kv_cache_multiplier}")
+    if health_timeout is not None:
+        meta_lines.append(f"# health_timeout: {health_timeout}")
     meta_lines.append(META_END)
     meta_block = "\n".join(meta_lines)
 
@@ -542,6 +565,7 @@ def patch_meta_fence(
     block_count: Optional[int] = None,
     max_context: Optional[int] = None,
     kv_cache_multiplier: Optional[int] = None,
+    health_timeout: Optional[int] = None,
 ) -> str:
     """Rewrite only the meta fence. Add it after the shebang if missing.
 
@@ -556,6 +580,8 @@ def patch_meta_fence(
         new_lines.append(f"# max_context: {max_context}")
     if kv_cache_multiplier is not None:
         new_lines.append(f"# kv_cache_multiplier: {kv_cache_multiplier}")
+    if health_timeout is not None:
+        new_lines.append(f"# health_timeout: {health_timeout}")
     new_lines.append(META_END)
     new_block = "\n".join(new_lines)
 

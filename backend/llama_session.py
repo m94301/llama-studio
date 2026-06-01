@@ -22,11 +22,13 @@ class LlamaSession:
         llama_server_binary: str,
         log_file: Path,
         gpu_ids: Optional[list] = None,
+        health_timeout: int = 120,
     ):
         self.model_config = model_config
         self.llama_server_binary = llama_server_binary
         self.log_file = log_file
         self.gpu_ids = list(gpu_ids) if gpu_ids else [0]
+        self.health_timeout = int(health_timeout)
         self.process: Optional[subprocess.Popen] = None
         self.pid: Optional[int] = None
         self.cancelled: bool = False
@@ -83,10 +85,10 @@ class LlamaSession:
 
             self.pid = self.process.pid
             logger.info(f"✓ Process spawned with PID {self.pid}")
-            logger.info(f"   Polling health check at 5s intervals using 120s timeout")
+            logger.info(f"   Polling health check at 5s intervals using {self.health_timeout}s timeout")
 
             # Wait for llama-server to be ready
-            await self.wait_ready(timeout=120)
+            await self.wait_ready(timeout=self.health_timeout)
 
             logger.info(f"✓ {self.model_config.name} ready on port {self.model_config.port}")
             return self.pid

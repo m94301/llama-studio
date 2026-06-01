@@ -5,6 +5,7 @@ Each script has a meta fence (display_name + GGUF-derived cache) and a
 launch-args fence (the llama-server invocation). See backend/launch_script.py.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from launch_script import (
     patch_meta_fence,
     patch_launch_args_fence,
     patch_cuda_visible_devices,
+    DEFAULT_HEALTH_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,15 @@ class ModelConfig:
     @property
     def kv_cache_multiplier(self) -> Optional[int]:
         return self.parsed.kv_cache_multiplier
+
+    @property
+    def health_timeout(self) -> Optional[int]:
+        """Raw per-model timeout override from the meta fence, or None if absent."""
+        return self.parsed.health_timeout
+
+    def effective_health_timeout(self) -> int:
+        """Per-model timeout if set, else the global default. Always returns an int."""
+        return self.parsed.health_timeout if self.parsed.health_timeout is not None else DEFAULT_HEALTH_TIMEOUT
 
     @property
     def launch_args(self) -> Dict[str, Any]:
@@ -236,7 +247,11 @@ class ConfigManager:
             logger.error(f"✗ Error saving app config: {e}")
             raise
 
-    async def load_all_models(self) -> Dict[str, ModelConfig]:
+    async def load_all_models(
+        self,
+        force_recompute_multiplier: bool = False,
+        on_progress=None,
+    ) -> Dict[str, ModelConfig]:
         """Scan config/models/*.sh; for any GGUFs without a script, generate a skeleton.
 
         Before loading, runs a sync pass over `.sh` / `.sh.old` files: scripts whose
@@ -244,6 +259,12 @@ class ConfigManager:
         but preserved); `.sh.old` scripts whose model file has reappeared are
         promoted back to `.sh`. This keeps the table tidy without trashing user
         config.
+
+        `force_recompute_multiplier`: when True (set by the explicit Rescan
+        button), re-parses every model's GGUF using the script's current
+        --ctx-size and rewrites the meta fence if the stored multiplier is stale.
+        Used to refresh SWA-architecture models after their saved ctx changed
+        outside the modal-save flow (e.g., hand-edited scripts).
         """
         if not self.app_config:
             raise RuntimeError("App config not loaded yet. Call load_app_config() first.")
@@ -275,25 +296,59 @@ class ConfigManager:
             if not script_path.exists():
                 self._generate_skeleton(script_path, model_name, gguf_path)
 
-        # Step 2: load every .sh in config/models
-        for script_path in sorted(config_models_dir.glob("*.sh")):
-            model_name = script_path.stem
+        # Step 2: load every .sh in config/models.
+        # _load_one can trigger a GGUF re-parse (CPU-bound, ~1s/model on large
+        # files), so run them concurrently across worker threads. parse_gguf
+        # results are cached by mtime so repeat rescans are nearly free.
+        # `on_progress(model_name)`, if provided, is called from each worker
+        # thread immediately before that script is loaded — used by the UI to
+        # report which model is currently being scanned.
+        script_paths = sorted(config_models_dir.glob("*.sh"))
+
+        def _load_with_progress(sp):
             try:
-                model_config = self._load_one(script_path)
-                self.models[model_name] = model_config
-                status = "✓ configured" if model_config.is_configured else f"⚠ {model_config.config_error}"
-                size_str = f"{model_config.size_gb:.1f}GB" if model_config.size_gb else "?"
-                logger.info(f"   {status}: {model_name} ({size_str})")
-            except Exception as e:
-                logger.error(f"✗ Error loading {script_path.name}: {e}")
+                result = self._load_one(sp, force_recompute_multiplier)
+            finally:
+                # Report progress *after* the load — this reflects completions
+                # rather than starts, so the (N/total) counter actually tracks
+                # work that's been done. Workers start concurrently, so reporting
+                # on start would jump straight to total/total.
+                if on_progress is not None:
+                    try:
+                        on_progress(sp.stem)
+                    except Exception:
+                        pass
+            return result
+
+        results = await asyncio.gather(
+            *(asyncio.to_thread(_load_with_progress, sp) for sp in script_paths),
+            return_exceptions=True,
+        )
+        for script_path, result in zip(script_paths, results):
+            model_name = script_path.stem
+            if isinstance(result, Exception):
+                logger.error(f"✗ Error loading {script_path.name}: {result}")
+                continue
+            model_config = result
+            self.models[model_name] = model_config
+            status = "✓ configured" if model_config.is_configured else f"⚠ {model_config.config_error}"
+            size_str = f"{model_config.size_gb:.1f}GB" if model_config.size_gb else "?"
+            logger.info(f"   {status}: {model_name} ({size_str})")
 
         configured = sum(1 for m in self.models.values() if m.is_configured)
         skeleton = len(self.models) - configured
         logger.info(f"✓ Loaded {len(self.models)} model(s) ({configured} configured, {skeleton} unconfigured)")
         return self.models
 
-    def _load_one(self, script_path: Path) -> ModelConfig:
-        """Read + parse a script, backfill GGUF metadata if missing, compute derived fields."""
+    def _load_one(self, script_path: Path, force_recompute_multiplier: bool = False) -> ModelConfig:
+        """Read + parse a script, backfill GGUF metadata if missing, compute derived fields.
+
+        `force_recompute_multiplier`: when True, re-parses the GGUF using the
+        script's current --ctx-size as the reference context and rewrites the
+        meta fence if the resulting multiplier differs from what's stored.
+        Used by the explicit Rescan flow to refresh SWA models whose ctx was
+        changed outside the modal-save path (e.g., hand-edits).
+        """
         text = script_path.read_text()
         parsed = parse_script(text)
 
@@ -308,21 +363,75 @@ class ConfigManager:
             and Path(parsed.model_path).exists()
             and any(getattr(parsed, f) is None for f in ("block_count", "max_context", "kv_cache_multiplier"))
         )
+        # Determine the ctx + batch + cache types the multiplier should be baked
+        # against, for both backfill and the forced-recompute path. Falls back to
+        # max_context when no ctx is set.
+        script_ctx = parsed.args.get("--ctx-size") or parsed.args.get("-c")
+        try:
+            script_ctx_int = int(script_ctx) if script_ctx else None
+        except (ValueError, TypeError):
+            script_ctx_int = None
+        reference_ctx = script_ctx_int or parsed.max_context
+        script_batch = parsed.args.get("--batch-size") or parsed.args.get("-b")
+        try:
+            script_batch_int = int(script_batch) if script_batch else None
+        except (ValueError, TypeError):
+            script_batch_int = None
+        ctk = parsed.args.get("--cache-type-k") or parsed.args.get("-ctk") or "f16"
+        ctv = parsed.args.get("--cache-type-v") or parsed.args.get("-ctv") or "f16"
+        k_bytes = KV_BYTES.get(str(ctk), 2.0)
+        v_bytes = KV_BYTES.get(str(ctv), 2.0)
+
+        _gguf_kwargs = dict(
+            reference_ctx=reference_ctx,
+            reference_batch_size=script_batch_int,
+            reference_k_bytes=k_bytes,
+            reference_v_bytes=v_bytes,
+        )
+
         if needs_backfill:
             try:
-                meta = parse_gguf_metadata(parsed.model_path)
+                meta = parse_gguf_metadata(parsed.model_path, **_gguf_kwargs)
                 new_text = patch_meta_fence(
                     text,
                     display_name=parsed.display_name,
                     block_count=meta.block_count,
                     max_context=meta.max_context,
                     kv_cache_multiplier=meta.kv_cache_multiplier,
+                    # Preserve any existing user-tunable fields across backfill.
+                    health_timeout=parsed.health_timeout,
                 )
                 script_path.write_text(new_text)
+                text = new_text
                 parsed = parse_script(new_text)
                 logger.debug(f"   Backfilled GGUF metadata for {script_path.stem}")
             except Exception as e:
                 logger.warning(f"⚠ Could not backfill metadata for {script_path.stem}: {e}")
+        elif force_recompute_multiplier and parsed.model_path and Path(parsed.model_path).exists():
+            # Refresh the multiplier for the script's current ctx — only writes if changed.
+            try:
+                fresh = parse_gguf_metadata(parsed.model_path, **_gguf_kwargs)
+                if (
+                    fresh.kv_cache_multiplier is not None
+                    and fresh.kv_cache_multiplier != parsed.kv_cache_multiplier
+                ):
+                    new_text = patch_meta_fence(
+                        text,
+                        display_name=parsed.display_name,
+                        block_count=parsed.block_count,
+                        max_context=parsed.max_context,
+                        kv_cache_multiplier=fresh.kv_cache_multiplier,
+                        health_timeout=parsed.health_timeout,
+                    )
+                    script_path.write_text(new_text)
+                    text = new_text
+                    parsed = parse_script(new_text)
+                    logger.info(
+                        f"   Refreshed multiplier for {script_path.stem}: "
+                        f"{parsed.kv_cache_multiplier} (ref_ctx={reference_ctx})"
+                    )
+            except Exception as e:
+                logger.warning(f"⚠ Could not refresh multiplier for {script_path.stem}: {e}")
 
         mc = ModelConfig(
             name=script_path.stem,
@@ -436,20 +545,66 @@ class ConfigManager:
         model_path: str,
         llama_bin: str,
         args: Dict[str, Optional[str]],
+        health_timeout: Optional[int] = None,
     ) -> ModelConfig:
         """Update a model's script by patching the launch-args and meta fences in place.
 
         Preserves any user content outside the fences. If the script doesn't
         exist yet, creates one from scratch.
+
+        `health_timeout`: optional per-model override (seconds). Pass None to
+        omit the line from the meta fence (load uses DEFAULT_HEALTH_TIMEOUT).
+
+        Side effect: for SWA-architecture models, re-parses the GGUF with the
+        saved --ctx-size as the reference context, so the cached
+        `kv_cache_multiplier` is accurate for the just-saved configuration.
+        Non-SWA models also re-parse (cheap and harmless) so any architectural
+        refinements in the parser propagate on save.
         """
         script_path = self.project_root / "config" / "models" / f"{model_name}.sh"
         script_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Pull GGUF metadata for the meta fence (use existing parsed if present)
+        # Pull GGUF metadata for the meta fence (use existing parsed as fallback)
         existing = self.models.get(model_name)
         block_count = existing.block_count if existing else None
         max_context = existing.max_context if existing else None
         kv_cache_multiplier = existing.kv_cache_multiplier if existing else None
+
+        # Re-parse GGUF using the about-to-be-saved ctx + batch + cache types so
+        # SWA models get an accurate multiplier AND the compute-buffer overhead
+        # is baked for the user's actual config. Falls back to cached values if
+        # the file is missing or parsing fails.
+        new_ctx = args.get("--ctx-size") or args.get("-c")
+        try:
+            new_ctx_int = int(new_ctx) if new_ctx not in (None, "") else None
+        except (ValueError, TypeError):
+            new_ctx_int = None
+        new_batch = args.get("--batch-size") or args.get("-b")
+        try:
+            new_batch_int = int(new_batch) if new_batch not in (None, "") else None
+        except (ValueError, TypeError):
+            new_batch_int = None
+        ctk = args.get("--cache-type-k") or args.get("-ctk") or "f16"
+        ctv = args.get("--cache-type-v") or args.get("-ctv") or "f16"
+        k_bytes = KV_BYTES.get(str(ctk), 2.0)
+        v_bytes = KV_BYTES.get(str(ctv), 2.0)
+        if model_path and Path(model_path).exists():
+            try:
+                fresh = parse_gguf_metadata(
+                    model_path,
+                    reference_ctx=new_ctx_int,
+                    reference_batch_size=new_batch_int,
+                    reference_k_bytes=k_bytes,
+                    reference_v_bytes=v_bytes,
+                )
+                if fresh.block_count is not None:
+                    block_count = fresh.block_count
+                if fresh.max_context is not None:
+                    max_context = fresh.max_context
+                if fresh.kv_cache_multiplier is not None:
+                    kv_cache_multiplier = fresh.kv_cache_multiplier
+            except Exception as e:
+                logger.warning(f"⚠ GGUF re-parse on save failed for {model_name}: {e}")
 
         if script_path.exists():
             text = script_path.read_text()
@@ -459,6 +614,7 @@ class ConfigManager:
                 block_count=block_count,
                 max_context=max_context,
                 kv_cache_multiplier=kv_cache_multiplier,
+                health_timeout=health_timeout,
             )
             text = patch_launch_args_fence(
                 text,
@@ -476,6 +632,7 @@ class ConfigManager:
                 llama_bin=llama_bin,
                 model_path=model_path,
                 args=args,
+                health_timeout=health_timeout,
             )
 
         script_path.write_text(text)

@@ -485,6 +485,8 @@
                 <button hx-post="/api/rescan-models"
                         hx-target="#rescan-status"
                         hx-swap="innerHTML"
+                        hx-on::before-request="startRescanPolling()"
+                        hx-on::after-request="stopRescanPolling()"
                         class="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold transition-colors">
                     🔄 Rescan
                 </button>
@@ -504,6 +506,47 @@
 
     <!-- HTMX Event Handlers -->
     <script>
+        // Rescan progress: poll /api/rescan-progress every 250ms while the
+        // /api/rescan-models POST is in flight. htmx fires startRescanPolling on
+        // beforeRequest and stopRescanPolling on afterRequest.
+        //
+        // Race protection: an in-flight poll can resolve *after* htmx swaps in
+        // the success message, overwriting it with stale "⏳ Rescanning…" text.
+        // We guard with (a) an AbortController to cancel pending fetches when
+        // stopping, and (b) a `_rescanStopped` flag so any fetch that already
+        // resolved past the abort can't write to the DOM.
+        let _rescanPollHandle = null;
+        let _rescanAbort = null;
+        let _rescanStopped = true;
+
+        async function _fetchRescanProgress() {
+            if (_rescanStopped) return;
+            try {
+                const r = await fetch('/api/rescan-progress', { signal: _rescanAbort && _rescanAbort.signal });
+                if (_rescanStopped) return;  // stopped while fetch was in flight
+                if (!r.ok) return;
+                const html = await r.text();
+                if (_rescanStopped) return;  // double-check after await
+                if (html.trim() === '') return;
+                document.getElementById('rescan-status').innerHTML = html;
+            } catch (e) { /* swallow — polling is best-effort and may be aborted */ }
+        }
+        function startRescanPolling() {
+            _rescanStopped = false;
+            _rescanAbort = new AbortController();
+            document.getElementById('rescan-status').innerHTML =
+                '<span class="text-blue-300">⏳ Rescanning…</span>';
+            if (_rescanPollHandle) clearInterval(_rescanPollHandle);
+            _rescanPollHandle = setInterval(_fetchRescanProgress, 250);
+        }
+        function stopRescanPolling() {
+            _rescanStopped = true;
+            if (_rescanAbort) { try { _rescanAbort.abort(); } catch (e) {} }
+            _rescanAbort = null;
+            if (_rescanPollHandle) clearInterval(_rescanPollHandle);
+            _rescanPollHandle = null;
+        }
+
         // Persist the "Load on startup" checkbox to app.json
         async function toggleAutoLoadOnStartup(enabled) {
             const fd = new FormData();

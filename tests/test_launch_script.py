@@ -536,6 +536,109 @@ CUDA_VISIBLE_DEVICES=0,1 exec "$LLAMA_BIN" \\
     assert ps.cuda_visible_devices == [4, 5]
 
 
+# ---------- health_timeout meta field ----------
+
+def test_health_timeout_default_absent():
+    """Scripts without health_timeout parse to None."""
+    ps = parse_script(CANONICAL)
+    assert ps.health_timeout is None
+
+
+def test_health_timeout_parses_when_present():
+    text = CANONICAL.replace(
+        "# kv_cache_multiplier: 213",
+        "# kv_cache_multiplier: 213\n# health_timeout: 300",
+    )
+    ps = parse_script(text)
+    assert ps.health_timeout == 300
+
+
+def test_health_timeout_malformed_warns_and_keeps_none():
+    text = CANONICAL.replace(
+        "# kv_cache_multiplier: 213",
+        "# kv_cache_multiplier: 213\n# health_timeout: not-a-number",
+    )
+    ps = parse_script(text)
+    assert ps.health_timeout is None
+    assert any("health_timeout" in w for w in ps.warnings)
+
+
+def test_render_health_timeout_round_trip():
+    text = render_script(
+        display_name="X",
+        block_count=64,
+        max_context=4096,
+        kv_cache_multiplier=128,
+        llama_bin="/bin/llama-server",
+        model_path="/m.gguf",
+        args={"--port": "8100"},
+        health_timeout=600,
+    )
+    assert "# health_timeout: 600" in text
+    ps = parse_script(text)
+    assert ps.health_timeout == 600
+
+
+def test_render_health_timeout_omitted_when_none():
+    text = render_script(
+        display_name="X",
+        block_count=64,
+        max_context=4096,
+        kv_cache_multiplier=128,
+        llama_bin="/bin/llama-server",
+        model_path="/m.gguf",
+        args={"--port": "8100"},
+        health_timeout=None,
+    )
+    assert "health_timeout" not in text
+
+
+def test_patch_meta_fence_adds_health_timeout():
+    text = render_script(
+        display_name="X",
+        block_count=64,
+        max_context=4096,
+        kv_cache_multiplier=128,
+        llama_bin="/bin/llama-server",
+        model_path="/m.gguf",
+        args={"--port": "8100"},
+    )
+    new = patch_meta_fence(
+        text,
+        display_name="X",
+        block_count=64,
+        max_context=4096,
+        kv_cache_multiplier=128,
+        health_timeout=900,
+    )
+    ps = parse_script(new)
+    assert ps.health_timeout == 900
+    assert ps.port == 8100
+
+
+def test_patch_meta_fence_strips_health_timeout_when_omitted():
+    text = render_script(
+        display_name="X",
+        block_count=64,
+        max_context=4096,
+        kv_cache_multiplier=128,
+        llama_bin="/bin/llama-server",
+        model_path="/m.gguf",
+        args={"--port": "8100"},
+        health_timeout=300,
+    )
+    new = patch_meta_fence(
+        text,
+        display_name="X",
+        block_count=64,
+        max_context=4096,
+        kv_cache_multiplier=128,
+    )
+    assert "health_timeout" not in new
+    ps = parse_script(new)
+    assert ps.health_timeout is None
+
+
 # ---------- migration round-trip: legacy JSON shapes ----------
 
 def test_migration_from_jsonish_launch_args():
