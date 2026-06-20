@@ -15,7 +15,7 @@ import socket
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 
 from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -1454,8 +1454,17 @@ async def calculate_vram(
 @app.get("/api/get-current-settings", response_class=JSONResponse)
 async def get_current_settings():
     """Return current settings for settings modal population."""
+    # Format the schema-detected llama-server version like the per-model modal
+    # ("9244 (b28a2f372)"). Falls back to "unknown" if no schema is cached.
+    version_raw = config_manager.app_config.llama_schema_version
+    if version_raw:
+        parts = version_raw.split("_")
+        version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
+    else:
+        version_str = "unknown"
     return {
         "llama_server": config_manager.app_config.llama_server_binary,
+        "llama_server_version": version_str,
         "models_directory": config_manager.app_config.models_directory,
         "webui_port": config_manager.app_config.webui_port,
     }

@@ -758,6 +758,10 @@
                 document.getElementById('llama-server-display').value = settings.llama_server;
                 document.getElementById('models-directory-display').value = settings.models_directory;
                 document.getElementById('webui-port-input').value = settings.webui_port || 7999;
+                const versionBadge = document.getElementById('llama-server-version-badge');
+                if (versionBadge) {
+                    versionBadge.textContent = settings.llama_server_version || 'unknown';
+                }
             } catch (e) {
                 console.error('Error loading settings:', e);
             }
@@ -917,7 +921,12 @@
 
                 <!-- Llama Server Section -->
                 <fieldset>
-                    <legend class="text-sm font-bold text-gray-300 mb-3">Llama Server Binary</legend>
+                    <legend class="text-sm font-bold text-gray-300 mb-3">
+                        Llama Server Binary
+                        <span id="llama-server-version-badge"
+                              class="ml-2 inline-block px-2 py-0.5 rounded text-xs font-mono font-normal bg-gray-700 text-gray-300"
+                              title="Detected llama-server version">unknown</span>
+                    </legend>
                     <div class="flex gap-3">
                         <input type="text"
                                id="llama-server-display"
