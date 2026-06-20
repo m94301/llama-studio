@@ -1,0 +1,112 @@
+<!-- Multi-GPU picker: N dropdown slots for tensor-split models. -->
+{% extends "base_modal.html" %}
+{% set title = "Pick GPUs" %}
+{% set width = "lg" %}
+
+{% block content %}
+<p class="text-sm text-gray-300 mb-2">
+    Loading: <span class="font-bold text-blue-400">{{ display_name }}</span>
+    <span class="text-xs text-gray-500">— {{ gpu_count }}-way split</span>
+</p>
+<p class="text-xs text-gray-400 mb-4">
+    Pick {{ gpu_count }} distinct GPUs. Per-GPU share is shown for each slot.
+</p>
+
+<form id="gpu-multi-picker-form" class="space-y-3 mb-4">
+    {% for i in range(gpu_count) %}
+        {% set need = per_gpu_need[i] %}
+        <div class="flex items-center gap-3">
+            <label class="text-xs font-bold text-gray-400 w-20">
+                Slot {{ i + 1 }}
+                <span class="block text-[10px] font-normal text-gray-500">{{ "%.1f"|format(need) }} GB</span>
+            </label>
+            <select name="gpu_id_{{ i }}"
+                    onchange="updatePickerState()"
+                    class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-2 text-sm text-gray-300">
+                <option value="">— pick GPU —</option>
+                {% for gid, gpu in gpu_data.items() | sort %}
+                    {% set available = gpu.memory - gpu.allocated %}
+                    {% set can_fit = available >= need %}
+                    <option value="{{ gid }}" data-available="{{ available }}" data-need="{{ need }}">
+                        GPU {{ gid }}: {{ gpu.name }} — {{ "%.1f"|format(available) }} GB free
+                        {{ '' if can_fit else '⚠' }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+    {% endfor %}
+</form>
+
+<p id="picker-warning" class="text-xs text-yellow-400 mb-2 min-h-[16px]"></p>
+
+<div class="flex gap-3 mt-2">
+    <button onclick="document.getElementById('modal').remove();"
+            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+        Cancel
+    </button>
+    <button id="picker-load-btn"
+            type="button"
+            onclick="submitMultiGpuPick()"
+            disabled
+            class="flex-1 px-4 py-2 rounded font-bold transition-colors text-white bg-gray-600 cursor-not-allowed opacity-50">
+        Load
+    </button>
+</div>
+
+<script>
+(function() {
+    const form = document.getElementById('gpu-multi-picker-form');
+    const warningEl = document.getElementById('picker-warning');
+    const loadBtn = document.getElementById('picker-load-btn');
+
+    window.updatePickerState = function() {
+        const selects = form.querySelectorAll('select');
+        const picks = Array.from(selects).map(s => s.value);
+        const warnings = [];
+        let allFilled = picks.every(v => v !== '');
+        let duplicate = false;
+        if (allFilled) {
+            const seen = new Set();
+            for (const v of picks) {
+                if (seen.has(v)) { duplicate = true; break; }
+                seen.add(v);
+            }
+            if (duplicate) warnings.push('Same GPU picked more than once.');
+        }
+        // Per-slot VRAM check
+        for (const sel of selects) {
+            const opt = sel.options[sel.selectedIndex];
+            if (!opt || !opt.value) continue;
+            const avail = parseFloat(opt.dataset.available);
+            const need = parseFloat(opt.dataset.need);
+            if (avail < need) {
+                warnings.push(`Slot ${sel.name.split('_')[2] || ''}: GPU ${sel.value} has ${avail.toFixed(1)} GB but needs ${need.toFixed(1)} GB.`);
+            }
+        }
+        const ok = allFilled && !duplicate && warnings.length === 0;
+        warningEl.textContent = warnings.join(' ');
+        loadBtn.disabled = !ok;
+        if (ok) {
+            loadBtn.className = 'flex-1 px-4 py-2 rounded font-bold transition-colors text-white bg-green-600 hover:bg-green-500';
+        } else {
+            loadBtn.className = 'flex-1 px-4 py-2 rounded font-bold transition-colors text-white bg-gray-600 cursor-not-allowed opacity-50';
+        }
+    };
+
+    window.submitMultiGpuPick = function() {
+        const selects = form.querySelectorAll('select');
+        const ids = Array.from(selects).map(s => s.value);
+        const fd = new FormData();
+        fd.append('model_name', '{{ model_name }}');
+        ids.forEach(id => fd.append('gpu_ids', id));
+        // FormData supports repeated keys natively; trigger-load reads them as List[int].
+        fetch('/api/trigger-load', { method: 'POST', body: fd })
+            .then(r => r.text())
+            .then(html => {
+                document.getElementById('modal-container').innerHTML = html;
+                if (window.htmx) htmx.process(document.getElementById('modal-container'));
+            });
+    };
+})();
+</script>
+{% endblock %}

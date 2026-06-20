@@ -1,0 +1,52 @@
+<!-- Confirm modal: shown when CUDA_VISIBLE_DEVICES is set in the script and the assignment is usable.
+     Lets the user accept the stored assignment or open the picker. -->
+{% extends "base_modal.html" %}
+{% set title = "Load to stored GPUs?" %}
+{% set width = "md" %}
+
+{% block content %}
+<p class="text-sm text-gray-300 mb-2">
+    Loading: <span class="font-bold text-blue-400">{{ display_name }}</span>
+    {% if gpu_count > 1 %}
+    <span class="text-xs text-gray-500">— {{ gpu_count }}-way split</span>
+    {% endif %}
+</p>
+<p class="text-xs text-gray-400 mb-4">
+    Last used: <code class="text-gray-300">GPU{{ 's' if gpu_count > 1 else '' }} {{ cvd_csv }}</code>
+</p>
+
+<div class="space-y-2 mb-4">
+    {% for slot in slots %}
+        {% set color = "border-green-600 bg-gray-800" if slot.ok else "border-red-600 bg-red-900 bg-opacity-30" %}
+        <div class="p-3 rounded border {{ color }}">
+            <div class="flex justify-between items-center">
+                <span class="font-bold">GPU {{ slot.gpu_id }}: {{ slot.gpu_name }}</span>
+                <span class="text-xs">{{ "%.1f"|format(slot.available) }} / {{ "%.1f"|format(slot.total) }} GB free</span>
+            </div>
+            <div class="text-xs mt-1 {{ 'text-green-400' if slot.ok else 'text-red-400' }}">
+                Needs {{ "%.1f"|format(slot.need) }} GB on this GPU
+                {% if slot.ok %}✓{% else %}✗ {{ slot.reason }}{% endif %}
+            </div>
+        </div>
+    {% endfor %}
+</div>
+
+<div class="flex gap-3 mt-6">
+    <button onclick="document.getElementById('modal').remove();"
+            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+        Cancel
+    </button>
+    <button hx-get="/api/gpu-selector?model={{ model_name }}&force_pick=1"
+            hx-target="#modal-container" hx-swap="innerHTML"
+            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+        Pick different GPUs
+    </button>
+    <button {% if not all_ok %}disabled{% endif %}
+            hx-post="/api/trigger-load"
+            hx-vals='{{ load_hx_vals }}'
+            hx-target="#modal-container" hx-swap="innerHTML"
+            class="flex-1 px-4 py-2 rounded font-bold transition-colors text-white {{ 'bg-green-600 hover:bg-green-500' if all_ok else 'bg-gray-600 cursor-not-allowed opacity-50' }}">
+        Load
+    </button>
+</div>
+{% endblock %}
