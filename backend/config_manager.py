@@ -41,6 +41,21 @@ KV_BYTES: Dict[str, float] = {
 }
 
 
+# llama.cpp splits large models into shards named `<base>-00001-of-00004.gguf`.
+# Only the first shard is passed to llama-server (`-m …-00001-of-00004.gguf`); it
+# loads the remaining shards automatically. We must therefore treat a shard set as
+# a single model: one config named after `<base>`, with a size summed across shards.
+_SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
+
+
+def parse_split_gguf(path: Path):
+    """If `path` is a multipart GGUF shard, return (base_name, index, total); else None."""
+    m = _SPLIT_RE.match(path.name)
+    if not m:
+        return None
+    return m.group("base"), int(m.group("idx")), int(m.group("total"))
+
+
 def calculate_kv_cache_gb(
     block_count: int,
     ctx_size: int,
@@ -288,7 +303,17 @@ class ConfigManager:
         logger.info(f"   Found {len(gguf_files)} GGUF file(s)")
 
         for gguf_path in sorted(gguf_files):
-            model_name = gguf_path.stem
+            split = parse_split_gguf(gguf_path)
+            if split is not None:
+                base_name, idx, _total = split
+                # Only the first shard drives a config; skip 00002-of-N onward so we
+                # don't generate a bogus config per shard. The config's -m points at
+                # this first shard and llama-server pulls in the rest.
+                if idx != 1:
+                    continue
+                model_name = base_name
+            else:
+                model_name = gguf_path.stem
             if model_name.startswith("mmproj"):
                 logger.debug(f"   Skipping mmproj model: {model_name}")
                 continue
@@ -680,6 +705,17 @@ class ConfigManager:
 
     def _get_gguf_size_gb(self, gguf_path: Path) -> float:
         try:
+            split = parse_split_gguf(gguf_path)
+            if split is not None:
+                # Multipart model: sum every shard so the reported size reflects the
+                # whole model, not just the first shard that -m points at.
+                base_name, _idx, total = split
+                total_bytes = 0
+                for i in range(1, total + 1):
+                    part = gguf_path.with_name(f"{base_name}-{i:05d}-of-{total:05d}.gguf")
+                    if part.exists():
+                        total_bytes += part.stat().st_size
+                return round(total_bytes / (1024**3), 1)
             size_bytes = gguf_path.stat().st_size
             return round(size_bytes / (1024**3), 1)
         except Exception as e:

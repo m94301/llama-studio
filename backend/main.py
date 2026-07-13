@@ -15,7 +15,7 @@ import socket
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 
 from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
