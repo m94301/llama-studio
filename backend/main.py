@@ -584,7 +584,7 @@ async def _auto_load_startup_models() -> None:
                     skipped += 1
                     continue
 
-                if len(cvd) != mc.gpu_count:
+                if not mc.is_flexible_split and len(cvd) != mc.gpu_count:
                     logger.warning(
                         f"   ⏭  {name}: skipped — CVD has {len(cvd)} GPU(s) but "
                         f"--tensor-split declares {mc.gpu_count}"
@@ -993,6 +993,15 @@ async def save_model_config_new(
                 )
             new_split_count = len(weights)
 
+        # A flexible-split model (--split-mode layer/row, no --tensor-split) can
+        # keep a CVD of any length, so its prior GPU assignment survives a save.
+        sm_raw = launch_args.get("--split-mode") or launch_args.get("-sm")
+        new_is_flexible_split = (
+            new_split_count == 1
+            and sm_raw is not None
+            and str(sm_raw).strip().lower() in ("layer", "row")
+        )
+
         # Get existing model config to preserve model_path and (if still valid) CVD
         existing_config = config_manager.get_model_config(model_name)
         prior_cvd = existing_config.cuda_visible_devices  # captured before save_model_script clobbers it
@@ -1024,7 +1033,7 @@ async def save_model_config_new(
         # restore CVD that's still consistent with the saved split. Mismatched CVDs are
         # silently dropped (the picker will surface re-pick at next load).
         if prior_cvd is not None:
-            if len(prior_cvd) == new_split_count:
+            if new_is_flexible_split or len(prior_cvd) == new_split_count:
                 model_config = config_manager.save_cuda_visible_devices(model_name, prior_cvd)
             else:
                 logger.info(
@@ -1163,10 +1172,18 @@ def _stored_cvd_usability(model_config: ModelConfig, gpu_data: dict) -> tuple:
     slot is OK and the CVD count matches the model's split count.
     """
     cvd = model_config.cuda_visible_devices or []
-    needs = model_config.per_gpu_vram() or [model_config.total_vram or model_config.size_gb or 0]
-    if model_config.gpu_count != len(cvd) or len(needs) != len(cvd):
-        # Count mismatch (or no CVD): caller treats this as "force picker"
-        return [], False
+    if model_config.is_flexible_split:
+        # Flexible split: any CVD of length >= 1 is valid; the share is the total
+        # divided evenly across however many GPUs the CVD names.
+        fallback = model_config.total_vram or model_config.size_gb or 0
+        needs = model_config.per_gpu_vram(count=len(cvd)) or [fallback / max(1, len(cvd))] * max(1, len(cvd))
+        if len(cvd) < 1 or len(needs) != len(cvd):
+            return [], False
+    else:
+        needs = model_config.per_gpu_vram() or [model_config.total_vram or model_config.size_gb or 0]
+        if model_config.gpu_count != len(cvd) or len(needs) != len(cvd):
+            # Count mismatch (or no CVD): caller treats this as "force picker"
+            return [], False
 
     slots = []
     all_ok = True
@@ -1228,13 +1245,29 @@ async def gpu_selector(model: str, force_pick: int = 0):
                 return HTMLResponse(template.render(
                     model_name=model,
                     display_name=model_config.display_name or model,
-                    gpu_count=gpu_count,
+                    # Use the actual slot count (flexible-split models report
+                    # gpu_count=1 but may span several GPUs via their stored CVD).
+                    gpu_count=len(slots),
                     cvd_csv=cvd_csv,
                     slots=slots,
                     all_ok=all_ok,
                     load_hx_vals=json.dumps(load_vals),
                 ))
             # CVD count mismatch → fall through to picker (blank-slate)
+
+        # Flexible-split path: --split-mode layer/row without --tensor-split.
+        # The user picks any set of GPUs (>=1); the model splits evenly across
+        # them. Per-GPU need is computed live in the template as total / count.
+        if model_config.is_flexible_split:
+            total_need = model_config.total_vram or model_config.size_gb or 0
+            template = jinja_env.get_template("modals/gpu_flex_picker.html")
+            return HTMLResponse(template.render(
+                model_name=model,
+                display_name=model_config.display_name or model,
+                split_mode=model_config.split_mode,
+                total_need=total_need,
+                gpu_data=gpu_data,
+            ))
 
         # Multi-pick path: tensor-split present, no usable CVD (or forced)
         if gpu_count > 1:

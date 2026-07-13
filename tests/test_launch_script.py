@@ -670,3 +670,60 @@ def test_migration_from_jsonish_launch_args():
     assert ps.model_path == model_path
     for k, v in launch_args.items():
         assert ps.args.get(k) == v, f"mismatch for {k}: expected {v!r}, got {ps.args.get(k)!r}"
+
+
+# ---------- split-mode / multi-GPU detection ----------
+
+def _script_with_args(arg_lines: str) -> str:
+    """Build a minimal script whose launch args are the given lines."""
+    return (
+        "#!/usr/bin/env bash\n"
+        "# === llama-studio:meta BEGIN ===\n"
+        "# display_name: T\n"
+        "# === llama-studio:meta END ===\n"
+        "LLAMA_BIN=/x/llama-server\n"
+        'exec "$LLAMA_BIN" \\\n'
+        "  -m /models/foo.gguf \\\n"
+        "  --port 8120 \\\n"
+        f"{arg_lines}"
+        "  -fa on\n"
+    )
+
+
+def test_split_mode_layer_is_flexible():
+    ps = parse_script(_script_with_args("  --split-mode layer \\\n"))
+    assert ps.split_mode == "layer"
+    assert ps.is_flexible_split is True
+    assert ps.gpu_count == 1  # count is chosen at load time, not baked in
+
+
+def test_split_mode_short_alias_row():
+    ps = parse_script(_script_with_args("  -sm row \\\n"))
+    assert ps.split_mode == "row"
+    assert ps.is_flexible_split is True
+
+
+def test_split_mode_none_is_single_gpu():
+    ps = parse_script(_script_with_args("  --split-mode none \\\n"))
+    assert ps.split_mode == "none"
+    assert ps.is_flexible_split is False
+
+
+def test_no_split_mode_is_single_gpu():
+    ps = parse_script(_script_with_args("  --threads 8 \\\n"))
+    assert ps.split_mode is None
+    assert ps.is_flexible_split is False
+
+
+def test_tensor_split_overrides_flexible():
+    ps = parse_script(
+        _script_with_args("  --split-mode layer \\\n  --tensor-split 1,1,1 \\\n")
+    )
+    assert ps.is_flexible_split is False  # explicit tensor-split wins
+    assert ps.gpu_count == 3
+
+
+def test_tensor_split_short_alias():
+    ps = parse_script(_script_with_args("  -ts 2,1 \\\n"))
+    assert ps.gpu_count == 2
+    assert ps.tensor_split_weights == [2.0, 1.0]

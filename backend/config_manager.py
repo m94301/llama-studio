@@ -165,24 +165,48 @@ class ModelConfig:
         return self.parsed.tensor_split_weights
 
     @property
+    def split_mode(self) -> Optional[str]:
+        return self.parsed.split_mode
+
+    @property
+    def is_flexible_split(self) -> bool:
+        return self.parsed.is_flexible_split
+
+    @property
     def cuda_visible_devices(self) -> Optional[list]:
         return self.parsed.cuda_visible_devices
 
-    def per_gpu_vram(self) -> Optional[list]:
-        """Return per-GPU VRAM share (in GB) as a list, honoring tensor-split weights.
+    def per_gpu_vram(self, count: Optional[int] = None) -> Optional[list]:
+        """Return per-GPU VRAM share (in GB) as a list.
 
-        Returns None if total_vram is unknown. For single-GPU, returns [total_vram].
-        For asymmetric splits, returns total_vram * weight_i / sum(weights).
+        Returns None if total_vram is unknown. Behavior by model type:
+        - tensor-split: total_vram * weight_i / sum(weights), one per weight.
+        - flexible split (--split-mode layer/row): total_vram divided evenly
+          across `count` GPUs (falls back to the stored CVD length, else 1).
+        - single-GPU: [total_vram].
+
+        `count` overrides the GPU count for the even-split cases (used by the
+        picker / load path where the user has chosen how many GPUs to use).
         """
         if self.total_vram is None:
             return None
         weights = self.tensor_split_weights
-        if weights is None or len(weights) <= 1:
+        if weights is not None and len(weights) > 1:
+            total_weight = sum(weights)
+            if total_weight <= 0:
+                return [self.total_vram / len(weights)] * len(weights)
+            return [round(self.total_vram * w / total_weight, 2) for w in weights]
+        # Even-split path (flexible split or plain single-GPU).
+        n = count
+        if n is None:
+            if self.is_flexible_split and self.cuda_visible_devices:
+                n = len(self.cuda_visible_devices)
+            else:
+                n = 1
+        n = max(1, n)
+        if n == 1:
             return [self.total_vram]
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            return [self.total_vram / len(weights)] * len(weights)
-        return [round(self.total_vram * w / total_weight, 2) for w in weights]
+        return [round(self.total_vram / n, 2)] * n
 
 
 class AppConfig(BaseModel):

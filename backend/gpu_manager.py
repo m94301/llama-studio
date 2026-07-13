@@ -241,12 +241,18 @@ class GpuManager:
         if model_name in self.sessions:
             raise ValueError(f"Model {model_name} already loaded")
 
-        # Validate gpu_ids count matches model's expected split count
-        expected = model_config.gpu_count
-        if len(gpu_ids) != expected:
-            raise ValueError(
-                f"Model {model_name} declares {expected} GPU(s) via --tensor-split; got {len(gpu_ids)}."
-            )
+        # Validate gpu_ids count matches model's expected split count. A flexible
+        # split (--split-mode layer/row, no --tensor-split) accepts any count >= 1
+        # since it divides evenly across whatever GPUs are made visible.
+        if model_config.is_flexible_split:
+            if len(gpu_ids) < 1:
+                raise ValueError(f"Model {model_name} needs at least one GPU; got none.")
+        else:
+            expected = model_config.gpu_count
+            if len(gpu_ids) != expected:
+                raise ValueError(
+                    f"Model {model_name} declares {expected} GPU(s) via --tensor-split; got {len(gpu_ids)}."
+                )
         if len(set(gpu_ids)) != len(gpu_ids):
             raise ValueError(f"Duplicate GPU IDs in selection: {gpu_ids}")
 
@@ -268,8 +274,9 @@ class GpuManager:
                 f"Port {model_config.port} is already in use. Cannot load {model_name}."
             )
 
-        # Compute per-GPU VRAM need (honors tensor-split weights)
-        per_gpu_need = model_config.per_gpu_vram() or [model_config.total_vram or model_config.size_gb or 0]
+        # Compute per-GPU VRAM need (honors tensor-split weights; even-splits a
+        # flexible-split model across the chosen count).
+        per_gpu_need = model_config.per_gpu_vram(count=len(gpu_ids)) or [model_config.total_vram or model_config.size_gb or 0]
         if len(per_gpu_need) != len(gpu_ids):
             # Defensive: pad/trim to match (shouldn't normally happen since gpu_count is the source)
             if len(gpu_ids) == 1:

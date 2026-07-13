@@ -50,6 +50,8 @@ FLAG_ALIASES: Dict[str, str] = {
     "-b": "--batch-size",
     "-ub": "--ubatch-size",
     "-t": "--threads",
+    "-sm": "--split-mode",
+    "-ts": "--tensor-split",
 }
 
 # Known flag-only (boolean) options for llama-server. Used as a hint when
@@ -141,11 +143,38 @@ class ParsedScript:
 
     @property
     def gpu_count(self) -> int:
-        """Number of GPUs this model wants. 1 if no --tensor-split (or split=[1])."""
+        """Number of GPUs this model wants. 1 if no --tensor-split (or split=[1]).
+
+        Note: a flexible-split model (--split-mode layer/row without
+        --tensor-split) reports 1 here because its count is not fixed by the
+        script — it's chosen at load time. Use `is_flexible_split` to detect
+        that case; the GPU count then comes from the user's selection / CVD.
+        """
         weights = self.tensor_split_weights
         if weights is None:
             return 1
         return len(weights)
+
+    @property
+    def split_mode(self) -> Optional[str]:
+        """Value of --split-mode / -sm, lowercased. None if not set."""
+        raw = self.args.get("--split-mode")
+        return str(raw).strip().lower() if raw else None
+
+    @property
+    def is_flexible_split(self) -> bool:
+        """True when the model splits across a user-chosen set of GPUs.
+
+        This holds when --split-mode is explicitly `layer` or `row` (llama.cpp's
+        multi-GPU modes) and no --tensor-split fixes the count/proportions. The
+        model then splits evenly across whatever GPUs are made visible via
+        CUDA_VISIBLE_DEVICES, so the GPU count is the user's selection rather
+        than a value baked into the script. (`--split-mode none` and the absence
+        of --split-mode both mean single-GPU here.)
+        """
+        if self.tensor_split_weights is not None:
+            return False
+        return self.split_mode in ("layer", "row")
 
     def is_configured(self) -> Tuple[bool, Optional[str]]:
         """Return (configured, reason_if_not)."""

@@ -1,0 +1,114 @@
+<!-- Flexible-split picker: pick any set of GPUs for a --split-mode layer/row model.
+     The model divides evenly across the checked GPUs; per-GPU share is computed
+     live as total_need / (number checked). -->
+{% extends "base_modal.html" %}
+{% set title = "Pick GPUs to split across" %}
+{% set width = "lg" %}
+
+{% block content %}
+<p class="text-sm text-gray-300 mb-2">
+    Loading: <span class="font-bold text-blue-400">{{ display_name }}</span>
+    <span class="text-xs text-gray-500">— split-mode {{ split_mode }}</span>
+</p>
+<p class="text-xs text-gray-400 mb-4">
+    Check the GPUs to split across. The model needs
+    <span class="font-bold text-gray-200">{{ "%.1f"|format(total_need) }} GB</span> total,
+    divided evenly — <span id="flex-share-label">pick one or more</span>.
+</p>
+
+<form id="gpu-flex-picker-form" class="space-y-2 mb-4">
+    {% for gid, gpu in gpu_data.items() | sort %}
+        {% set available = gpu.memory - gpu.allocated %}
+        <label class="flex items-center gap-3 p-2 rounded border border-gray-700 hover:border-gray-500 cursor-pointer">
+            <input type="checkbox" name="gpu_id" value="{{ gid }}"
+                   data-available="{{ available }}"
+                   onchange="updateFlexState()"
+                   class="w-4 h-4 accent-blue-500">
+            <span class="flex-1 text-sm text-gray-300">
+                GPU {{ gid }}: {{ gpu.name }}
+                <span class="block text-[10px] text-gray-500">{{ "%.1f"|format(available) }} GB free</span>
+            </span>
+            <span class="flex-share-status text-xs text-gray-500" data-gid="{{ gid }}"></span>
+        </label>
+    {% endfor %}
+</form>
+
+<p id="flex-warning" class="text-xs text-yellow-400 mb-2 min-h-[16px]"></p>
+
+<div class="flex gap-3 mt-2">
+    <button onclick="document.getElementById('modal').remove();"
+            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+        Cancel
+    </button>
+    <button id="flex-load-btn"
+            type="button"
+            onclick="submitFlexPick()"
+            disabled
+            class="flex-1 px-4 py-2 rounded font-bold transition-colors text-white bg-gray-600 cursor-not-allowed opacity-50">
+        Load
+    </button>
+</div>
+
+<script>
+(function() {
+    const totalNeed = {{ total_need }};
+    const form = document.getElementById('gpu-flex-picker-form');
+    const warningEl = document.getElementById('flex-warning');
+    const shareLabel = document.getElementById('flex-share-label');
+    const loadBtn = document.getElementById('flex-load-btn');
+
+    window.updateFlexState = function() {
+        const boxes = Array.from(form.querySelectorAll('input[type=checkbox]'));
+        const checked = boxes.filter(b => b.checked);
+        const n = checked.length;
+        const share = n > 0 ? totalNeed / n : 0;
+
+        // Update the "X.X GB per GPU across N cards" hint.
+        if (n === 0) {
+            shareLabel.textContent = 'pick one or more';
+        } else {
+            shareLabel.textContent = share.toFixed(1) + ' GB per GPU across ' + n + ' card' + (n > 1 ? 's' : '');
+        }
+
+        // Per-checked-GPU fit check + status markers.
+        const warnings = [];
+        for (const b of boxes) {
+            const statusEl = form.querySelector('.flex-share-status[data-gid="' + b.value + '"]');
+            const avail = parseFloat(b.dataset.available);
+            if (!b.checked) {
+                if (statusEl) statusEl.textContent = '';
+                continue;
+            }
+            const fits = avail >= share;
+            if (statusEl) {
+                statusEl.textContent = (fits ? '✓ ' : '⚠ ') + share.toFixed(1) + ' GB';
+                statusEl.className = 'flex-share-status text-xs ' + (fits ? 'text-green-400' : 'text-yellow-400');
+            }
+            if (!fits) {
+                warnings.push('GPU ' + b.value + ' has ' + avail.toFixed(1) + ' GB but needs ' + share.toFixed(1) + ' GB.');
+            }
+        }
+
+        const ok = n >= 1 && warnings.length === 0;
+        warningEl.textContent = warnings.join(' ');
+        loadBtn.disabled = !ok;
+        loadBtn.className = ok
+            ? 'flex-1 px-4 py-2 rounded font-bold transition-colors text-white bg-green-600 hover:bg-green-500'
+            : 'flex-1 px-4 py-2 rounded font-bold transition-colors text-white bg-gray-600 cursor-not-allowed opacity-50';
+    };
+
+    window.submitFlexPick = function() {
+        const checked = Array.from(form.querySelectorAll('input[type=checkbox]:checked'));
+        const fd = new FormData();
+        fd.append('model_name', '{{ model_name }}');
+        checked.forEach(b => fd.append('gpu_ids', b.value));
+        fetch('/api/trigger-load', { method: 'POST', body: fd })
+            .then(r => r.text())
+            .then(html => {
+                document.getElementById('modal-container').innerHTML = html;
+                if (window.htmx) htmx.process(document.getElementById('modal-container'));
+            });
+    };
+})();
+</script>
+{% endblock %}
