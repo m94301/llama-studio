@@ -75,6 +75,25 @@ AUTO_LOAD_CURRENT_NAME: str = ""
 # /api/rescan-progress while the rescan request is in flight.
 RESCAN_STATE: Dict[str, object] = {"active": False, "current": "", "done": 0, "total": 0}
 
+# Cached machine IPv4, resolved once on first use. The GPU panel embeds this in
+# per-model llama-server URLs; it doesn't change while the server runs, so we
+# avoid opening a probe socket on every panel render (polled ~1/s per client).
+_SERVER_IPV4: Optional[str] = None
+
+
+def get_server_ipv4() -> str:
+    """Return the machine's local IPv4, resolving + caching it on first call."""
+    global _SERVER_IPV4
+    if _SERVER_IPV4 is None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))  # No packets sent; just picks the outbound iface.
+            _SERVER_IPV4 = s.getsockname()[0]
+            s.close()
+        except Exception:
+            _SERVER_IPV4 = "localhost"
+    return _SERVER_IPV4
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -227,15 +246,8 @@ async def gpu_panel():
         </div>
         """
 
-    # Get machine's local IPv4 address
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))  # Doesn't actually connect, just determines local IP
-        server_ipv4 = s.getsockname()[0]
-        s.close()
-    except Exception:
-        # Fallback if can't determine
-        server_ipv4 = "localhost"
+    # Machine's local IPv4 address (resolved once, then cached).
+    server_ipv4 = get_server_ipv4()
 
     html = '<div class="gpu-table">'
 
@@ -1849,6 +1861,26 @@ async def validate_binary_path(path: str = Form(...)):
 # ============================================================================
 
 
+def _tail_lines(path: Path, n: int, block_size: int = 65536) -> list[str]:
+    """Return the last `n` lines of `path`, reading only from the end.
+
+    Reads fixed-size blocks backwards until `n` newlines are covered, so a large
+    logfile (llama-server logs grow) isn't slurped into memory on every poll.
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        remaining = f.tell()
+        data = b""
+        # One extra newline's worth of slack so we don't clip the last line.
+        while remaining > 0 and data.count(b"\n") <= n:
+            read_size = min(block_size, remaining)
+            remaining -= read_size
+            f.seek(remaining)
+            data = f.read(read_size) + data
+    text = data.decode("utf-8", errors="replace")
+    return text.splitlines()[-n:]
+
+
 @app.get("/api/model-log-tail", response_class=PlainTextResponse)
 async def model_log_tail(model: str, lines: int = 30):
     """Return last N lines from a model's logfile as plain text."""
@@ -1858,11 +1890,7 @@ async def model_log_tail(model: str, lines: int = 30):
         if not log_path.exists():
             return "(no log file)"
 
-        # Read last N lines from file, ignoring encoding errors
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-
-        tail_lines = all_lines[-lines:] if all_lines else []
+        tail_lines = _tail_lines(log_path, lines)
 
         # Return as plain text, strip trailing whitespace from each line
         return '\n'.join(line.rstrip() for line in tail_lines)

@@ -102,10 +102,15 @@ class GpuInfo:
     gpu_id: int
     name: str
     memory: float  # Total VRAM in GB
-    allocated: float  # Currently allocated in GB
+    allocated: float  # App-tracked allocation in GB (maintained by load/unload)
     loaded_models: list  # List of LoadedModel dicts
     power_draw: float = None  # Current power draw in watts
     temperature: float = None  # Current temperature in °C
+    # Real VRAM used, as reported by NVML. Refreshed every ~1s by the monitor
+    # loop so get_gpu_status() can serve it without a per-request NVML round-trip.
+    # This is what the UI shows and the picker checks against — distinct from the
+    # app-tracked `allocated` field used by load_model's own admission guard.
+    mem_used_gb: float = 0.0
 
     def to_dict(self):
         return {
@@ -160,6 +165,9 @@ class GpuManager:
                         memory=total_memory_gb,
                         allocated=0.0,
                         loaded_models=[],
+                        # Seed real usage so the first panel render (before the
+                        # monitor loop's first tick) isn't reported as 0 GB used.
+                        mem_used_gb=mem_info.used / (1024**3),
                     )
                     logger.info(f"✓ Detected GPU {i}: {name} ({total_memory_gb:.1f} GB)")
 
@@ -519,18 +527,11 @@ class GpuManager:
         result = {}
         for gpu_id, gpu in self.gpus.items():
             info = gpu.to_dict()
-            if PYNVML_AVAILABLE:
-                try:
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    info["allocated"] = mem_info.used / (1024**3)  # Convert bytes to GB
-                    info["memory"] = mem_info.total / (1024**3)     # Convert bytes to GB
-                    power = pynvml.nvmlDeviceGetPowerUsage(handle)
-                    info["power_draw"] = power / 1000.0  # Convert mW to W
-                    temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-                    info["temperature"] = temp
-                except Exception:
-                    pass
+            # Serve NVML-derived metrics from the cache the monitor loop keeps
+            # fresh (~1s), rather than issuing a fresh round-trip per request.
+            # "allocated" here means real VRAM used (what the UI/picker want),
+            # which is why we override the app-tracked field from to_dict().
+            info["allocated"] = gpu.mem_used_gb
             result[gpu_id] = info
         return result
 
@@ -556,6 +557,10 @@ class GpuManager:
                         gpu.power_draw = power / 1000.0  # Convert mW to W
                         temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
                         gpu.temperature = temp
+                        # Refresh real VRAM usage so get_gpu_status() can serve it
+                        # from cache (the panel and GPU picker read this).
+                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        gpu.mem_used_gb = mem_info.used / (1024**3)
                     except Exception as e:
                         logger.debug(f"   [GPU Monitor] Error reading GPU {gpu_id}: {e}")
                         continue
