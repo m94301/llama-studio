@@ -216,7 +216,7 @@ class AppConfig(BaseModel):
     models_directory: str = Field(default="./models", description="Path to models directory")
     logs_directory: str = Field(default="./logs", description="Path to logs directory")
     llama_server_binary: str = Field(
-        default="/home/m6/servers/llamacpp/bin/llama-server",
+        default="/home/servers/llamacpp/bin/llama-server",
         description="Path to llama-server binary"
     )
     llama_schema_version: Optional[str] = Field(

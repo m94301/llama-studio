@@ -32,11 +32,11 @@ CANONICAL = """#!/usr/bin/env bash
 # kv_cache_multiplier: 213
 # === llama-studio:meta END ===
 
-LLAMA_BIN=/home/m6/servers/llamacpp/bin/llama-server
+LLAMA_BIN=/home/servers/llamacpp/bin/llama-server
 
 # === llama-studio:launch-args BEGIN ===
 exec "$LLAMA_BIN" \\
-  -m /home/m6/models/Qwen3.6-27B-Q4_K_M.gguf \\
+  -m /home/models/Qwen3.6-27B-Q4_K_M.gguf \\
   --host 0.0.0.0 \\
   --port 8100 \\
   --ctx-size 262144 \\
@@ -70,8 +70,8 @@ def test_meta_fence_missing_warns():
 def test_args_fence_parses_canonical():
     ps = parse_script(CANONICAL)
     assert ps.has_args_fence is True
-    assert ps.llama_bin == "/home/m6/servers/llamacpp/bin/llama-server"
-    assert ps.model_path == "/home/m6/models/Qwen3.6-27B-Q4_K_M.gguf"
+    assert ps.llama_bin == "/home/servers/llamacpp/bin/llama-server"
+    assert ps.model_path == "/home/models/Qwen3.6-27B-Q4_K_M.gguf"
     assert ps.host == "0.0.0.0"
     assert ps.port == 8100
     assert ps.args["--ctx-size"] == "262144"
@@ -103,12 +103,12 @@ def test_args_chat_template_kwargs_with_json_value():
 
 def test_llama_bin_var_resolves_from_assignment():
     ps = parse_script(CANONICAL)
-    assert ps.llama_bin == "/home/m6/servers/llamacpp/bin/llama-server"
+    assert ps.llama_bin == "/home/servers/llamacpp/bin/llama-server"
 
 
 def test_llama_bin_var_quoted_assignment():
     text = CANONICAL.replace(
-        "LLAMA_BIN=/home/m6/servers/llamacpp/bin/llama-server",
+        "LLAMA_BIN=/home/servers/llamacpp/bin/llama-server",
         'LLAMA_BIN="/opt/llama cpp/llama-server"',
     )
     ps = parse_script(text)
@@ -121,7 +121,7 @@ def test_is_configured_happy(tmp_path):
     model_file = tmp_path / "m.gguf"
     model_file.write_text("fake")
     text = CANONICAL.replace(
-        "/home/m6/models/Qwen3.6-27B-Q4_K_M.gguf",
+        "/home/models/Qwen3.6-27B-Q4_K_M.gguf",
         str(model_file),
     )
     ps = parse_script(text)
@@ -133,7 +133,7 @@ def test_is_configured_missing_port(tmp_path):
     model_file = tmp_path / "m.gguf"
     model_file.write_text("fake")
     text = CANONICAL.replace(
-        "/home/m6/models/Qwen3.6-27B-Q4_K_M.gguf", str(model_file)
+        "/home/models/Qwen3.6-27B-Q4_K_M.gguf", str(model_file)
     ).replace("  --port 8100 \\\n", "")
     ps = parse_script(text)
     ok, reason = ps.is_configured()
@@ -656,13 +656,13 @@ def test_migration_from_jsonish_launch_args():
         "--no-mmap": None,
         "--direct-io": None,
     }
-    model_path = "/home/m6/models/Qwen3.6-27B-Q4_K_M.gguf"
+    model_path = "/home/models/Qwen3.6-27B-Q4_K_M.gguf"
     text = render_script(
         display_name="Qwen 3.6 27B",
         block_count=64,
         max_context=262144,
         kv_cache_multiplier=213,
-        llama_bin="/home/m6/servers/llamacpp/bin/llama-server",
+        llama_bin="/home/servers/llamacpp/bin/llama-server",
         model_path=model_path,
         args=launch_args,
     )
