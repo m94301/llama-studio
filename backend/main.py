@@ -1336,13 +1336,25 @@ async def gpu_selector(model: str, force_pick: int = 0):
                 gpu_data=gpu_data,
             ))
 
-        # Single-GPU picker (unchanged behavior for non-split models)
+        # Single-GPU picker. Per-GPU need is computed here rather than in the
+        # template so the engine-specific rules live in one place: vLLM claims
+        # util × that GPU's capacity, llama.cpp needs weights + KV.
+        if model_config.engine == "vllm":
+            need_by_gpu = {
+                gid: model_config.needed_on_gpu(info["memory"])
+                for gid, info in gpu_data.items()
+            }
+        else:
+            flat_need = model_config.total_vram or model_config.size_gb or 0
+            need_by_gpu = {gid: flat_need for gid in gpu_data}
+
         template = jinja_env.get_template("modals/gpu_selector.html")
         return HTMLResponse(template.render(
             model_name=model,
             model_config=model_config,
             display_name=model_config.display_name or model,
             gpu_data=gpu_data,
+            need_by_gpu=need_by_gpu,
         ))
     except FileNotFoundError as e:
         logger.error(f"✗ Model {model} not found: {e}")
