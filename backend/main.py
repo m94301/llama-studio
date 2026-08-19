@@ -1624,22 +1624,11 @@ async def config_paths():
                 </button>
             </div>
             
-            <!-- vLLM Executable (optional) -->
-            <div class="flex items-center gap-3">
-                <label class="w-32 text-sm font-bold text-gray-300">vLLM:</label>
-                <input type="text"
-                       value="{app_config.vllm_binary or '(not configured)'}"
-                       readonly
-                       class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
-                <button hx-get="/api/file-browser?path_type=vllm_binary&current_path={app_config.vllm_binary or str(Path.home())}"
-                        hx-target="#modal-container"
-                        hx-swap="innerHTML"
-                        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold transition-colors">
-                    Edit
-                </button>
-            </div>
-
             <!-- Models Directory -->
+            <!-- NOTE: the vLLM executable field lives in the Settings modal
+                 (frontend/templates/index.html); this endpoint renders into
+                 #config-paths-panel, which is permanently hidden. -->
+
             <div class="flex items-center gap-3">
                 <label class="w-32 text-sm font-bold text-gray-300">Models Dir:</label>
                 <input type="text"
@@ -1907,9 +1896,12 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
         return html
     except Exception as e:
         logger.error(f"✗ Error in update_config_path: {type(e).__name__}: {e}", exc_info=True)
+        # The status stays 200 so htmx still swaps this into the modal; the
+        # data-config-error marker is what callers test to detect failure.
         error_html = f"""
         <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
              id="modal"
+             data-config-error="1"
              onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
             <div class="bg-gray-800 border border-red-600 rounded-lg p-6 w-full max-w-md"
                  onclick="event.stopPropagation()">

@@ -841,6 +841,23 @@
             document.getElementById('settings-modal').focus();
         }
 
+        // /api/update-config-path answers 200 even on failure (so htmx can swap
+        // its error modal), so every caller must check the error marker —
+        // otherwise a rejected path is reported to the user as saved.
+        async function updateConfigPath(pathType, newPath) {
+            const resp = await fetch('/api/update-config-path', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `path_type=${encodeURIComponent(pathType)}&new_path=${encodeURIComponent(newPath)}`
+            });
+            const html = await resp.text();
+            if (!resp.ok || html.includes('data-config-error')) {
+                const m = html.match(/<p class="text-sm text-gray-300 mb-4">([^<]*)<\/p>/);
+                throw new Error(m ? m[1] : `${pathType}: update failed`);
+            }
+            return html;
+        }
+
         async function saveSettings() {
             const saveBtn = document.getElementById('settings-save-btn');
             const statusDiv = document.getElementById('settings-status');
@@ -860,11 +877,7 @@
                 // Step 2: Update llama server
                 if (currentSettingsPaths.llama_server) {
                     statusMsg.textContent = '⏳ Loading llama-server schema...';
-                    await fetch('/api/update-config-path', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `path_type=llama_server&new_path=${encodeURIComponent(currentSettingsPaths.llama_server)}`
-                    });
+                    await updateConfigPath('llama_server', currentSettingsPaths.llama_server);
                     await sleep(1000);
                 }
 
@@ -872,26 +885,13 @@
                 // manifest via its own `serve --help`; slow on first run)
                 if (currentSettingsPaths.vllm_binary) {
                     statusMsg.textContent = '⏳ Validating vLLM + capturing flag manifest (can take a minute on first run)...';
-                    const vllmResp = await fetch('/api/update-config-path', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `path_type=vllm_binary&new_path=${encodeURIComponent(currentSettingsPaths.vllm_binary)}`
-                    });
-                    const vllmHtml = await vllmResp.text();
-                    if (vllmHtml.includes('Error Updating Path')) {
-                        const m = vllmHtml.match(/<p class="text-sm text-gray-300 mb-4">([^<]*)<\/p>/);
-                        throw new Error(m ? m[1] : 'vLLM executable validation failed');
-                    }
+                    await updateConfigPath('vllm_binary', currentSettingsPaths.vllm_binary);
                 }
 
                 // Step 3: Update models directory
                 if (currentSettingsPaths.models_directory) {
                     statusMsg.textContent = '⏳ Rescanning models...';
-                    await fetch('/api/update-config-path', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `path_type=models_directory&new_path=${encodeURIComponent(currentSettingsPaths.models_directory)}`
-                    });
+                    await updateConfigPath('models_directory', currentSettingsPaths.models_directory);
                     await sleep(1000);
                 }
 
