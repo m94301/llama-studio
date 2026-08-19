@@ -153,3 +153,32 @@ class TestReaper:
         monkeypatch.setattr(gpu_manager.os, "killpg", lambda *a: None)  # kills fail silently
         self._manager(tmp_path)._reap_stale_sessions()
         assert "m" in json.loads(reg.read_text())
+
+
+class TestEngineEnvironment:
+    """The engine child must not inherit Llama Studio's own control vars.
+
+    start.sh exports VERBOSE as "" (or "--verbose"); vLLM reads its own VERBOSE
+    as bool(int(...)), so inheriting ours killed engine-core init ~100s into
+    startup, after weights and CUDA graphs were already loaded.
+    """
+
+    def _session(self, gpu_ids):
+        return LlamaSession(
+            model_config=_StubConfig(),
+            llama_server_binary="/bin/true",
+            log_file=Path("/tmp/fake.log"),
+            gpu_ids=gpu_ids,
+        )
+
+    @pytest.mark.parametrize("value", ["", "--verbose", "1"])
+    def test_verbose_never_reaches_the_engine(self, monkeypatch, value):
+        monkeypatch.setenv("VERBOSE", value)
+        assert "VERBOSE" not in self._session([0])._build_env()
+
+    def test_sets_cuda_visible_devices_in_order(self):
+        assert self._session([2, 0, 1])._build_env()["CUDA_VISIBLE_DEVICES"] == "2,0,1"
+
+    def test_other_environment_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        assert self._session([0])._build_env()["HF_HUB_OFFLINE"] == "1"

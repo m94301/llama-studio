@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 # that no longer belongs to us.
 ENGINE_PROC_RE = re.compile(r"llama-server|vllm|EngineCore|\.sh\b")
 
+# Llama Studio's own control variables. These must never reach an engine
+# process: we hand the child a copy of our environment, and a name collision
+# is silently fatal. VERBOSE is the live example — start.sh sets it to "" (or
+# "--verbose"), while vLLM reads its own VERBOSE as bool(int(...)), so an
+# inherited value crashes engine-core init ~100s into startup.
+STUDIO_ONLY_ENV_VARS = ("VERBOSE",)
+
 
 def process_group_members(pgid: Optional[int]) -> str:
     """Cmdlines of every *live* process in `pgid`, or '' if none remain.
@@ -80,6 +87,20 @@ class LlamaSession:
         self.pid: Optional[int] = None
         self.cancelled: bool = False
 
+    def _build_env(self) -> Dict[str, str]:
+        """Environment for the engine process.
+
+        Sets CUDA_VISIBLE_DEVICES for GPU assignment — for tensor-split models
+        gpu_ids is ordered, since --main-gpu / --tensor-split index into this
+        visible-devices list — and strips Llama Studio's own control variables
+        so they can't collide with the engine's.
+        """
+        env = os.environ.copy()
+        for var in STUDIO_ONLY_ENV_VARS:
+            env.pop(var, None)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self.gpu_ids)
+        return env
+
     async def start(self) -> int:
         """
         Start llama-server process by executing the model's shell script.
@@ -113,12 +134,7 @@ class LlamaSession:
             log_file_handle.write(f"\n{'='*80}\n")
             log_file_handle.flush()
 
-            # Set up environment with CUDA_VISIBLE_DEVICES for GPU assignment.
-            # For tensor-split models, gpu_ids contains all GPUs in the order they
-            # should be visible to llama-server (--main-gpu and --tensor-split index
-            # into this visible-devices list).
-            env = os.environ.copy()
-            env['CUDA_VISIBLE_DEVICES'] = ",".join(str(g) for g in self.gpu_ids)
+            env = self._build_env()
             logger.debug(f"   CUDA_VISIBLE_DEVICES set to: {env['CUDA_VISIBLE_DEVICES']}")
 
             # Spawn process

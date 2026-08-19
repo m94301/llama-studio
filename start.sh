@@ -64,5 +64,12 @@ if [[ "$1" == "-v" ]] || [[ "$1" == "--verbose" ]]; then
     echo ""
 fi
 
-# Start uvicorn (pass VERBOSE_FLAG as environment variable, not as argument)
-VERBOSE=$VERBOSE_FLAG python -m uvicorn main:app --reload --host 0.0.0.0 --port "${PORT:-7999}"
+# Start uvicorn (pass VERBOSE_FLAG as environment variable, not as argument).
+# Only set VERBOSE when it's actually on: an empty VERBOSE is still an exported
+# variable, and anything we spawn inherits it. vLLM reads its own VERBOSE as
+# an int, so an inherited empty value crashes it.
+if [ -n "$VERBOSE_FLAG" ]; then
+    VERBOSE=$VERBOSE_FLAG python -m uvicorn main:app --reload --host 0.0.0.0 --port "${PORT:-7999}"
+else
+    python -m uvicorn main:app --reload --host 0.0.0.0 --port "${PORT:-7999}"
+fi
