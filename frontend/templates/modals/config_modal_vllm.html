@@ -55,21 +55,18 @@
 </div>
 
 <script>
-async function saveVllmScript() {
-    const form = new FormData();
-    form.append('model_name', '{{ model_name }}');
-    form.append('script_text', document.getElementById('vllm-script-input').value);
-    const box = document.getElementById('vllm-save-result');
-    box.innerHTML = '<span class="text-gray-400">Saving…</span>';
-    try {
-        const resp = await fetch('/api/save-raw-script', { method: 'POST', body: form });
-        const html = await resp.text();
-        // save-raw-script returns a result modal; swap it in over this one.
-        document.getElementById('modal').remove();
-        document.getElementById('modal-container').innerHTML = html;
-        htmx.process(document.getElementById('modal-container'));
-    } catch (e) {
-        box.innerHTML = '<span class="text-red-400">✗ Save failed: ' + e + '</span>';
-    }
+function saveVllmScript() {
+    document.getElementById('vllm-save-result').innerHTML =
+        '<span class="text-gray-400">Saving…</span>';
+    // htmx swap (not raw innerHTML) so the result modal's inline <script> runs —
+    // it defines the closeModalAndRefresh() its OK button calls.
+    htmx.ajax('POST', '/api/save-raw-script', {
+        target: '#modal-container',
+        swap: 'innerHTML',
+        values: {
+            model_name: '{{ model_name }}',
+            script_text: document.getElementById('vllm-script-input').value,
+        },
+    });
 }
 </script>
