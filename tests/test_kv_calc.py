@@ -158,3 +158,30 @@ class TestCalibrationWithExplicitBudget:
         text = ("Available KV cache memory: 55.42 GiB\n"
                 "GPU KV cache size: 4,842,496 tokens\n")
         assert calibrate_from_log(text, 999) == 12288
+
+
+class TestLoadRejectionIsTerminal:
+    """A rejected load must not leave the row stuck in LOADING.
+
+    load_model runs as a FastAPI BackgroundTask after trigger_load has already
+    set LOADING, and a background task's exception is swallowed — so admission
+    failures have to set FAILED themselves.
+    """
+
+    def test_rejection_sets_failed(self):
+        import asyncio
+        import sys
+        from pathlib import Path as _P
+        sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "backend"))
+        from gpu_manager import GpuManager, ModelState
+
+        class _Cfg:
+            models = {}
+            def get_all_models(self): return {}
+            def get_model_config(self, name): raise FileNotFoundError(name)
+            project_root = _P("/tmp")
+
+        gm = GpuManager(_Cfg())
+        asyncio.run(gm.load_model("nope", [0]))          # model not found
+        assert gm.state_info["nope"].state == ModelState.FAILED
+        assert "nope" in (gm.state_info["nope"].error_msg or "")

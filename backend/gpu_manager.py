@@ -353,7 +353,33 @@ class GpuManager:
 
         Raises:
             ValueError: If model not found, gpu_ids count mismatches gpu_count, or VRAM insufficient.
+
+        Note: callers run this as a FastAPI BackgroundTask *after* trigger_load
+        has already set the row to LOADING, and a background task's exception is
+        swallowed. Any rejection must therefore leave the row in a terminal
+        state itself — see the wrapper below.
         """
+        try:
+            await self._load_model_inner(model_name, gpu_ids)
+        except Exception as e:
+            # Admission failures (already loaded, GPU mismatch, port in use,
+            # not enough VRAM) are raised before the inner try block. Without
+            # this the row stays LOADING forever with a CANCEL button.
+            logger.error(f"✗ Load rejected for {model_name}: {e}")
+            await self._set_model_state(model_name, ModelState.FAILED, LoadingPhase.ERROR, str(e))
+            try:
+                model_config = self.config.get_model_config(model_name)
+                asyncio.create_task(event_bus.broadcast({
+                    "type": "model_state_change",
+                    "model_name": model_name,
+                    "state": ModelState.FAILED.value,
+                    "html_id": model_config.html_id,
+                }))
+            except Exception:
+                pass
+
+    async def _load_model_inner(self, model_name: str, gpu_ids: List[int]) -> None:
+        """Validation + spawn. See load_model for the error contract."""
         logger.info(f"🔄 load_model called: model={model_name}, gpu_ids={gpu_ids}")
 
         if model_name not in self.config.get_all_models():
@@ -722,9 +748,13 @@ class GpuManager:
                 # Crash watchdog: a RUNNING session whose process has exited
                 # (OOM, crash, external kill) gets its allocations released and
                 # its row flipped to FAILED instead of showing RUNNING forever.
+                # LOADING is included deliberately: a session whose process dies
+                # while the row is mid-load (or after a rejected second load
+                # request left the row stuck) would otherwise never be cleaned
+                # up, leaving a stale registry entry and a frozen row.
                 for name, session in list(self.sessions.items()):
                     if (
-                        self.get_model_state(name) == ModelState.RUNNING
+                        self.get_model_state(name) in (ModelState.RUNNING, ModelState.LOADING)
                         and session.process is not None
                         and session.process.poll() is not None
                     ):
