@@ -55,6 +55,18 @@
 </div>
 
 <script>
+// The save-result popup's OK button calls these; define them globally here so
+// the button works even if the popup's own inline script doesn't execute.
+window.refreshModelList = function () {
+    setTimeout(() => {
+        htmx.ajax('GET', '/api/model-list', { target: '#models-container', swap: 'innerHTML' });
+    }, 100);
+};
+window.closeModalAndRefresh = function () {
+    document.getElementById('modal')?.remove();
+    window.refreshModelList();
+};
+
 function saveVllmScript() {
     document.getElementById('vllm-save-result').innerHTML =
         '<span class="text-gray-400">Saving…</span>';
