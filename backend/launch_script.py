@@ -64,6 +64,9 @@ FLAG_ALIASES: Dict[str, str] = {
     "-t": "--threads",
     "-sm": "--split-mode",
     "-ts": "--tensor-split",
+    "-np": "--parallel",
+    "-kvu": "--kv-unified",
+    "-no-kvu": "--no-kv-unified",
 }
 
 # Known flag-only (boolean) options for llama-server. Used as a hint when
@@ -143,6 +146,10 @@ class ParsedScript:
     # Optional user-declared model weights size (GB) for display; vLLM models
     # have no GGUF to size from when the dir path can't be summed.
     vram_gb: Optional[float] = None
+    # Measured KV bytes per token. A cached *measurement* (estimated from
+    # config.json, calibrated from a real load's log), not a setting — the same
+    # category as kv_cache_multiplier. Settings live in the args, never here.
+    kv_bytes_per_token: Optional[int] = None
     # VLLM_PP_LAYER_PARTITION assignment from the body, parsed to ints.
     pp_layer_partition: Optional[List[int]] = None
 
@@ -216,6 +223,83 @@ class ParsedScript:
             return 0.9
 
     @property
+    def kv_cache_memory_bytes(self) -> Optional[int]:
+        """Explicit vLLM KV pool budget, or None when sized by utilization."""
+        raw = self.args.get("--kv-cache-memory-bytes")
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # ---- context / concurrency (derived from arguments, never metadata) ----
+
+    @property
+    def concurrency(self) -> Optional[int]:
+        """Conversations servable at once, or None when the engine decides.
+
+        Neither engine states this statically: llama.cpp publishes --parallel as
+        `-1 = auto` (resolved to 4 slots at runtime) and vLLM's --max-num-seqs
+        help says `(default: None)`, computed in create_engine_config. So an
+        absent flag means "engine decides" and must not be shown as a number.
+        """
+        key = "--max-num-seqs" if self.engine == "vllm" else "--parallel"
+        raw = self.args.get(key)
+        try:
+            value = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+        if value is not None and value < 0:
+            return None  # llama.cpp's -1 sentinel is "auto"
+        return value
+
+    @property
+    def kv_unified(self) -> bool:
+        """llama.cpp shares one KV buffer across slots.
+
+        Enabled implicitly when --parallel is absent (server.cpp sets
+        n_parallel=4, kv_unified=true), or explicitly via --kv-unified. With it
+        on, every slot sees the whole --ctx-size; with it off the pool is
+        divided (n_ctx_seq = n_ctx / n_seq_max).
+        """
+        if self.engine == "vllm":
+            return False
+        if "--kv-unified" in self.args:
+            return True
+        if "--no-kv-unified" in self.args:
+            return False
+        raw = self.args.get("--parallel")
+        if raw is None:
+            return True  # absent -> auto
+        try:
+            return int(raw) < 0  # the explicit -1 "auto" sentinel
+        except (TypeError, ValueError):
+            return False
+
+    @property
+    def context_length(self) -> Optional[int]:
+        """Context available to a single conversation.
+
+        llama.cpp: --ctx-size when the KV buffer is unified, else divided by
+        --parallel. vLLM: --max-model-len.
+        """
+        if self.engine == "vllm":
+            raw = self.args.get("--max-model-len")
+            try:
+                return int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+        raw = self.args.get("--ctx-size")
+        try:
+            ctx = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+        if ctx is None:
+            return None
+        if self.kv_unified:
+            return ctx
+        return ctx // max(1, self.concurrency or 1)
+
+    @property
     def gpu_count(self) -> int:
         """Number of GPUs this model wants. 1 if no --tensor-split (or split=[1]).
 
@@ -272,6 +356,17 @@ class ParsedScript:
             return False, f"model path not found: {self.model_path}"
         if self.port is None:
             return False, "--port not set"
+        if self.engine == "vllm":
+            # Decision 7: a vLLM model states what it wants rather than taking
+            # 90% of the card. All three are required because L and C alone do
+            # not size the pool — leave the budget out and the engine still
+            # claims util × capacity regardless of what the other two say.
+            if self.context_length is None:
+                return False, "--max-model-len not set (context per conversation)"
+            if self.concurrency is None:
+                return False, "--max-num-seqs not set (concurrency)"
+            if self.kv_cache_memory_bytes is None:
+                return False, "--kv-cache-memory-bytes not set (KV pool budget)"
         return True, None
 
 
@@ -510,6 +605,12 @@ def parse_script(text: str) -> ParsedScript:
             ps.engine_declared = True
         elif eng:
             ps.warnings.append(f"meta engine={eng!r} is not one of {VALID_ENGINES}; treating as llamacpp")
+        kvb = meta.get("kv_bytes_per_token")
+        if kvb is not None and kvb != "":
+            try:
+                ps.kv_bytes_per_token = int(kvb)
+            except ValueError:
+                ps.warnings.append(f"meta kv_bytes_per_token={kvb!r} is not an integer")
         vg = meta.get("vram_gb")
         if vg is not None and vg != "":
             try:
@@ -870,6 +971,7 @@ def patch_meta_fence(
     health_timeout=_UNSET,
     engine=_UNSET,
     vram_gb=_UNSET,
+    kv_bytes_per_token=_UNSET,
 ) -> str:
     """Merge the given fields into the meta fence, preserving everything else.
 
@@ -891,6 +993,7 @@ def patch_meta_fence(
         "max_context": max_context,
         "kv_cache_multiplier": kv_cache_multiplier,
         "health_timeout": health_timeout,
+        "kv_bytes_per_token": kv_bytes_per_token,
     }
     updates = {k: v for k, v in updates.items() if v is not _UNSET}
     # An empty string display_name behaves like a delete (legacy callers pass "").
@@ -922,8 +1025,8 @@ def patch_meta_fence(
         # value None → drop the line
 
     # Append fields that weren't already present, in canonical order.
-    for key in ("display_name", "engine", "vram_gb", "block_count",
-                "max_context", "kv_cache_multiplier", "health_timeout"):
+    for key in ("display_name", "engine", "vram_gb", "kv_bytes_per_token",
+                "block_count", "max_context", "kv_cache_multiplier", "health_timeout"):
         if key in updates and key not in seen and updates[key] is not None:
             out.append(_render_meta_line(key, updates[key]))
 

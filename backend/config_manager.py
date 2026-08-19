@@ -185,14 +185,35 @@ class ModelConfig:
     def gpu_memory_utilization(self) -> float:
         return self.parsed.gpu_memory_utilization
 
+    @property
+    def kv_cache_memory_bytes(self) -> Optional[int]:
+        return self.parsed.kv_cache_memory_bytes
+
+    @property
+    def context_length(self) -> Optional[int]:
+        return self.parsed.context_length
+
+    @property
+    def concurrency(self) -> Optional[int]:
+        return self.parsed.concurrency
+
     def needed_on_gpu(self, gpu_total_gb: float) -> float:
         """VRAM a vLLM model will claim on one GPU of the given capacity.
 
-        vLLM pre-allocates its KV pool to fill util × capacity on every visible
-        GPU regardless of model size, so the need depends on the target GPU,
-        not the model (doc 21 decision 3). llama.cpp callers use per_gpu_vram.
+        With an explicit --kv-cache-memory-bytes the claim is bounded:
+        weights + overhead + that budget, split across the GPUs the model spans.
+        Without one, vLLM fills util × capacity on every visible GPU regardless
+        of model size, so the need depends on the target GPU rather than the
+        model (doc 21 decision 3 and §2.4).
         """
-        return round(self.gpu_memory_utilization * gpu_total_gb, 2)
+        budget = self.kv_cache_memory_bytes
+        if budget is None:
+            return round(self.gpu_memory_utilization * gpu_total_gb, 2)
+        from kv_calc import DEFAULT_OVERHEAD_GB, GIB
+        per_gpu = max(1, self.gpu_count)
+        total = (self.size_gb or 0.0) + DEFAULT_OVERHEAD_GB + budget / GIB
+        # Never claim to need more than utilization would have allowed.
+        return round(min(total / per_gpu, self.gpu_memory_utilization * gpu_total_gb), 2)
 
     @property
     def model_path(self) -> Optional[str]:
@@ -635,6 +656,37 @@ class ConfigManager:
         mc.is_configured = ok
         mc.config_error = reason
         return mc
+
+    def calibrate_kv_bytes_per_token(self, model_name: str) -> Optional[int]:
+        """Read the exact KV bytes/token back from a successful load's log.
+
+        vLLM reports both the KV pool size in GiB and in tokens; their ratio is
+        exact, and it is the only trustworthy figure for architectures whose KV
+        shape isn't the standard one. Cached in the meta fence (a measurement,
+        not a setting) and only written when it actually changes.
+        """
+        from kv_calc import calibrate_from_log
+
+        mc = self.models.get(model_name)
+        if mc is None or mc.engine != "vllm":
+            return None
+        try:
+            log_path = self.get_log_path(model_name)
+            measured = calibrate_from_log(log_path.read_text(errors="replace"))
+        except Exception as e:
+            logger.debug(f"   Could not calibrate KV for {model_name}: {e}")
+            return None
+        if not measured or measured == mc.parsed.kv_bytes_per_token:
+            return measured
+        try:
+            script_path = self.get_script_path(model_name)
+            new_text = patch_meta_fence(script_path.read_text(), kv_bytes_per_token=measured)
+            if write_script_atomic(script_path, new_text):
+                logger.info(f"   Calibrated KV for {model_name}: {measured} bytes/token")
+            self.rescan_model(model_name)
+        except Exception as e:
+            logger.warning(f"⚠ Could not store calibrated KV for {model_name}: {e}")
+        return measured
 
     def _finish_vllm_model(self, script_path: Path, parsed: ParsedScript) -> ModelConfig:
         """Build a ModelConfig for an engine:vllm script.

@@ -119,10 +119,22 @@ class TestVllmParse:
     def test_is_configured_accepts_directory(self, tmp_path):
         model_dir = tmp_path / "dsv4-flash"
         model_dir.mkdir()
-        text = VLLM_SCRIPT.replace("/models/dsv4-flash", str(model_dir))
+        text = VLLM_SCRIPT.replace("/models/dsv4-flash", str(model_dir)).replace(
+            "--host 0.0.0.0 --port 8098",
+            "--host 0.0.0.0 --port 8098 --max-num-seqs 8 --kv-cache-memory-bytes 1000000",
+        )
         ps = parse_script(text)
         ok, reason = ps.is_configured()
         assert ok, reason
+
+    def test_decision_7_blocks_a_script_without_a_kv_budget(self, tmp_path):
+        """The reference DSV4 script pre-dates decision 7 and is now unconfigured
+        until it states concurrency and a KV budget."""
+        model_dir = tmp_path / "dsv4-flash"
+        model_dir.mkdir()
+        ps = parse_script(VLLM_SCRIPT.replace("/models/dsv4-flash", str(model_dir)))
+        ok, reason = ps.is_configured()
+        assert not ok and "--max-num-seqs" in reason
 
 
 class TestLlamacppUnchanged:
@@ -260,3 +272,83 @@ class TestVarResolutionShellSemantics:
         # `MAXLEN="${MAXLEN:-1000}"` then a later hard override
         text = 'MAXLEN="${MAXLEN:-1000}"\nMAXLEN=2000\n'
         assert resolve_var_refs("$MAXLEN", text) == "2000"
+
+
+class TestContextConcurrencyDerivation:
+    """Context and concurrency are read from arguments, never metadata (decision 7)."""
+
+    def _vllm(self, extra: str) -> str:
+        return (f"#!/usr/bin/env bash\n{META_BEGIN}\n# engine: vllm\n{META_END}\n"
+                f"exec /opt/venv/bin/vllm serve /models/m --host 0.0.0.0 --port 8000 {extra}\n")
+
+    def _llama(self, extra: str) -> str:
+        return (f"#!/usr/bin/env bash\n{META_BEGIN}\n# engine: llamacpp\n{META_END}\n"
+                f'exec /usr/bin/llama-server -m /m.gguf --host 0.0.0.0 --port 8100 {extra}\n')
+
+    def test_vllm_reads_its_flags(self):
+        ps = parse_script(self._vllm("--max-model-len 32768 --max-num-seqs 4"))
+        assert ps.context_length == 32768
+        assert ps.concurrency == 4
+
+    def test_vllm_kv_budget(self):
+        ps = parse_script(self._vllm("--kv-cache-memory-bytes 402653184"))
+        assert ps.kv_cache_memory_bytes == 402653184
+
+    def test_unset_concurrency_is_none_not_a_guess(self):
+        """Neither engine states a static default, so we must not invent one."""
+        assert parse_script(self._vllm("--max-model-len 4096")).concurrency is None
+        assert parse_script(self._llama("--ctx-size 4096")).concurrency is None
+
+    def test_llamacpp_auto_parallel_means_unified_and_full_context(self):
+        # server.cpp: n_parallel < 0 -> n_parallel = 4, kv_unified = true
+        ps = parse_script(self._llama("--ctx-size 262144"))
+        assert ps.kv_unified is True
+        assert ps.context_length == 262144
+        assert parse_script(self._llama("--ctx-size 4096 --parallel -1")).kv_unified is True
+
+    def test_llamacpp_explicit_parallel_divides_the_pool(self):
+        # llama-context.cpp: n_ctx_seq = n_ctx / n_seq_max when not unified
+        ps = parse_script(self._llama("--ctx-size 131072 --parallel 4"))
+        assert ps.kv_unified is False
+        assert ps.concurrency == 4
+        assert ps.context_length == 32768  # 131072 / 4
+
+    def test_explicit_kv_unified_keeps_the_full_context(self):
+        ps = parse_script(self._llama("--ctx-size 131072 --parallel 4 --kv-unified"))
+        assert ps.kv_unified is True
+        assert ps.context_length == 131072
+
+
+class TestVllmRequiredArguments:
+    """Decision 7: a vLLM model must state context, concurrency, and budget."""
+
+    def _script(self, tmp_path, extra: str) -> str:
+        d = tmp_path / "m"
+        d.mkdir(exist_ok=True)
+        return (f"#!/usr/bin/env bash\n{META_BEGIN}\n# engine: vllm\n{META_END}\n"
+                f"exec /opt/venv/bin/vllm serve {d} --host 0.0.0.0 --port 8000 {extra}\n")
+
+    @pytest.mark.parametrize("extra,missing", [
+        ("--max-num-seqs 1 --kv-cache-memory-bytes 1000", "--max-model-len"),
+        ("--max-model-len 4096 --kv-cache-memory-bytes 1000", "--max-num-seqs"),
+        ("--max-model-len 4096 --max-num-seqs 1", "--kv-cache-memory-bytes"),
+    ])
+    def test_each_missing_argument_blocks_the_load(self, tmp_path, extra, missing):
+        ok, reason = parse_script(self._script(tmp_path, extra)).is_configured()
+        assert not ok and missing in reason
+
+    def test_all_three_present_is_configured(self, tmp_path):
+        ok, reason = parse_script(self._script(
+            tmp_path, "--max-model-len 4096 --max-num-seqs 1 --kv-cache-memory-bytes 1000"
+        )).is_configured()
+        assert ok, reason
+
+    def test_llamacpp_is_not_subject_to_the_requirement(self, tmp_path):
+        """Requiring --parallel would unconfigure the existing fleet AND flip it
+        out of unified KV, dividing tuned contexts. See the deviation note."""
+        gguf = tmp_path / "m.gguf"
+        gguf.write_bytes(b"x")
+        text = (f"#!/usr/bin/env bash\n{META_BEGIN}\n# engine: llamacpp\n{META_END}\n"
+                f"exec /usr/bin/llama-server -m {gguf} --host 0.0.0.0 --port 8100\n")
+        ok, reason = parse_script(text).is_configured()
+        assert ok, reason

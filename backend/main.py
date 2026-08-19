@@ -1572,6 +1572,76 @@ async def calculate_vram(
         return {"error": str(e)}
 
 
+@app.post("/api/calculate-vllm-vram", response_class=JSONResponse)
+async def calculate_vllm_vram(
+    model: str = Form(...),
+    context_length: int = Form(0),
+    concurrency: int = Form(1),
+    vram_gb: float = Form(0.0),
+    solve_for: str = Form("vram"),
+):
+    """Both directions of the context/concurrency/VRAM relation (doc 21 §2.4).
+
+    solve_for='vram'    : context + concurrency -> total VRAM
+    solve_for='context' : VRAM budget + concurrency -> largest context that fits
+
+    One shared helper backs both so a round-trip returns to the same slider
+    position. Returns the pool token count and the KV budget to write into the
+    script as --kv-cache-memory-bytes.
+    """
+    from kv_calc import (
+        DEFAULT_OVERHEAD_GB, GIB, bytes_per_token_from_config,
+        context_for_vram, pool_tokens, vram_gb_for,
+    )
+    try:
+        mc = config_manager.get_model_config(model)
+    except FileNotFoundError:
+        return JSONResponse({"error": f"model not found: {model}"}, status_code=404)
+
+    bpt = mc.parsed.kv_bytes_per_token
+    source = "measured"
+    if not bpt and mc.model_path:
+        bpt = bytes_per_token_from_config(
+            mc.model_path, mc.launch_args.get("--kv-cache-dtype")
+        )
+        source = "estimated"
+    if not bpt:
+        return JSONResponse({
+            "error": "KV bytes/token unknown for this model — load it once to calibrate",
+        }, status_code=422)
+
+    weights = mc.size_gb or 0.0
+    concurrency = max(1, concurrency)
+    if solve_for == "context":
+        ctx = context_for_vram(
+            vram_gb=vram_gb, concurrency=concurrency, bytes_per_token=bpt,
+            weights_gb=weights, max_context=mc.max_context,
+        )
+        total, tokens = vram_gb_for(
+            context_length=ctx, concurrency=concurrency,
+            bytes_per_token=bpt, weights_gb=weights,
+        )
+    else:
+        ctx = max(0, context_length)
+        total, tokens = vram_gb_for(
+            context_length=ctx, concurrency=concurrency,
+            bytes_per_token=bpt, weights_gb=weights,
+        )
+
+    return JSONResponse({
+        "context_length": ctx,
+        "concurrency": concurrency,
+        "pool_tokens": tokens,
+        "bytes_per_token": bpt,
+        "bytes_per_token_source": source,
+        "weights_gb": round(weights, 2),
+        "overhead_gb": DEFAULT_OVERHEAD_GB,
+        "kv_gb": round(tokens * bpt / GIB, 2),
+        "total_gb": total,
+        "kv_cache_memory_bytes": tokens * bpt,
+    })
+
+
 @app.get("/api/get-current-settings", response_class=JSONResponse)
 async def get_current_settings():
     """Return current settings for settings modal population."""

@@ -504,6 +504,14 @@ class GpuManager:
                         loaded_model_dict['vram_share'] = need
                         self.gpus[gid].loaded_models.append(loaded_model_dict)
 
+            # A successful vLLM load reports its exact KV bytes/token; capture
+            # it so the calculator stops relying on the config.json estimate.
+            if model_config.engine == "vllm":
+                try:
+                    await asyncio.to_thread(self.config.calibrate_kv_bytes_per_token, model_name)
+                except Exception as e:
+                    logger.debug(f"   KV calibration skipped for {model_name}: {e}")
+
             # Mark as running
             await self._set_model_state(model_name, ModelState.RUNNING, LoadingPhase.RUNNING)
             logger.info(f"✓ {model_name} loaded on GPU(s) {gpu_ids}, PID {pid}")
