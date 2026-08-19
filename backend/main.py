@@ -897,6 +897,11 @@ async def config_modal_new(model: str):
                 display_name=model_config.display_name or model,
                 script_text=config_manager.get_script_text(model),
                 config_error=model_config.config_error,
+                # Parse warnings that predict a failed launch (e.g. a layer
+                # partition whose length no longer matches --pipeline-parallel-size)
+                # belong in front of the user before they spend minutes on a load.
+                warnings=[w for w in model_config.parsed.warnings
+                          if "meta fence missing" not in w],
                 gpu_count=model_config.gpu_count,
                 health_timeout=model_config.health_timeout,
                 default_health_timeout=model_config.effective_health_timeout(),

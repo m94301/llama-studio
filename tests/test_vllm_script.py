@@ -352,3 +352,33 @@ class TestVllmRequiredArguments:
                 f"exec /usr/bin/llama-server -m {gguf} --host 0.0.0.0 --port 8100\n")
         ok, reason = parse_script(text).is_configured()
         assert ok, reason
+
+
+class TestCvdWithTrailingComment:
+    """A CVD line with a trailing comment must still be replaced, not duplicated.
+
+    Real case: the DSV4 script carried `export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"   # 3 cards`.
+    Selecting 4 GPUs added a second line and left the old one, after which the
+    parser read the stale value and reported 3 GPUs for a 4-GPU model.
+    """
+
+    SCRIPT = (
+        "#!/usr/bin/env bash\n"
+        f"{META_BEGIN}\n# engine: vllm\n{META_END}\n"
+        'export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"   # 3 cards\n'
+        "VLLM_BIN=/opt/venv/bin/vllm\n\n"
+        'exec "$VLLM_BIN" serve /models/m --host 0.0.0.0 --port 8000\n'
+    )
+
+    def test_commented_line_is_replaced_not_duplicated(self):
+        from launch_script import patch_cuda_visible_devices
+        out = patch_cuda_visible_devices(self.SCRIPT, [0, 1, 2, 3])
+        assert out.count("CUDA_VISIBLE_DEVICES") == 1
+        assert parse_script(out).cuda_visible_devices == [0, 1, 2, 3]
+
+    def test_plain_commented_line_is_parsed(self):
+        text = self.SCRIPT.replace(
+            'export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"   # 3 cards',
+            "export CUDA_VISIBLE_DEVICES=2,3   # the big cards",
+        )
+        assert parse_script(text).cuda_visible_devices == [2, 3]

@@ -18,6 +18,15 @@
 
         <div class="flex-1 overflow-y-auto pr-2 space-y-6">
 
+            {% if warnings %}
+            <div class="p-3 rounded border border-yellow-600 bg-yellow-900 bg-opacity-25">
+                <p class="text-sm text-yellow-300 font-bold mb-1">⚠ This script will not start as written</p>
+                <ul class="list-disc ml-5 text-xs text-yellow-200 space-y-0.5">
+                    {% for w in warnings %}<li>{{ w }}</li>{% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+
             <!-- Identity -->
             <fieldset class="flex gap-3 items-end">
                 <div class="flex-1">

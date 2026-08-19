@@ -1238,8 +1238,11 @@ def patch_cuda_visible_devices(text: str, ids: Optional[List[int]]) -> str:
 
     # Strip all CVD declarations (standalone lines + inline prefixes)
     cleaned_lines: List[str] = []
+    # A trailing comment still makes this a standalone assignment. Requiring the
+    # line to end at the value left commented ones behind, so writing a new GPU
+    # selection produced two CVD lines and the parser then read the stale one.
     standalone_re = re.compile(
-        rf'^[ \t]*(?:export[ \t]+)?{_CVD_KEY}=(?:"[^"]*"|\'[^\']*\'|\S+)[ \t]*$'
+        rf'^[ \t]*(?:export[ \t]+)?{_CVD_KEY}=(?:"[^"]*"|\'[^\']*\'|\S+)[ \t]*(?:#.*)?$'
     )
     inline_prefix_re = re.compile(rf'^([ \t]*){_CVD_KEY}=(?:"[^"]*"|\'[^\']*\'|\S+)[ \t]+')
     for line in lines:
