@@ -4,6 +4,7 @@ import asyncio
 import subprocess
 import logging
 import os
+import re
 import signal
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -12,6 +13,43 @@ import httpx
 from config_manager import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+# Cmdline signature of a process we're entitled to kill. Used before signalling
+# a process group whose leader we may already have reaped — a PID freed by
+# wait()/poll() can in principle be recycled, and we must never signal a group
+# that no longer belongs to us.
+ENGINE_PROC_RE = re.compile(r"llama-server|vllm|EngineCore|\.sh\b")
+
+
+def process_group_members(pgid: Optional[int]) -> str:
+    """Cmdlines of every *live* process in `pgid`, or '' if none remain.
+
+    Zombies are excluded: a killed child stays in the process table until its
+    parent reaps it, and counting those as alive would make a successful kill
+    look like a failure.
+    """
+    if not pgid or os.name == "nt":
+        return ""
+    try:
+        # -ww: never truncate the args column. Without it ps clips at the
+        # terminal width, which can cut the engine name out of a long model
+        # path and make a group look like it isn't ours.
+        out = subprocess.run(
+            ["ps", "-ww", "-eo", "pgid=,pid=,stat=,args="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return ""
+    members = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3:
+            continue
+        row_pgid, pid, stat = parts[0], parts[1], parts[2]
+        if row_pgid != str(pgid) or stat.startswith("Z"):
+            continue
+        members.append(f"{pid} {parts[3] if len(parts) > 3 else ''}".strip())
+    return "\n".join(members)
 
 
 class LlamaSession:
@@ -116,19 +154,38 @@ class LlamaSession:
             await self.stop()
             raise
 
-    def kill_process_group(self, sig: int = signal.SIGKILL) -> None:
+    def kill_process_group(self, sig: int = signal.SIGKILL, *, verify: bool = False) -> None:
         """Signal the session's entire process group (leader may already be dead).
 
         start_new_session=True makes the spawned script its own group leader,
         so self.pid doubles as the pgid even after the leader exits — this is
         how orphaned engine workers (vLLM spawn-mode) get swept.
+
+        `verify=True` checks the group still contains engine processes before
+        signalling. Use it once the leader has been reaped (wait()/poll()),
+        because the PID is then eligible for reuse and could name a group that
+        isn't ours.
         """
         if not self.pid or os.name == "nt":
             return
+        if verify:
+            members = process_group_members(self.pid)
+            if not members:
+                return  # group already empty — nothing to do
+            if not ENGINE_PROC_RE.search(members):
+                logger.warning(
+                    f"⚠ Not signalling pgid {self.pid}: it no longer looks like "
+                    f"{self.model_config.name}'s process group"
+                )
+                return
         try:
             os.killpg(self.pid, sig)
         except (ProcessLookupError, PermissionError, OSError):
             pass  # group fully gone — the normal case
+
+    def group_is_alive(self) -> bool:
+        """True while any process in this session's group is still running."""
+        return bool(process_group_members(self.pid))
 
     async def stop(self) -> None:
         """Terminate the session's entire process group.
@@ -164,7 +221,8 @@ class LlamaSession:
                 await asyncio.to_thread(self.process.wait)
             finally:
                 # Unconditional sweep: catches workers the leader left behind.
-                self.kill_process_group(signal.SIGKILL)
+                # Verified, because the leader has now been reaped.
+                self.kill_process_group(signal.SIGKILL, verify=True)
 
             self.process = None
             self.pid = None

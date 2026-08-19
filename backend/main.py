@@ -133,6 +133,13 @@ async def lifespan(app: FastAPI):
             and config_manager.app_config.startup_models
         ):
             asyncio.create_task(_auto_load_startup_models())
+
+        # Warm the vllm version cache in the background so the first Settings
+        # open doesn't pay for `vllm --version` importing torch.
+        if config_manager.app_config.vllm_binary:
+            asyncio.create_task(
+                asyncio.to_thread(get_vllm_version, config_manager.app_config.vllm_binary)
+            )
     except Exception as e:
         logger.error(f"✗ Startup failed: {e}")
         raise
@@ -1560,12 +1567,17 @@ async def get_current_settings():
         version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
     else:
         version_str = "unknown"
+    # `vllm --version` imports torch on a cold cache (tens of seconds), so it
+    # runs in a thread — never inline, or opening Settings freezes the app.
     vllm_bin = config_manager.app_config.vllm_binary
+    vllm_version = ""
+    if vllm_bin:
+        vllm_version = await asyncio.to_thread(get_vllm_version, vllm_bin) or "unknown"
     return {
         "llama_server": config_manager.app_config.llama_server_binary,
         "llama_server_version": version_str,
         "vllm_binary": vllm_bin or "",
-        "vllm_version": (get_vllm_version(vllm_bin) or "unknown") if vllm_bin else "",
+        "vllm_version": vllm_version,
         "models_directory": config_manager.app_config.models_directory,
         "webui_port": config_manager.app_config.webui_port,
     }

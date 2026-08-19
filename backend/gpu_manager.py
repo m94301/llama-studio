@@ -20,7 +20,7 @@ except ImportError:
     PYNVML_AVAILABLE = False
 
 from config_manager import ConfigManager, ModelConfig
-from llama_session import LlamaSession
+from llama_session import ENGINE_PROC_RE, LlamaSession, process_group_members
 from port_manager import is_port_available
 from event_bus import event_bus
 
@@ -141,6 +141,9 @@ class GpuManager:
         self.state_lock = asyncio.Lock()
         self.gpu_detection_status: str = "unavailable"
         self.gpu_detection_error: Optional[str] = None
+        # Process groups that survived their session's stop(), kept so they
+        # stay in the on-disk registry and get reaped at the next start.
+        self._orphans: Dict[str, dict] = {}
 
     # ---- session registry: crash-proof cleanup across app restarts ----
     #
@@ -154,31 +157,31 @@ class GpuManager:
         return self.config.project_root / "sessions" / "active.json"
 
     def _registry_sync(self) -> None:
-        """Rewrite the registry from the current sessions dict."""
+        """Rewrite the registry from live sessions plus any known orphans."""
         try:
             data = {
                 name: {"pid": s.pid, "port": s.model_config.port}
                 for name, s in self.sessions.items()
                 if s.pid
             }
+            # Groups that outlived their session (survived unload). They are no
+            # longer tracked as sessions but must stay reapable; the next start
+            # skips any whose group is already empty.
+            for name, info in self._orphans.items():
+                data.setdefault(f"{name}:orphan", info)
             path = self._registry_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(data, indent=1))
         except Exception as e:
             logger.warning(f"⚠ Could not write session registry: {e}")
 
-    @staticmethod
-    def _group_members(pgid: int) -> str:
-        """Cmdlines of all processes in a group ('' when the group is empty)."""
-        try:
-            return subprocess.run(
-                ["pgrep", "-g", str(pgid), "-a"], capture_output=True, text=True
-            ).stdout.strip()
-        except Exception:
-            return ""
-
     def _reap_stale_sessions(self) -> None:
-        """Kill process groups recorded by a previous run that are still alive."""
+        """Kill process groups recorded by a previous run that are still alive.
+
+        Entries that could not be killed are kept in the registry so a later
+        run tries again — forgetting them would strand VRAM with no record that
+        anything was left behind. Blocking: call via asyncio.to_thread.
+        """
         path = self._registry_path()
         if not path.exists() or os.name == "nt":
             return
@@ -186,16 +189,17 @@ class GpuManager:
             data = json.loads(path.read_text())
         except Exception:
             data = {}
+
+        unreaped: Dict[str, dict] = {}
         for name, info in data.items():
             pgid = info.get("pid")
             if not pgid:
                 continue
-            members = self._group_members(pgid)
+            members = process_group_members(pgid)
             if not members:
-                continue
-            # PID-reuse guard: only kill groups that actually contain engine
-            # processes (or our launch script).
-            if not re.search(r"llama-server|vllm|EngineCore", members):
+                continue  # already gone
+            # PID-reuse guard: only kill groups that still look like ours.
+            if not ENGINE_PROC_RE.search(members):
                 logger.warning(
                     f"⚠ Stale session {name}: pgid {pgid} now holds unrelated processes; not touching it"
                 )
@@ -206,25 +210,33 @@ class GpuManager:
             except OSError:
                 pass
             deadline = time.time() + 10
-            while time.time() < deadline and self._group_members(pgid):
+            while time.time() < deadline and process_group_members(pgid):
                 time.sleep(0.5)
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except OSError:
                 pass
-            if self._group_members(pgid):
-                logger.error(f"✗ Could not fully reap pgid {pgid} for {name}")
+            time.sleep(0.2)
+            if process_group_members(pgid):
+                logger.error(
+                    f"✗ Could not fully reap pgid {pgid} for {name} — it may still hold VRAM. "
+                    f"Keeping it in the registry to retry next start."
+                )
+                unreaped[name] = info
             else:
                 logger.info(f"✓ Reaped {name}")
+
         try:
-            path.write_text("{}")
-        except Exception:
-            pass
+            path.write_text(json.dumps(unreaped, indent=1))
+        except Exception as e:
+            logger.warning(f"⚠ Could not rewrite session registry: {e}")
 
     async def initialize(self) -> None:
         """Detect available GPUs on startup."""
-        # Before anything else: clean up engine processes a previous run left behind.
-        self._reap_stale_sessions()
+        # Before anything else: clean up engine processes a previous run left
+        # behind. Runs in a thread — it polls with blocking sleeps for up to
+        # ~10s per stale group and must not stall the event loop.
+        await asyncio.to_thread(self._reap_stale_sessions)
 
         if PYNVML_AVAILABLE:
             try:
@@ -295,22 +307,39 @@ class GpuManager:
         """Terminate all running llama-server sessions."""
         logger.info("⏳ Cleaning up sessions...")
 
-        # Stop all active sessions
-        tasks = []
-        for model_name, session in list(self.sessions.items()):
-            logger.info(f"   Stopping session: {model_name}")
-            tasks.append(session.stop())
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            logger.info(f"✓ Stopped {len(tasks)} session(s)")
-        else:
+        names = list(self.sessions.keys())
+        if not names:
             logger.info("   No active sessions to stop")
+            self._registry_sync()
+            return
 
-        # Clear sessions dict
-        self.sessions.clear()
+        for name in names:
+            logger.info(f"   Stopping session: {name}")
+        results = await asyncio.gather(
+            *(self.sessions[n].stop() for n in names), return_exceptions=True
+        )
+
+        # Drop only the sessions that are genuinely gone. Anything still alive
+        # stays in self.sessions so _registry_sync keeps its record and the next
+        # start reaps it, instead of losing track of a process holding VRAM.
+        stopped = 0
+        for name, result in zip(names, results):
+            session = self.sessions.get(name)
+            if session is None:
+                continue
+            if isinstance(result, Exception):
+                logger.error(f"✗ {name} raised during stop: {result}")
+            if session.group_is_alive():
+                logger.error(
+                    f"✗ {name} still has live processes after stop — leaving it in the "
+                    f"session registry so the next start reaps it"
+                )
+                continue
+            self.sessions.pop(name, None)
+            stopped += 1
+
         self._registry_sync()
-        logger.info("✓ All sessions cleaned up")
+        logger.info(f"✓ Stopped {stopped}/{len(names)} session(s)")
 
     async def load_model(self, model_name: str, gpu_ids: List[int]) -> None:
         """
@@ -585,6 +614,18 @@ class GpuManager:
 
             session = self.sessions[model_name]
             await session.stop()
+            if session.group_is_alive():
+                # stop() TERMed and KILLed the group; if anything survived it is
+                # unkillable from here (uninterruptible sleep, or not ours).
+                # Say so loudly rather than reporting a clean unload.
+                logger.error(
+                    f"✗ {model_name}: processes survived unload (pgid {session.pid}) — "
+                    f"VRAM may not be released; recorded for reaping at next start"
+                )
+                self._orphans[model_name] = {
+                    "pid": session.pid,
+                    "port": session.model_config.port,
+                }
 
             # Update GPU allocation across all GPUs the model was using
             model = self.models[model_name]
