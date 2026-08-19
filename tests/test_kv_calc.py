@@ -139,3 +139,22 @@ class TestInverseSolve:
         one = context_for_vram(vram_gb=20.0, concurrency=1, **self.ARGS)
         four = context_for_vram(vram_gb=20.0, concurrency=4, **self.ARGS)
         assert four == pytest.approx(one / 4, rel=0.01)
+
+
+class TestCalibrationWithExplicitBudget:
+    """With --kv-cache-memory-bytes set, vLLM stops printing 'Available KV cache
+    memory', so the known budget over the reported token count is the source.
+    This is the configuration decision 7 requires, so it must be the one that works."""
+
+    LOG = "INFO [kv_cache_utils.py] GPU KV cache size: 65,536 tokens\n"
+
+    def test_derives_from_the_budget(self):
+        assert calibrate_from_log(self.LOG, 805306368) == 12288
+
+    def test_none_without_a_budget_to_divide(self):
+        assert calibrate_from_log(self.LOG) is None
+
+    def test_memory_line_still_wins_when_present(self):
+        text = ("Available KV cache memory: 55.42 GiB\n"
+                "GPU KV cache size: 4,842,496 tokens\n")
+        assert calibrate_from_log(text, 999) == 12288

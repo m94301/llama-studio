@@ -170,6 +170,8 @@ class ModelConfig:
         self.total_vram: Optional[float] = None
         self.is_configured: bool = False
         self.config_error: Optional[str] = None  # reason for unconfigured, surfaced in UI
+        # vLLM models have no GGUF; trained context comes from config.json.
+        self.vllm_max_context: Optional[int] = None
 
     # ---- proxies to parsed script ----
 
@@ -225,6 +227,9 @@ class ModelConfig:
 
     @property
     def max_context(self) -> Optional[int]:
+        """Trained context: GGUF metadata for llama.cpp, config.json for vLLM."""
+        if self.parsed.engine == "vllm":
+            return self.vllm_max_context
         return self.parsed.max_context
 
     @property
@@ -672,7 +677,9 @@ class ConfigManager:
             return None
         try:
             log_path = self.get_log_path(model_name)
-            measured = calibrate_from_log(log_path.read_text(errors="replace"))
+            measured = calibrate_from_log(
+                log_path.read_text(errors="replace"), mc.kv_cache_memory_bytes
+            )
         except Exception as e:
             logger.debug(f"   Could not calibrate KV for {model_name}: {e}")
             return None
@@ -705,6 +712,12 @@ class ConfigManager:
             mc.size_gb = parsed.vram_gb
         elif parsed.model_path and Path(parsed.model_path).is_dir():
             mc.size_gb = self._get_safetensors_size_gb(Path(parsed.model_path))
+        # Trained context bounds the calculator's slider, exactly as the GGUF
+        # max_context does for llama.cpp. Read live rather than cached: it is a
+        # property of the model directory, not something the user configures.
+        if parsed.model_path and Path(parsed.model_path).is_dir():
+            from kv_calc import max_context_from_config
+            mc.vllm_max_context = max_context_from_config(parsed.model_path)
         ok, reason = parsed.is_configured()
         mc.is_configured = ok
         mc.config_error = reason

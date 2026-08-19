@@ -46,6 +46,24 @@ DEFAULT_OVERHEAD_GB = 1.5
 CONTEXT_GRANULARITY = 256
 
 
+def max_context_from_config(model_dir: str) -> Optional[int]:
+    """Trained context length from a HF config.json — the slider's upper bound.
+
+    The vLLM counterpart of the GGUF `max_context` we cache for llama.cpp.
+    """
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except Exception:
+        return None
+    if "max_position_embeddings" not in cfg and isinstance(cfg.get("text_config"), dict):
+        cfg = cfg["text_config"]
+    value = cfg.get("max_position_embeddings")
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
 def dtype_bytes(name: Optional[str], default: float = 2.0) -> float:
     if not name:
         return default
@@ -98,16 +116,26 @@ _KV_MEM_RE = re.compile(r"Available KV cache memory:\s*([\d.]+)\s*GiB")
 _KV_TOK_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
 
 
-def calibrate_from_log(log_text: str) -> Optional[int]:
-    """Exact KV bytes per token, read back from a successful vLLM load's log."""
-    mem = _KV_MEM_RE.search(log_text)
+def calibrate_from_log(log_text: str, kv_budget_bytes: Optional[int] = None) -> Optional[int]:
+    """Exact KV bytes per token, read back from a successful vLLM load's log.
+
+    Two sources, because vLLM's reporting depends on how the pool was sized:
+    with utilization-based sizing it prints "Available KV cache memory: X GiB",
+    but with an explicit --kv-cache-memory-bytes that line is absent — so the
+    known budget divided by the reported token count is the figure instead.
+    """
     tok = _KV_TOK_RE.search(log_text)
-    if not mem or not tok:
+    if not tok:
         return None
     tokens = int(tok.group(1).replace(",", ""))
     if tokens <= 0:
         return None
-    return int(round(float(mem.group(1)) * GIB / tokens))
+    mem = _KV_MEM_RE.search(log_text)
+    if mem:
+        return int(round(float(mem.group(1)) * GIB / tokens))
+    if kv_budget_bytes:
+        return int(round(kv_budget_bytes / tokens))
+    return None
 
 
 def pool_tokens(context_length: int, concurrency: int, headroom: float = 1.0) -> int:
