@@ -165,6 +165,9 @@ class ParsedScript:
 
     # Shell-level state (read from script body, not args)
     cuda_visible_devices: Optional[List[int]] = None  # parsed CUDA_VISIBLE_DEVICES, None if absent
+    # Assignments above the invocation (VLLM_PP_LAYER_PARTITION, MODEL, …).
+    # Real launch config that never appears in the argument list.
+    env_assignments: Dict[str, str] = field(default_factory=dict)
 
     # Original text and parse warnings
     raw_text: str = ""
@@ -647,6 +650,8 @@ def parse_script(text: str) -> ParsedScript:
     # Shell-level CVD (read from the whole script regardless of fence presence)
     ps.cuda_visible_devices = _extract_cuda_visible_devices(text)
 
+    ps.env_assignments = extract_assignments(text)
+
     # vLLM uneven pipeline split (env var, preserved as preamble — doc 21 §4).
     raw_part = _lookup_assignment("VLLM_PP_LAYER_PARTITION", text)
     if raw_part is not None:
@@ -1088,6 +1093,82 @@ def patch_launch_args_fence(
     else:
         prefix = ""
     return prefix + text + (trailing_newline if not text.endswith("\n") else "") + body
+
+
+# Shell variables the app manages itself; the user edits these through their own
+# controls, not as free-form environment rows.
+MANAGED_ASSIGNMENTS = {_CVD_KEY}
+
+_ASSIGN_LINE_RE = re.compile(
+    r'^[ \t]*(?P<export>export[ \t]+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)='
+    r'(?P<value>"[^"]*"|\'[^\']*\'|[^\s#]*)(?P<rest>.*)$'
+)
+
+
+def extract_assignments(text: str) -> Dict[str, str]:
+    """Shell assignments above the invocation, as written (quotes stripped).
+
+    These carry real launch configuration that never appears in the argument
+    list — VLLM_PP_LAYER_PARTITION, VLLM_WORKER_MULTIPROC_METHOD, the MODEL /
+    MAXLEN style variable defaults — so the config UI has to be able to show and
+    edit them. Later assignments win, matching the shell.
+    """
+    span = find_invocation_span(text)
+    limit = span[0] if span else len(text.splitlines())
+    found: Dict[str, str] = {}
+    for line in text.splitlines()[:limit]:
+        m = _ASSIGN_LINE_RE.match(line)
+        if not m:
+            continue
+        name = m.group("name")
+        if name in MANAGED_ASSIGNMENTS:
+            continue
+        value = m.group("value")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        found[name] = value
+    return found
+
+
+def patch_env_assignment(text: str, name: str, value: Optional[str]) -> str:
+    """Set, change, or remove one shell assignment, leaving the rest untouched.
+
+    Rewrites the last existing assignment in place (preserving any trailing
+    comment), inserts one just above the invocation when absent, and removes
+    every assignment of `name` when value is None.
+    """
+    lines = text.splitlines()
+    span = find_invocation_span(text)
+    limit = span[0] if span else len(lines)
+    trailing = "\n" if text.endswith("\n") else ""
+
+    matches = [
+        i for i in range(limit)
+        if (m := _ASSIGN_LINE_RE.match(lines[i])) and m.group("name") == name
+    ]
+
+    if value is None:
+        for i in reversed(matches):
+            del lines[i]
+        return "\n".join(lines) + trailing
+
+    quoted = value if re.fullmatch(r"[A-Za-z0-9_./:,+-]*", value) else f'"{value}"'
+    if matches:
+        keep = matches[-1]
+        m = _ASSIGN_LINE_RE.match(lines[keep])
+        prefix = "export " if m.group("export") else ""
+        indent = re.match(r"^[ \t]*", lines[keep]).group(0)
+        comment = m.group("rest")
+        lines[keep] = f"{indent}{prefix}{name}={quoted}{comment}"
+        for i in reversed(matches[:-1]):
+            del lines[i]
+        return "\n".join(lines) + trailing
+
+    insert_at = limit
+    while insert_at > 0 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    lines[insert_at:insert_at] = [f"export {name}={quoted}"]
+    return "\n".join(lines) + trailing
 
 
 def find_invocation_span(text: str) -> Optional[Tuple[int, int]]:

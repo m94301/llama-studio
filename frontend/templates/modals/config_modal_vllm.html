@@ -100,6 +100,38 @@
                 </div>
             </fieldset>
 
+            <!-- Environment: launch config that has no command-line flag -->
+            <fieldset>
+                <legend class="text-sm font-bold text-gray-300 mb-1">Environment</legend>
+                <p class="text-xs text-gray-500 mb-3">
+                    Shell assignments above the <code>exec</code> line. These are real launch
+                    settings with no command-line flag — <code>VLLM_PP_LAYER_PARTITION</code>,
+                    worker method, and the model's own variable defaults. Comments on each line
+                    are preserved.
+                </p>
+                <div id="v-env-table" class="border border-gray-700 rounded overflow-hidden">
+                    <div class="bg-gray-900 px-4 py-2 grid gap-2 font-bold text-sm text-gray-400"
+                         style="grid-template-columns: 1fr 1.4fr auto;">
+                        <span>Variable</span><span>Value</span><span></span>
+                    </div>
+                    {% for name, value in env_assignments.items() %}
+                    <div class="px-4 py-2 border-t border-gray-700 grid gap-2 items-center"
+                         style="grid-template-columns: 1fr 1.4fr auto;">
+                        <input type="text" data-env-name value="{{ name }}"
+                               class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
+                        <input type="text" data-env-value value="{{ value }}"
+                               oninput="vCheckPartition()"
+                               class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
+                        <button type="button" onclick="this.closest('div').remove(); vCheckPartition();"
+                                class="text-red-500 hover:text-red-400 text-xl leading-none w-6 h-6">×</button>
+                    </div>
+                    {% endfor %}
+                </div>
+                <p id="v-partition-note" class="text-xs mt-2"></p>
+                <button type="button" onclick="vAddEnv()"
+                        class="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">+ Add Variable</button>
+            </fieldset>
+
             <!-- Advanced args -->
             <fieldset>
                 <legend class="text-sm font-bold text-gray-300 mb-3">Launch Args</legend>
@@ -212,6 +244,7 @@ window.V = {
     gpuFree: {{ gpu_free | tojson }},
     kvBudget: {{ kv_cache_memory_bytes | tojson }},
     headroom: {{ kv_headroom }},
+    ppSize: {{ pp_size }},
 };
 const GIB = 1024 ** 3;
 
@@ -349,6 +382,51 @@ function vFilter(query) {
     });
 }
 
+function vAddEnv() {
+    const table = document.getElementById('v-env-table');
+    const row = document.createElement('div');
+    row.className = 'px-4 py-2 border-t border-gray-700 grid gap-2 items-center';
+    row.style.gridTemplateColumns = '1fr 1.4fr auto';
+    row.innerHTML = `
+        <input type="text" data-env-name placeholder="VLLM_..." class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
+        <input type="text" data-env-value oninput="vCheckPartition()" class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
+        <button type="button" onclick="this.closest('div').remove(); vCheckPartition();" class="text-red-500 hover:text-red-400 text-xl leading-none w-6 h-6">×</button>`;
+    table.appendChild(row);
+    row.querySelector('[data-env-name]').focus();
+}
+
+function vCollectEnv() {
+    const env = {};
+    document.querySelectorAll('#v-env-table [data-env-name]').forEach(input => {
+        const name = input.value.trim();
+        if (!name) return;
+        env[name] = input.closest('div').querySelector('[data-env-value]').value;
+    });
+    return env;
+}
+
+// The mismatch that cost a failed 4-card start: the partition must have one
+// entry per pipeline stage, and they must sum to the model's layer count.
+function vCheckPartition() {
+    const note = document.getElementById('v-partition-note');
+    if (!note) return;
+    const raw = vCollectEnv()['VLLM_PP_LAYER_PARTITION'];
+    if (!raw) { note.textContent = ''; return; }
+    const m = String(raw).match(/(\d+\s*,\s*)*\d+/);
+    const parts = m ? m[0].split(',').map(s => parseInt(s.trim())) : [];
+    const pp = window.V.ppSize;
+    if (!parts.length) { note.textContent = ''; return; }
+    const sum = parts.reduce((a, b) => a + b, 0);
+    if (parts.length !== pp) {
+        note.className = 'text-xs mt-2 text-red-400';
+        note.textContent = `⚠ VLLM_PP_LAYER_PARTITION has ${parts.length} entries but `
+            + `--pipeline-parallel-size is ${pp}. vLLM will refuse to start.`;
+    } else {
+        note.className = 'text-xs mt-2 text-gray-500';
+        note.textContent = `${parts.length} stages, ${sum} layers total.`;
+    }
+}
+
 function vCollectArgs() {
     const args = {};
     args['--host'] = document.getElementById('v-host').value.trim() || '0.0.0.0';
@@ -381,6 +459,7 @@ function vSave() {
             display_name: document.getElementById('v-display-name').value,
             health_timeout: document.getElementById('v-health-timeout').value,
             args_json: JSON.stringify(vCollectArgs()),
+            env_json: JSON.stringify(vCollectEnv()),
         },
     });
 }
@@ -413,4 +492,5 @@ window.closeModalAndRefresh = function () {
 
 vRecalc();
 vSyncRows();
+vCheckPartition();
 </script>

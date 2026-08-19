@@ -919,6 +919,8 @@ async def config_modal_new(model: str):
                 weights_gb=model_config.size_gb or 0,
                 overhead_gb=DEFAULT_OVERHEAD_GB,
                 kv_headroom=DEFAULT_KV_HEADROOM,
+                env_assignments=model_config.parsed.env_assignments,
+                pp_size=model_config.parsed.pipeline_parallel_size,
                 gpu_free=gpu_free,
             ))
 
@@ -1624,6 +1626,7 @@ async def save_vllm_config(
     display_name: str = Form(""),
     health_timeout: str = Form(""),
     args_json: str = Form(...),
+    env_json: str = Form("{}"),
 ):
     """Structured save for a vLLM model — rewrites only the exec line (§2.2).
 
@@ -1633,7 +1636,7 @@ async def save_vllm_config(
     and arguments the user didn't change keep their original spelling, so
     `$VAR` indirection survives.
     """
-    from launch_script import patch_exec_invocation
+    from launch_script import patch_env_assignment, patch_exec_invocation
 
     logger.info(f"💾 Saving vLLM config for: {model_name}")
     try:
@@ -1676,6 +1679,18 @@ async def save_vllm_config(
         script_path = config_manager.get_script_path(model_name)
         text = script_path.read_text()
         text = patch_exec_invocation(text, args=args, parsed=mc.parsed)
+        # Environment assignments carry launch config with no CLI flag; drop
+        # any the user removed, then set the rest.
+        try:
+            env = json.loads(env_json) or {}
+        except json.JSONDecodeError:
+            env = {}
+        if env:
+            for gone in set(mc.parsed.env_assignments) - set(env):
+                text = patch_env_assignment(text, gone, None)
+            for name, value in env.items():
+                if mc.parsed.env_assignments.get(name) != value:
+                    text = patch_env_assignment(text, name, value)
         text = patch_meta_fence(
             text,
             display_name=display_name.strip() or None,
