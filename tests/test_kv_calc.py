@@ -185,3 +185,100 @@ class TestLoadRejectionIsTerminal:
         asyncio.run(gm.load_model("nope", [0]))          # model not found
         assert gm.state_info["nope"].state == ModelState.FAILED
         assert "nope" in (gm.state_info["nope"].error_msg or "")
+
+
+class TestDerivedUtilization:
+    """--gpu-memory-utilization is a startup gate as well as a sizing knob:
+    vLLM refuses to launch unless free >= util x capacity, however little it then
+    uses. Deriving it from the need keeps the gate and real consumption in step."""
+
+    def test_tracks_the_need_rather_than_the_card(self):
+        from kv_calc import utilization_for
+        # 52 GB needed on a 64 GB card -> ~0.85, not 0.98
+        assert utilization_for(52.0, 64.0) == pytest.approx(0.853, abs=0.002)
+
+    def test_a_small_model_does_not_claim_the_whole_card(self):
+        from kv_calc import utilization_for
+        util = utilization_for(2.2, 64.0)
+        assert util < 0.05
+        assert util * 64.0 >= 2.2  # still covers actual usage
+
+    def test_covers_usage_with_margin(self):
+        from kv_calc import UTILIZATION_SAFETY, utilization_for
+        for need in (1.0, 10.0, 52.0):
+            assert utilization_for(need, 64.0) * 64.0 >= need * (UTILIZATION_SAFETY - 0.01)
+
+    def test_never_exceeds_the_maximum(self):
+        from kv_calc import UTILIZATION_MAX, utilization_for
+        assert utilization_for(999.0, 64.0) == UTILIZATION_MAX
+
+    def test_never_zero(self):
+        from kv_calc import utilization_for
+        assert utilization_for(0.0, 64.0) > 0
+
+
+class TestPickerMatchesTheStartupGate:
+    """Regression for the failed 4-card DSV4 start: our picker asked for the
+    predicted usage (52.12 GB) and passed a GPU with 62.07 GB free, while vLLM's
+    gate demanded 62.24 GB and refused."""
+
+    def _model(self, util, kv_bytes, size_gb, gpus=1):
+        import sys
+        from pathlib import Path as _P
+        sys.path.insert(0, str(_P(__file__).resolve().parent.parent / "backend"))
+        from config_manager import ModelConfig
+        from launch_script import META_BEGIN, META_END, parse_script
+        text = (
+            f"#!/usr/bin/env bash\n{META_BEGIN}\n# engine: vllm\n{META_END}\n"
+            f"exec /opt/venv/bin/vllm serve /m --host 0.0.0.0 --port 8000 "
+            f"--gpu-memory-utilization {util} --kv-cache-memory-bytes {kv_bytes} "
+            f"--pipeline-parallel-size {gpus}\n"
+        )
+        mc = ModelConfig(name="m", script_path=_P("/tmp/m.sh"), parsed=parse_script(text))
+        mc.size_gb = size_gb
+        return mc
+
+    def test_hand_set_high_util_is_demanded_in_full(self):
+        mc = self._model(0.98, 1_000_000, size_gb=155.4, gpus=4)
+        assert mc.needed_on_gpu(63.51) == pytest.approx(0.98 * 63.51, abs=0.01)
+
+    def test_derived_util_demands_only_what_is_used(self):
+        from kv_calc import GIB, utilization_for
+        kv = int(3.0 * GIB)
+        usage = 2.0 + 1.5 + 3.0
+        util = utilization_for(usage, 64.0)
+        mc = self._model(util, kv, size_gb=2.0)
+        need = mc.needed_on_gpu(64.0)
+        assert need >= usage           # covers the load
+        assert need < usage * 1.15     # without reserving the card
+
+
+class TestPerGpuKvSemantics:
+    """--kv-cache-memory-bytes is 'Size of KV Cache per GPU' — only the weights
+    divide across cards. Dividing the KV too under-predicted a 4-card DSV4 at
+    42 GB per GPU when it actually used 52-53."""
+
+    # The real 4-card DSV4 load: 262k context, budget sized from the 44,032
+    # bytes/token estimate that was current at the time.
+    ARGS = dict(context_length=262144, concurrency=1, bytes_per_token=44032,
+                weights_gb=155.4, overhead_gb=1.5, headroom=1.2)
+
+    def test_matches_the_measured_four_card_load(self):
+        per_gpu, tokens = vram_gb_for(gpu_count=4, **self.ARGS)
+        assert tokens == 314572
+        assert per_gpu == pytest.approx(52.5, abs=1.5)   # measured 51.2-53.3
+
+    def test_only_weights_divide(self):
+        one, _ = vram_gb_for(gpu_count=1, **self.ARGS)
+        four, _ = vram_gb_for(gpu_count=4, **self.ARGS)
+        kv_plus_overhead = 314572 * 44032 / GIB + 1.5
+        assert one - four == pytest.approx(155.4 - 155.4 / 4, abs=0.05)
+        assert four - 155.4 / 4 == pytest.approx(kv_plus_overhead, abs=0.05)
+
+    def test_inverse_accounts_for_the_split_too(self):
+        per_gpu, _ = vram_gb_for(gpu_count=4, **self.ARGS)
+        back = context_for_vram(
+            vram_gb=per_gpu, concurrency=1, bytes_per_token=44032,
+            weights_gb=155.4, overhead_gb=1.5, headroom=1.2, gpu_count=4,
+        )
+        assert abs(back - 262144) <= CONTEXT_GRANULARITY

@@ -208,14 +208,22 @@ class ModelConfig:
         of model size, so the need depends on the target GPU rather than the
         model (doc 21 decision 3 and §2.4).
         """
+        gate = self.gpu_memory_utilization * gpu_total_gb
         budget = self.kv_cache_memory_bytes
         if budget is None:
-            return round(self.gpu_memory_utilization * gpu_total_gb, 2)
+            return round(gate, 2)
         from kv_calc import DEFAULT_OVERHEAD_GB, GIB
         per_gpu = max(1, self.gpu_count)
-        total = (self.size_gb or 0.0) + DEFAULT_OVERHEAD_GB + budget / GIB
-        # Never claim to need more than utilization would have allowed.
-        return round(min(total / per_gpu, self.gpu_memory_utilization * gpu_total_gb), 2)
+        # --kv-cache-memory-bytes is per GPU; only the weights divide.
+        usage = (self.size_gb or 0.0) / per_gpu + DEFAULT_OVERHEAD_GB + budget / GIB
+        # --gpu-memory-utilization is a startup gate as well as a sizing knob:
+        # vLLM refuses to launch unless `free >= util × capacity`, however little
+        # it then uses. Requiring only the predicted usage would green-light loads
+        # the engine rejects — which is exactly how a 4-card DSV4 start failed on
+        # a GPU with 62.07 GB free against a 62.24 GB gate. The config UI derives
+        # util from this same usage figure, so for a tool-written script the two
+        # numbers coincide and nothing is over-reserved.
+        return round(max(usage, gate), 2)
 
     @property
     def model_path(self) -> Optional[str]:

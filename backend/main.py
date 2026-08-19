@@ -887,9 +887,13 @@ async def config_modal_new(model: str):
                 )
                 bpt_source = "estimated"
 
-            gpu_free = {}
+            gpu_free, gpu_caps = {}, []
             for gid, info in (gpu_manager.get_gpu_status() or {}).items():
                 gpu_free[gid] = round(info["memory"] - info["allocated"], 1)
+                gpu_caps.append(info["memory"])
+            # Utilization is a fraction of each card, so derive it against the
+            # smallest one present; anything larger then has room to spare.
+            gpu_capacity = round(min(gpu_caps), 2) if gpu_caps else 0.0
 
             # Render the opening VRAM figure server-side. The box previously
             # relied entirely on JS having run to show anything, so it appeared
@@ -902,7 +906,7 @@ async def config_modal_new(model: str):
                 initial_vram, initial_tokens = vram_gb_for(
                     context_length=initial_ctx, concurrency=initial_conc,
                     bytes_per_token=bpt, weights_gb=model_config.size_gb or 0,
-                    headroom=DEFAULT_KV_HEADROOM,
+                    headroom=DEFAULT_KV_HEADROOM, gpu_count=model_config.gpu_count,
                 )
 
             template = jinja_env.get_template("modals/config_modal_vllm.html")
@@ -936,6 +940,7 @@ async def config_modal_new(model: str):
                 env_assignments=model_config.parsed.env_assignments,
                 pp_size=model_config.parsed.pipeline_parallel_size,
                 gpu_free=gpu_free,
+                gpu_capacity=gpu_capacity,
                 initial_vram=initial_vram,
                 initial_tokens=initial_tokens,
             ))
@@ -1768,19 +1773,19 @@ async def calculate_vllm_vram(
         ctx = context_for_vram(
             vram_gb=vram_gb, concurrency=concurrency, bytes_per_token=bpt,
             weights_gb=weights, max_context=mc.max_context,
-            headroom=DEFAULT_KV_HEADROOM,
+            headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
         )
         total, tokens = vram_gb_for(
             context_length=ctx, concurrency=concurrency,
             bytes_per_token=bpt, weights_gb=weights,
-            headroom=DEFAULT_KV_HEADROOM,
+            headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
         )
     else:
         ctx = max(0, context_length)
         total, tokens = vram_gb_for(
             context_length=ctx, concurrency=concurrency,
             bytes_per_token=bpt, weights_gb=weights,
-            headroom=DEFAULT_KV_HEADROOM,
+            headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
         )
 
     return JSONResponse({
@@ -1793,7 +1798,9 @@ async def calculate_vllm_vram(
         "overhead_gb": DEFAULT_OVERHEAD_GB,
         "headroom": DEFAULT_KV_HEADROOM,
         "kv_gb": round(tokens * bpt / GIB, 2),
-        "total_gb": total,
+        "per_gpu_gb": total,
+        "gpu_count": mc.gpu_count,
+        "total_gb": round(total * mc.gpu_count, 2),
         "kv_cache_memory_bytes": tokens * bpt,
     })
 

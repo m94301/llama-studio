@@ -20,6 +20,7 @@ whose KV shape isn't the standard `2 × layers × kv_heads × head_dim × dtype`
 
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Optional, Tuple
@@ -144,6 +145,37 @@ def calibrate_from_log(log_text: str, kv_budget_bytes: Optional[int] = None) -> 
     return None
 
 
+# How far above the computed need the derived utilization sits. --gpu-memory-utilization
+# must cover actual usage (vLLM errors if the KV budget doesn't fit inside it) while
+# staying as low as possible, because it is *also* a startup gate: vLLM refuses to launch
+# unless `free >= util × capacity`, whether or not it means to use that much. Too high and
+# a model blocks a card it isn't filling; too low and it won't start at all.
+UTILIZATION_SAFETY = 1.05
+UTILIZATION_MAX = 0.98
+
+
+def utilization_for(
+    needed_gb: float,
+    capacity_gb: float,
+    *,
+    safety: float = UTILIZATION_SAFETY,
+    maximum: float = UTILIZATION_MAX,
+) -> float:
+    """Smallest --gpu-memory-utilization that still covers `needed_gb` on this card.
+
+    Deriving it from the need keeps the startup gate and real consumption in step:
+    the GPU picker can then require exactly what vLLM will require, instead of
+    green-lighting a load the engine refuses, or reserving a whole card for a model
+    that only wants a slice of it.
+    """
+    if capacity_gb <= 0:
+        return maximum
+    # Round *up* at 3dp: rounding to nearest can land the gate just under the
+    # need it was supposed to cover.
+    exact = needed_gb * safety / capacity_gb
+    return min(maximum, max(0.001, math.ceil(exact * 1000) / 1000))
+
+
 def pool_tokens(context_length: int, concurrency: int, headroom: float = 1.0) -> int:
     """Total KV tokens needed to serve `concurrency` conversations of `context_length`."""
     return int(max(1, context_length) * max(1, concurrency) * max(1.0, headroom))
@@ -161,10 +193,20 @@ def vram_gb_for(
     weights_gb: float,
     overhead_gb: float = DEFAULT_OVERHEAD_GB,
     headroom: float = 1.0,
+    gpu_count: int = 1,
 ) -> Tuple[float, int]:
-    """Forward solve: (total VRAM in GB, pool tokens) for a context/concurrency pair."""
+    """Forward solve: (VRAM per GPU in GB, pool tokens) for a context/concurrency pair.
+
+    vLLM's --kv-cache-memory-bytes is documented as "Size of KV Cache **per
+    GPU**", so the KV figure is what each card carries — only the weights divide
+    across them. Getting this wrong under-predicts a pipeline-parallel model
+    badly: a 4-card DSV4 measured 52-53 GB per GPU against a 42 GB prediction
+    that had divided the KV four ways.
+    """
     tokens = pool_tokens(context_length, concurrency, headroom)
-    return round(weights_gb + overhead_gb + kv_gb(tokens, bytes_per_token), 2), tokens
+    gpus = max(1, gpu_count)
+    per_gpu = weights_gb / gpus + overhead_gb + kv_gb(tokens, bytes_per_token)
+    return round(per_gpu, 2), tokens
 
 
 def context_for_vram(
@@ -175,6 +217,7 @@ def context_for_vram(
     weights_gb: float,
     overhead_gb: float = DEFAULT_OVERHEAD_GB,
     headroom: float = 1.0,
+    gpu_count: int = 1,
     max_context: Optional[int] = None,
     granularity: int = CONTEXT_GRANULARITY,
 ) -> int:
@@ -184,7 +227,7 @@ def context_for_vram(
     to `max_context` when the model's trained length is known. Returns 0 when
     the budget cannot even cover weights + overhead.
     """
-    available = vram_gb - weights_gb - overhead_gb
+    available = vram_gb - weights_gb / max(1, gpu_count) - overhead_gb
     if available <= 0 or bytes_per_token <= 0:
         return 0
     tokens = int(available * GIB / bytes_per_token / max(1.0, headroom))
