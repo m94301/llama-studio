@@ -139,13 +139,11 @@
                     </div>
                     {% endfor %}
                 </div>
-                <div class="grid grid-cols-2 gap-2">
+                <div class="flex gap-2">
                     <button type="button" onclick="vAddArg('', '')"
-                            class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">+ Add Argument</button>
+                            class="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">+ Add Argument</button>
                     <button type="button" onclick="vShowBrowser()"
-                            class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">🔍 Option Browser</button>
-                    <button type="button" id="v-raw-toggle" onclick="vToggleRaw()"
-                            class="col-span-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm font-bold">Edit Raw Script</button>
+                            class="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">🔍 Option Browser</button>
                 </div>
                 <p class="text-xs text-gray-600 mt-2">
                     Saving rewrites only the <code>exec</code> line. Env exports, comments and
@@ -154,10 +152,10 @@
                 </p>
             </fieldset>
 
-            <!-- Launch script: always here, not behind a button. Anything with no
-                 field above — env exports like VLLM_PP_LAYER_PARTITION, pre-launch
-                 commands — is edited directly. -->
-            <fieldset id="v-raw-section" class="hidden">
+            <!-- Launch script: always visible. Anything with no field above — env
+                 exports like VLLM_PP_LAYER_PARTITION, pre-launch commands — is
+                 edited directly here. -->
+            <fieldset id="v-raw-section">
                 <legend class="text-sm font-bold text-gray-300 mb-1">Launch Script</legend>
                 <p class="text-xs text-gray-500 mb-2">
                     <code>config/models/{{ model_name }}.sh</code> — the source of truth. Editing
@@ -397,12 +395,6 @@ function vSave() {
 }
 
 
-function vToggleRaw() {
-    const section = document.getElementById('v-raw-section');
-    const open = section.classList.toggle('hidden') === false;
-    document.getElementById('v-raw-toggle').textContent = open ? 'Hide Raw Script' : 'Edit Raw Script';
-    if (open) section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-}
 
 function vSaveRaw() {
     document.getElementById('v-raw-note').textContent = 'Saving…';
