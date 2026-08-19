@@ -315,15 +315,27 @@ _VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}?")
 
 
 def _lookup_assignment(name: str, text: str) -> Optional[str]:
-    """Find `NAME=value` (optionally exported/quoted) in the script body."""
-    for pat in (
-        rf'^[ \t]*(?:export[ \t]+)?{name}[ \t]*=[ \t]*"([^"]*)"',
-        rf"^[ \t]*(?:export[ \t]+)?{name}[ \t]*=[ \t]*'([^']*)'",
-        rf"^[ \t]*(?:export[ \t]+)?{name}[ \t]*=[ \t]*(\S+)",
-    ):
-        m = re.search(pat, text, re.MULTILINE)
-        if m:
-            return m.group(1)
+    """Value of the *last* `NAME=value` assignment in the script.
+
+    Shell runs top to bottom, so a later assignment wins — the same rule
+    _extract_cuda_visible_devices already applies. Matching all three quoting
+    forms in one pass matters: trying double-quoted, then single, then bare
+    patterns in sequence would let quoting style decide the winner instead of
+    position. (Assignments inside conditionals can't be resolved without
+    evaluating the script; last-wins is the closest static approximation.)
+    """
+    pattern = re.compile(
+        rf'^[ \t]*(?:export[ \t]+)?{re.escape(name)}[ \t]*=[ \t]*'
+        rf'(?:"([^"]*)"|\'([^\']*)\'|(\S+))',
+        re.MULTILINE,
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return None
+    last = matches[-1]
+    for group in (1, 2, 3):
+        if last.group(group) is not None:
+            return last.group(group)
     return None
 
 

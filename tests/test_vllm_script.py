@@ -234,3 +234,29 @@ class TestVllmSkeleton:
         )
         ps = parse_script(text)
         assert set(ps.args.keys()) == {"--host"}
+
+
+class TestVarResolutionShellSemantics:
+    """Audit finding #2: resolution picked the first match per quoting style,
+    so which assignment won depended on quote characters rather than position."""
+
+    def test_last_assignment_wins(self):
+        assert resolve_var_refs("$MODEL", "MODEL=/old\nMODEL=/new\n") == "/new"
+
+    @pytest.mark.parametrize("text,expected", [
+        ('MODEL=/bare/first\nMODEL="/quoted/second"\n', "/quoted/second"),
+        ('MODEL="/quoted/first"\nMODEL=/bare/second\n', "/bare/second"),
+        ("MODEL='/single/first'\nMODEL=/bare/second\n", "/bare/second"),
+        ('MODEL=/bare/first\nMODEL=\'/single/second\'\n', "/single/second"),
+    ])
+    def test_quoting_style_does_not_decide_the_winner(self, text, expected):
+        assert resolve_var_refs("$MODEL", text) == expected
+
+    def test_export_prefix_and_override(self):
+        text = 'export MODEL="/first"\nexport MODEL="/second"\n'
+        assert resolve_var_refs("$MODEL", text) == "/second"
+
+    def test_override_of_a_guarded_default(self):
+        # `MAXLEN="${MAXLEN:-1000}"` then a later hard override
+        text = 'MAXLEN="${MAXLEN:-1000}"\nMAXLEN=2000\n'
+        assert resolve_var_refs("$MAXLEN", text) == "2000"
