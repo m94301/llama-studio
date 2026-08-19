@@ -1,7 +1,12 @@
 """GPU state management and session coordination."""
 
 import asyncio
+import json
 import logging
+import os
+import re
+import signal
+import subprocess
 import time
 from typing import Dict, List, Optional
 from enum import Enum
@@ -137,8 +142,90 @@ class GpuManager:
         self.gpu_detection_status: str = "unavailable"
         self.gpu_detection_error: Optional[str] = None
 
+    # ---- session registry: crash-proof cleanup across app restarts ----
+    #
+    # Every live session is recorded in sessions/active.json the moment it has
+    # a PID. On startup, before anything else, stale entries from a previous
+    # run (hard kill, --reload restart, crash) are reaped by killing their
+    # process groups — this is what guarantees no engine process ever outlives
+    # the app unnoticed.
+
+    def _registry_path(self) -> Path:
+        return self.config.project_root / "sessions" / "active.json"
+
+    def _registry_sync(self) -> None:
+        """Rewrite the registry from the current sessions dict."""
+        try:
+            data = {
+                name: {"pid": s.pid, "port": s.model_config.port}
+                for name, s in self.sessions.items()
+                if s.pid
+            }
+            path = self._registry_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=1))
+        except Exception as e:
+            logger.warning(f"⚠ Could not write session registry: {e}")
+
+    @staticmethod
+    def _group_members(pgid: int) -> str:
+        """Cmdlines of all processes in a group ('' when the group is empty)."""
+        try:
+            return subprocess.run(
+                ["pgrep", "-g", str(pgid), "-a"], capture_output=True, text=True
+            ).stdout.strip()
+        except Exception:
+            return ""
+
+    def _reap_stale_sessions(self) -> None:
+        """Kill process groups recorded by a previous run that are still alive."""
+        path = self._registry_path()
+        if not path.exists() or os.name == "nt":
+            return
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            data = {}
+        for name, info in data.items():
+            pgid = info.get("pid")
+            if not pgid:
+                continue
+            members = self._group_members(pgid)
+            if not members:
+                continue
+            # PID-reuse guard: only kill groups that actually contain engine
+            # processes (or our launch script).
+            if not re.search(r"llama-server|vllm|EngineCore", members):
+                logger.warning(
+                    f"⚠ Stale session {name}: pgid {pgid} now holds unrelated processes; not touching it"
+                )
+                continue
+            logger.warning(f"♻ Reaping stale session from previous run: {name} (pgid {pgid})")
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.time() + 10
+            while time.time() < deadline and self._group_members(pgid):
+                time.sleep(0.5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            if self._group_members(pgid):
+                logger.error(f"✗ Could not fully reap pgid {pgid} for {name}")
+            else:
+                logger.info(f"✓ Reaped {name}")
+        try:
+            path.write_text("{}")
+        except Exception:
+            pass
+
     async def initialize(self) -> None:
         """Detect available GPUs on startup."""
+        # Before anything else: clean up engine processes a previous run left behind.
+        self._reap_stale_sessions()
+
         if PYNVML_AVAILABLE:
             try:
                 pynvml.nvmlInit()
@@ -222,6 +309,7 @@ class GpuManager:
 
         # Clear sessions dict
         self.sessions.clear()
+        self._registry_sync()
         logger.info("✓ All sessions cleaned up")
 
     async def load_model(self, model_name: str, gpu_ids: List[int]) -> None:
@@ -359,6 +447,7 @@ class GpuManager:
                 gpu_ids=gpu_ids,
                 health_timeout=model_config.effective_health_timeout(),
                 term_grace=30.0 if model_config.engine == "vllm" else 5.0,
+                on_spawn=self._registry_sync,
             )
 
             # Store session BEFORE start() so cancel_load can find it
@@ -404,6 +493,7 @@ class GpuManager:
             # Don't set FAILED — cancel_load already set IDLE
             if model_name in self.sessions:
                 del self.sessions[model_name]
+            self._registry_sync()
             # Don't re-raise — FastAPI background tasks expect clean exit
         except Exception as e:
             logger.error(f"✗ Failed to load {model_name}: {e}")
@@ -411,6 +501,7 @@ class GpuManager:
             # Clean up session if it was partially created (so retries will work)
             if model_name in self.sessions:
                 del self.sessions[model_name]
+            self._registry_sync()
             # Broadcast failure event for immediate UI update
             model_config = self.config.get_model_config(model_name)
             asyncio.create_task(event_bus.broadcast({
@@ -441,6 +532,7 @@ class GpuManager:
             if session:
                 session.cancelled = True
                 await session.stop()
+            self._registry_sync()
 
             # Reset GPU allocation if it was partially updated
             model = self.models.get(model_name)
@@ -507,6 +599,7 @@ class GpuManager:
 
             # Clean up
             del self.sessions[model_name]
+            self._registry_sync()
             model.gpu_ids = []
             model.vram_per_gpu = []
             model.pid = None
@@ -599,7 +692,11 @@ class GpuManager:
     async def _handle_crashed_session(self, model_name: str, returncode) -> None:
         """Clean up after a session whose process died out from under us."""
         logger.error(f"✗ {model_name} process exited unexpectedly (code {returncode})")
-        self.sessions.pop(model_name, None)
+        crashed = self.sessions.pop(model_name, None)
+        if crashed is not None:
+            # A dead leader can leave engine workers holding VRAM — sweep the group.
+            crashed.kill_process_group(signal.SIGKILL)
+        self._registry_sync()
         model = self.models.get(model_name)
         if model and model.gpu_ids:
             for gid, need in zip(model.gpu_ids, model.vram_per_gpu):

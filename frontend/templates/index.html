@@ -741,9 +741,10 @@
 
         let currentSettingsPaths = {
             llama_server: '',
-            models_directory: ''
+            models_directory: '',
+            vllm_binary: ''
         };
-        let filePickerMode = null; // 'llama_server' or 'models_directory'
+        let filePickerMode = null; // 'llama_server', 'models_directory', or 'vllm_binary'
 
         async function openSettingsModal() {
             const modal = document.getElementById('settings-modal');
@@ -753,14 +754,21 @@
                 const settings = await response.json();
                 currentSettingsPaths.llama_server = settings.llama_server;
                 currentSettingsPaths.models_directory = settings.models_directory;
+                currentSettingsPaths.vllm_binary = settings.vllm_binary || '';
 
                 // Update display fields
                 document.getElementById('llama-server-display').value = settings.llama_server;
                 document.getElementById('models-directory-display').value = settings.models_directory;
+                document.getElementById('vllm-binary-display').value = settings.vllm_binary || '';
                 document.getElementById('webui-port-input').value = settings.webui_port || 7999;
                 const versionBadge = document.getElementById('llama-server-version-badge');
                 if (versionBadge) {
                     versionBadge.textContent = settings.llama_server_version || 'unknown';
+                }
+                const vllmBadge = document.getElementById('vllm-version-badge');
+                if (vllmBadge) {
+                    vllmBadge.textContent = settings.vllm_binary
+                        ? (settings.vllm_version || 'unknown') : 'not configured';
                 }
             } catch (e) {
                 console.error('Error loading settings:', e);
@@ -860,6 +868,22 @@
                     await sleep(1000);
                 }
 
+                // Step 2b: Update vLLM executable (captures the engine's flag
+                // manifest via its own `serve --help`; slow on first run)
+                if (currentSettingsPaths.vllm_binary) {
+                    statusMsg.textContent = '⏳ Validating vLLM + capturing flag manifest (can take a minute on first run)...';
+                    const vllmResp = await fetch('/api/update-config-path', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: `path_type=vllm_binary&new_path=${encodeURIComponent(currentSettingsPaths.vllm_binary)}`
+                    });
+                    const vllmHtml = await vllmResp.text();
+                    if (vllmHtml.includes('Error Updating Path')) {
+                        const m = vllmHtml.match(/<p class="text-sm text-gray-300 mb-4">([^<]*)<\/p>/);
+                        throw new Error(m ? m[1] : 'vLLM executable validation failed');
+                    }
+                }
+
                 // Step 3: Update models directory
                 if (currentSettingsPaths.models_directory) {
                     statusMsg.textContent = '⏳ Rescanning models...';
@@ -940,6 +964,32 @@
                         </button>
                     </div>
                     <p class="text-xs text-gray-500 mt-2">Path to llama-server executable</p>
+                </fieldset>
+
+                <!-- vLLM Executable Section -->
+                <fieldset>
+                    <legend class="text-sm font-bold text-gray-300 mb-3">
+                        vLLM Executable
+                        <span id="vllm-version-badge"
+                              class="ml-2 inline-block px-2 py-0.5 rounded text-xs font-mono font-normal bg-gray-700 text-gray-300"
+                              title="Detected vllm version">not configured</span>
+                    </legend>
+                    <div class="flex gap-3">
+                        <input type="text"
+                               id="vllm-binary-display"
+                               readonly
+                               class="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300 font-mono"
+                               placeholder="Optional — enables vLLM model discovery">
+                        <button type="button"
+                                onclick="openFileBrowser('vllm_binary')"
+                                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold">
+                            Browse
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">
+                        Select the venv (or its bin/) containing the vllm executable. Saving runs
+                        <code>vllm serve --help</code> to capture the exact flags this build supports.
+                    </p>
                 </fieldset>
 
                 <!-- Models Directory Section -->

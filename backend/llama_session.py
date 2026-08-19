@@ -4,6 +4,7 @@ import asyncio
 import subprocess
 import logging
 import os
+import signal
 from pathlib import Path
 from typing import Optional, Dict, Any
 import httpx
@@ -24,6 +25,7 @@ class LlamaSession:
         gpu_ids: Optional[list] = None,
         health_timeout: int = 120,
         term_grace: float = 5.0,
+        on_spawn=None,
     ):
         self.model_config = model_config
         self.llama_server_binary = llama_server_binary
@@ -33,6 +35,9 @@ class LlamaSession:
         # SIGTERM → SIGKILL window. vLLM multi-GPU teardown (NCCL, spawned
         # workers) needs far longer than llama-server's near-instant exit.
         self.term_grace = float(term_grace)
+        # Called as soon as the process has a PID — the session registry uses
+        # this so a crash mid-health-check still leaves a reapable record.
+        self.on_spawn = on_spawn
         self.process: Optional[subprocess.Popen] = None
         self.pid: Optional[int] = None
         self.cancelled: bool = False
@@ -89,6 +94,11 @@ class LlamaSession:
 
             self.pid = self.process.pid
             logger.info(f"✓ Process spawned with PID {self.pid}")
+            if self.on_spawn:
+                try:
+                    self.on_spawn()
+                except Exception:
+                    pass
             logger.info(f"   Polling health check at 5s intervals using {self.health_timeout}s timeout")
 
             # Wait for llama-server to be ready
@@ -106,8 +116,28 @@ class LlamaSession:
             await self.stop()
             raise
 
+    def kill_process_group(self, sig: int = signal.SIGKILL) -> None:
+        """Signal the session's entire process group (leader may already be dead).
+
+        start_new_session=True makes the spawned script its own group leader,
+        so self.pid doubles as the pgid even after the leader exits — this is
+        how orphaned engine workers (vLLM spawn-mode) get swept.
+        """
+        if not self.pid or os.name == "nt":
+            return
+        try:
+            os.killpg(self.pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # group fully gone — the normal case
+
     async def stop(self) -> None:
-        """Terminate llama-server process and entire process group."""
+        """Terminate the session's entire process group.
+
+        The SIGTERM must go to the *group*, not just the leader: vLLM's
+        spawn-mode workers are separate processes, and a leader that exits
+        cleanly can still leave workers holding VRAM. A final SIGKILL group
+        sweep runs unconditionally for the same reason.
+        """
         self.cancelled = True
         if not self.process:
             return
@@ -115,8 +145,11 @@ class LlamaSession:
         try:
             logger.info(f"⏳ Stopping {self.model_config.name} (PID {self.pid})")
 
-            # Graceful termination
-            self.process.terminate()
+            # Graceful termination of the whole group (engine workers included)
+            if os.name != "nt":
+                self.kill_process_group(signal.SIGTERM)
+            else:
+                self.process.terminate()
 
             try:
                 await asyncio.wait_for(
@@ -125,17 +158,13 @@ class LlamaSession:
                 )
                 logger.info(f"✓ {self.model_config.name} terminated gracefully")
             except asyncio.TimeoutError:
-                # Force kill if graceful termination times out
                 logger.warning(f"⚠ Force-killing {self.model_config.name} and process group")
+                self.kill_process_group(signal.SIGKILL)
                 self.process.kill()
                 await asyncio.to_thread(self.process.wait)
-
-                # Also kill entire process group to catch any child processes
-                if self.pid and os.name != 'nt':  # Not Windows
-                    try:
-                        os.killpg(os.getpgid(self.pid), 9)  # SIGKILL entire group
-                    except (ProcessLookupError, OSError):
-                        pass  # Process group already gone
+            finally:
+                # Unconditional sweep: catches workers the leader left behind.
+                self.kill_process_group(signal.SIGKILL)
 
             self.process = None
             self.pid = None
