@@ -102,6 +102,11 @@ KNOWN_FLAG_ONLY_VLLM = {
 
 VALID_ENGINES = ("llamacpp", "vllm")
 
+# Distinguishes "caller didn't mention this field" from "caller passed None to
+# clear it" in patch_meta_fence. Without it, a call site that simply forgets a
+# field silently deletes (or worse, overwrites) it.
+_UNSET = object()
+
 # Meta fields that are GGUF-derived (integers); user-owned fields are str.
 META_INT_FIELDS = {"block_count", "max_context", "kv_cache_multiplier"}
 
@@ -818,50 +823,89 @@ def _render_invocation(llama_bin: str, model_path: Optional[str], args: Dict[str
 
 # ---------- fence patching (in-place rewrites) ----------
 
+def _render_meta_line(key: str, value) -> str:
+    """Render one `# key: value` meta line."""
+    if key == "vram_gb":
+        return f"# vram_gb: {float(value):g}"
+    return f"# {key}: {value}"
+
+
 def patch_meta_fence(
     text: str,
     *,
-    display_name: Optional[str] = None,
-    block_count: Optional[int] = None,
-    max_context: Optional[int] = None,
-    kv_cache_multiplier: Optional[int] = None,
-    health_timeout: Optional[int] = None,
-    engine: str = "llamacpp",
-    vram_gb: Optional[float] = None,
+    display_name=_UNSET,
+    block_count=_UNSET,
+    max_context=_UNSET,
+    kv_cache_multiplier=_UNSET,
+    health_timeout=_UNSET,
+    engine=_UNSET,
+    vram_gb=_UNSET,
 ) -> str:
-    """Rewrite only the meta fence. Add it after the shebang if missing.
+    """Merge the given fields into the meta fence, preserving everything else.
 
-    Any of the kwargs left as None will be omitted from the new meta block
-    (except `engine`, which is always emitted — the tag is mandatory).
+    Three distinct states, so that forgetting a field can't destroy it:
+      - field omitted      → existing value left untouched
+      - field = <value>    → set (added if absent, updated in place if present)
+      - field = None       → its line is removed
+
+    Lines the parser doesn't model — user comments, unrecognized `# key: value`
+    entries — are preserved verbatim in their original positions. Existing keys
+    keep their position; newly added keys are appended in canonical order.
+    The fence is created after the shebang if the script has none.
     """
-    new_lines = [META_BEGIN]
-    if display_name:
-        new_lines.append(f"# display_name: {display_name}")
-    new_lines.append(f"# engine: {engine}")
-    if vram_gb is not None:
-        new_lines.append(f"# vram_gb: {vram_gb:g}")
-    if block_count is not None:
-        new_lines.append(f"# block_count: {block_count}")
-    if max_context is not None:
-        new_lines.append(f"# max_context: {max_context}")
-    if kv_cache_multiplier is not None:
-        new_lines.append(f"# kv_cache_multiplier: {kv_cache_multiplier}")
-    if health_timeout is not None:
-        new_lines.append(f"# health_timeout: {health_timeout}")
-    new_lines.append(META_END)
-    new_block = "\n".join(new_lines)
+    updates = {
+        "display_name": display_name,
+        "engine": engine,
+        "vram_gb": vram_gb,
+        "block_count": block_count,
+        "max_context": max_context,
+        "kv_cache_multiplier": kv_cache_multiplier,
+        "health_timeout": health_timeout,
+    }
+    updates = {k: v for k, v in updates.items() if v is not _UNSET}
+    # An empty string display_name behaves like a delete (legacy callers pass "").
+    for k, v in list(updates.items()):
+        if v == "":
+            updates[k] = None
 
     fence = _extract_fence(text, META_BEGIN, META_END)
+    existing_inner = fence[2].splitlines() if fence is not None else []
+
+    out: List[str] = []
+    seen = set()
+    for line in existing_inner:
+        stripped = line.strip()
+        key = None
+        if stripped.startswith("#") and ":" in stripped:
+            candidate = stripped.lstrip("#").split(":", 1)[0].strip()
+            if candidate in updates:
+                key = candidate
+        if key is None:
+            out.append(line)  # unmodelled content — preserve verbatim
+            continue
+        if key in seen:
+            continue  # collapse duplicate keys onto the first occurrence
+        seen.add(key)
+        value = updates[key]
+        if value is not None:
+            out.append(_render_meta_line(key, value))
+        # value None → drop the line
+
+    # Append fields that weren't already present, in canonical order.
+    for key in ("display_name", "engine", "vram_gb", "block_count",
+                "max_context", "kv_cache_multiplier", "health_timeout"):
+        if key in updates and key not in seen and updates[key] is not None:
+            out.append(_render_meta_line(key, updates[key]))
+
+    new_block = "\n".join([META_BEGIN, *out, META_END])
+
+    lines = text.splitlines()
     if fence is not None:
         begin_idx, end_idx, _ = fence
-        lines = text.splitlines()
         lines[begin_idx:end_idx + 1] = new_block.splitlines()
-        return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
-
-    # Insert after shebang (or at top)
-    lines = text.splitlines()
-    insert_at = 1 if lines and lines[0].startswith("#!") else 0
-    lines[insert_at:insert_at] = new_block.splitlines()
+    else:
+        insert_at = 1 if lines and lines[0].startswith("#!") else 0
+        lines[insert_at:insert_at] = new_block.splitlines()
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 

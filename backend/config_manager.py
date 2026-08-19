@@ -538,16 +538,8 @@ class ConfigManager:
         # Backfill the mandatory engine tag into scripts that predate it
         # (one-line meta-fence patch; inserts the fence if missing entirely).
         if not parsed.engine_declared:
-            new_text = patch_meta_fence(
-                text,
-                display_name=parsed.display_name,
-                block_count=parsed.block_count,
-                max_context=parsed.max_context,
-                kv_cache_multiplier=parsed.kv_cache_multiplier,
-                health_timeout=parsed.health_timeout,
-                engine=parsed.engine,
-                vram_gb=parsed.vram_gb,
-            )
+            # Merge semantics: this touches the engine line and nothing else.
+            new_text = patch_meta_fence(text, engine=parsed.engine)
             if write_script_atomic(script_path, new_text):
                 logger.info(f"   Backfilled engine tag ({parsed.engine}) for {script_path.stem}")
             text = new_text
@@ -591,14 +583,13 @@ class ConfigManager:
         if needs_backfill:
             try:
                 meta = parse_gguf_metadata(parsed.model_path, **_gguf_kwargs)
+                # Only the GGUF-derived fields; everything else in the fence
+                # (display_name, health_timeout, engine, …) is left untouched.
                 new_text = patch_meta_fence(
                     text,
-                    display_name=parsed.display_name,
                     block_count=meta.block_count,
                     max_context=meta.max_context,
                     kv_cache_multiplier=meta.kv_cache_multiplier,
-                    # Preserve any existing user-tunable fields across backfill.
-                    health_timeout=parsed.health_timeout,
                 )
                 write_script_atomic(script_path, new_text)
                 text = new_text
@@ -615,12 +606,7 @@ class ConfigManager:
                     and fresh.kv_cache_multiplier != parsed.kv_cache_multiplier
                 ):
                     new_text = patch_meta_fence(
-                        text,
-                        display_name=parsed.display_name,
-                        block_count=parsed.block_count,
-                        max_context=parsed.max_context,
-                        kv_cache_multiplier=fresh.kv_cache_multiplier,
-                        health_timeout=parsed.health_timeout,
+                        text, kv_cache_multiplier=fresh.kv_cache_multiplier
                     )
                     write_script_atomic(script_path, new_text)
                     text = new_text

@@ -616,7 +616,13 @@ def test_patch_meta_fence_adds_health_timeout():
     assert ps.port == 8100
 
 
-def test_patch_meta_fence_strips_health_timeout_when_omitted():
+def test_patch_meta_fence_strips_health_timeout_when_explicitly_none():
+    """Passing None clears a field — this is how the UI empties the timeout box.
+
+    (Before the merge-semantics fix, *omitting* the kwarg also cleared it, which
+    meant any caller that forgot a field silently destroyed it. Omission now
+    preserves; see test_patch_meta_fence_preserves_omitted_fields.)
+    """
     text = render_script(
         display_name="X",
         block_count=64,
@@ -627,16 +633,30 @@ def test_patch_meta_fence_strips_health_timeout_when_omitted():
         args={"--port": "8100"},
         health_timeout=300,
     )
-    new = patch_meta_fence(
-        text,
+    new = patch_meta_fence(text, health_timeout=None)
+    assert "health_timeout" not in new
+    ps = parse_script(new)
+    assert ps.health_timeout is None
+
+
+def test_patch_meta_fence_preserves_omitted_fields():
+    text = render_script(
         display_name="X",
         block_count=64,
         max_context=4096,
         kv_cache_multiplier=128,
+        llama_bin="/bin/llama-server",
+        model_path="/m.gguf",
+        args={"--port": "8100"},
+        health_timeout=300,
     )
-    assert "health_timeout" not in new
+    new = patch_meta_fence(text, block_count=99)  # mentions one field only
     ps = parse_script(new)
-    assert ps.health_timeout is None
+    assert ps.block_count == 99
+    assert ps.display_name == "X"
+    assert ps.max_context == 4096
+    assert ps.kv_cache_multiplier == 128
+    assert ps.health_timeout == 300
 
 
 # ---------- migration round-trip: legacy JSON shapes ----------
