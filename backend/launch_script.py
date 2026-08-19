@@ -157,6 +157,11 @@ class ParsedScript:
     llama_bin: Optional[str] = None  # binary path used in the exec line
     model_path: Optional[str] = None  # value of -m / --model
     args: Dict[str, Optional[str]] = field(default_factory=dict)  # all launch args incl. --port, --host
+    # The same args as written in the script, before $VAR resolution. A save
+    # re-emits the raw form for any arg the user didn't change, so shell
+    # indirection like --max-model-len "$MAXLEN" survives a structured edit.
+    raw_args: Dict[str, Optional[str]] = field(default_factory=dict)
+    raw_model_path: Optional[str] = None
 
     # Shell-level state (read from script body, not args)
     cuda_visible_devices: Optional[List[int]] = None  # parsed CUDA_VISIBLE_DEVICES, None if absent
@@ -714,7 +719,9 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
             ps.engine = "vllm"
         ps.has_args_fence = True
         ps.llama_bin = binary
-        ps.args, ps.model_path = _vllm_arg_tokens_to_dict(tokens[2:], full_text, ps.warnings)
+        ps.args, ps.model_path, ps.raw_args, ps.raw_model_path = _vllm_arg_tokens_to_dict(
+            tokens[2:], full_text, ps.warnings
+        )
         return
 
     ps.has_args_fence = True  # found a valid invocation; treat as "configured-able"
@@ -739,7 +746,9 @@ def _vllm_arg_tokens_to_dict(
     aliases: Dict[str, str] = manifest.get("aliases", {})
 
     args: Dict[str, Optional[str]] = {}
+    raw: Dict[str, Optional[str]] = {}
     model_path: Optional[str] = None
+    raw_model_path: Optional[str] = None
     last_flag: Optional[str] = None
     i = 0
     while i < len(tokens):
@@ -748,9 +757,12 @@ def _vllm_arg_tokens_to_dict(
             value = resolve_var_refs(tok, full_text, warnings)
             if model_path is None and last_flag is None:
                 model_path = value
+                raw_model_path = tok
             elif last_flag is not None:
                 prev = args.get(last_flag)
                 args[last_flag] = f"{prev} {value}" if prev else value
+                prev_raw = raw.get(last_flag)
+                raw[last_flag] = f"{prev_raw} {tok}" if prev_raw else tok
             else:
                 warnings.append(f"stray token in vllm invocation: {tok!r}")
             i += 1
@@ -778,14 +790,16 @@ def _vllm_arg_tokens_to_dict(
 
         if not takes_value:
             args[canonical] = None
+            raw[canonical] = None
             last_flag = None  # boolean flags never accumulate values
             i += 1
         else:
             args[canonical] = resolve_var_refs(tokens[i + 1], full_text, warnings)
+            raw[canonical] = tokens[i + 1]
             last_flag = canonical
             i += 2
 
-    return args, model_path
+    return args, model_path, raw, raw_model_path
 
 
 def parse_pasted_script(text: str) -> ParsedScript:
@@ -1074,6 +1088,127 @@ def patch_launch_args_fence(
     else:
         prefix = ""
     return prefix + text + (trailing_newline if not text.endswith("\n") else "") + body
+
+
+def find_invocation_span(text: str) -> Optional[Tuple[int, int]]:
+    """Line span [start, end) of the launch invocation, continuations included.
+
+    Returns None when no invocation line is found.
+    """
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if re.match(r"^(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=", s):
+            continue
+        if (
+            s.startswith("exec ") or "$LLAMA_BIN" in s or "${LLAMA_BIN" in s
+            or "llama-server" in s or re.search(r"vllm[\"']?\s+serve\b", s)
+        ):
+            start = i
+            break
+    if start is None:
+        return None
+    end = start
+    while end < len(lines) and lines[end].rstrip().endswith("\\"):
+        end += 1
+    return start, min(end + 1, len(lines))
+
+
+def patch_exec_invocation(
+    text: str,
+    *,
+    args: Dict[str, Optional[str]],
+    model_path: Optional[str] = None,
+    parsed: Optional[ParsedScript] = None,
+) -> str:
+    """Rewrite only the exec line, preserving every other byte of the script.
+
+    This is what makes structured saves safe for vLLM, whose scripts are mostly
+    preamble: env vars, tuning comments, variable defaults. `patch_launch_args_fence`
+    replaces everything below the meta fence and would destroy all of it.
+
+    When `parsed` is supplied, any argument whose value is unchanged is re-emitted
+    in its original form — so `--max-model-len "$MAXLEN"` stays a variable
+    reference instead of being frozen to the resolved number. Changed values are
+    written literally.
+    """
+    span = find_invocation_span(text)
+    if span is None:
+        raise ValueError("no launch invocation found to patch")
+    start, end = span
+    lines = text.splitlines()
+
+    binary = parsed.llama_bin if parsed else None
+    original = lines[start]
+    # Preserve the original binary token (e.g. "$VLLM_BIN") rather than its
+    # resolved path, and whether the line was exec'd.
+    try:
+        head_tokens = shlex.split(_collapse_continuations("\n".join(lines[start:end])), posix=True)
+    except ValueError:
+        head_tokens = []
+    is_exec = original.strip().startswith("exec ")
+    m = re.match(r'^\s*(?:exec\s+)?("[^"]*"|\'[^\']*\'|\S+)', original)
+    binary_token = m.group(1) if m else (binary or "")
+    is_vllm = bool(parsed and parsed.engine == "vllm") or (
+        len(head_tokens) > 1 and head_tokens[1] == "serve"
+    )
+
+    indent = re.match(r"^(\s*)", original).group(1)
+
+    def _requote(raw: str) -> str:
+        """Re-emit a raw token. shlex stripped its quotes, so a variable
+        reference must be re-wrapped — bare $VAR word-splits on spaces and
+        vanishes when empty."""
+        return f'"{raw}"' if "$" in raw else shlex.quote(raw)
+
+    def _value_token(key: str, value: Optional[str]) -> Optional[str]:
+        """Original spelling when unchanged, else a freshly quoted literal."""
+        if value is None:
+            return None
+        if parsed is not None:
+            prior = parsed.args.get(key)
+            raw = parsed.raw_args.get(key)
+            if raw is not None and str(prior) == str(value):
+                return _requote(raw)
+        return shlex.quote(str(value))
+
+    parts: List[str] = []
+    if is_vllm:
+        # The model is positional and belongs on the `serve` line, matching how
+        # these scripts are written by hand.
+        model = model_path if model_path is not None else (parsed.model_path if parsed else None)
+        model_token = ""
+        if model is not None:
+            if parsed and parsed.raw_model_path and parsed.model_path == model:
+                model_token = " " + _requote(parsed.raw_model_path)
+            else:
+                model_token = " " + shlex.quote(str(model))
+        prefix = f'{"exec " if is_exec else ""}{binary_token} serve{model_token}'
+    else:
+        prefix = f'{"exec " if is_exec else ""}{binary_token}'
+        model = model_path if model_path is not None else (parsed.model_path if parsed else None)
+        if model:
+            parts.append(f"-m {shlex.quote(str(model))}")
+
+    for key, value in args.items():
+        if key in ("-m", "--model"):
+            continue
+        token = _value_token(key, value)
+        parts.append(key if token is None else f"{key} {token}")
+
+    if not parts:
+        rendered = [f"{indent}{prefix}"]
+    else:
+        rendered = [f"{indent}{prefix} \\"]
+        for part in parts[:-1]:
+            rendered.append(f"{indent}  {part} \\")
+        rendered.append(f"{indent}  {parts[-1]}")
+
+    lines[start:end] = rendered
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
 def patch_cuda_visible_devices(text: str, ids: Optional[List[int]]) -> str:
