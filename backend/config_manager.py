@@ -10,7 +10,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field, field_validator
@@ -47,6 +49,76 @@ KV_BYTES: Dict[str, float] = {
 # loads the remaining shards automatically. We must therefore treat a shard set as
 # a single model: one config named after `<base>`, with a size summed across shards.
 _SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
+
+
+# Model scripts are user-authored config that the scanner rewrites in place
+# (engine-tag backfill, GGUF metadata backfill, UI saves). Those writes must
+# never be able to leave a truncated file behind, and a bad transform must be
+# recoverable — hence atomic replace plus a pruned snapshot of prior content.
+SCRIPT_BACKUP_DIRNAME = ".backups"
+SCRIPT_BACKUP_KEEP = 5
+
+
+def _snapshot_script(path: Path, content: str) -> None:
+    """Save the pre-write content to config/models/.backups/<name>.<timestamp>."""
+    try:
+        backup_dir = path.parent / SCRIPT_BACKUP_DIRNAME
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dest = backup_dir / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}"
+        if not dest.exists():
+            dest.write_text(content)
+        # Keep only the most recent N snapshots per script (names sort by time).
+        snapshots = sorted(backup_dir.glob(f"{path.name}.*"))
+        for stale in snapshots[:-SCRIPT_BACKUP_KEEP]:
+            stale.unlink(missing_ok=True)
+    except Exception as e:
+        # A failed backup must not block the write; surface it and move on.
+        logger.warning(f"⚠ Could not snapshot {path.name} before rewrite: {e}")
+
+
+def write_script_atomic(path: Path, text: str, *, backup: bool = True) -> bool:
+    """Write `text` to `path` via a temp file + atomic rename.
+
+    Returns True if the file was written, False if the content was already
+    identical (no write, no snapshot, no mtime churn). Existing permissions are
+    preserved; a crash mid-write leaves the original file intact because the
+    rename is the only step that touches it.
+    """
+    path = Path(path)
+    existing: Optional[str] = None
+    if path.exists():
+        try:
+            existing = path.read_text()
+        except Exception:
+            existing = None  # unreadable (encoding/permissions) — back up by copy below
+        if existing is not None and existing == text:
+            return False
+        if backup:
+            if existing is not None:
+                _snapshot_script(path, existing)
+            else:
+                # Unreadable as text — preserve the bytes verbatim instead.
+                try:
+                    backup_dir = path.parent / SCRIPT_BACKUP_DIRNAME
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, backup_dir / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}")
+                except Exception as e:
+                    logger.warning(f"⚠ Could not snapshot unreadable {path.name}: {e}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if path.exists():
+            shutil.copymode(path, tmp)  # keep the executable bit
+        os.replace(tmp, path)  # atomic within the same filesystem
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return True
 
 
 def parse_split_gguf(path: Path):
@@ -396,7 +468,7 @@ class ConfigManager:
                         vllm_bin=self.app_config.vllm_binary,
                         available_flags=vllm_flags,
                     )
-                    script_path.write_text(text)
+                    write_script_atomic(script_path, text, backup=False)  # brand new file
                     script_path.chmod(0o755)
                     logger.info(f"   Generated vLLM skeleton: {script_path.name}")
                 except Exception as e:
@@ -476,10 +548,10 @@ class ConfigManager:
                 engine=parsed.engine,
                 vram_gb=parsed.vram_gb,
             )
-            script_path.write_text(new_text)
+            if write_script_atomic(script_path, new_text):
+                logger.info(f"   Backfilled engine tag ({parsed.engine}) for {script_path.stem}")
             text = new_text
             parsed = parse_script(new_text)
-            logger.info(f"   Backfilled engine tag ({parsed.engine}) for {script_path.stem}")
 
         if parsed.engine == "vllm":
             return self._finish_vllm_model(script_path, parsed)
@@ -528,7 +600,7 @@ class ConfigManager:
                     # Preserve any existing user-tunable fields across backfill.
                     health_timeout=parsed.health_timeout,
                 )
-                script_path.write_text(new_text)
+                write_script_atomic(script_path, new_text)
                 text = new_text
                 parsed = parse_script(new_text)
                 logger.debug(f"   Backfilled GGUF metadata for {script_path.stem}")
@@ -550,7 +622,7 @@ class ConfigManager:
                         kv_cache_multiplier=fresh.kv_cache_multiplier,
                         health_timeout=parsed.health_timeout,
                     )
-                    script_path.write_text(new_text)
+                    write_script_atomic(script_path, new_text)
                     text = new_text
                     parsed = parse_script(new_text)
                     logger.info(
@@ -671,7 +743,7 @@ class ConfigManager:
                 max_context=meta.max_context,
                 kv_cache_multiplier=meta.kv_cache_multiplier,
             )
-            script_path.write_text(text)
+            write_script_atomic(script_path, text, backup=False)  # brand new file
             script_path.chmod(0o755)
             logger.debug(f"   Generated skeleton: {script_path}")
         except Exception as e:
@@ -792,7 +864,7 @@ class ConfigManager:
                 health_timeout=health_timeout,
             )
 
-        script_path.write_text(text)
+        write_script_atomic(script_path, text)
         script_path.chmod(0o755)
         return self.rescan_model(model_name)
 
@@ -816,8 +888,7 @@ class ConfigManager:
                 return existing
         text = script_path.read_text()
         new_text = patch_cuda_visible_devices(text, ids)
-        if new_text != text:
-            script_path.write_text(new_text)
+        if write_script_atomic(script_path, new_text):
             logger.info(f"✓ Updated CVD for {model_name}: {ids}")
         return self.rescan_model(model_name)
 
@@ -831,7 +902,7 @@ class ConfigManager:
         """Overwrite a model's script with raw text (used by the 'raw script' editor tab)."""
         path = self.get_script_path(model_name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        write_script_atomic(path, text)
         path.chmod(0o755)
         return self.rescan_model(model_name)
 
