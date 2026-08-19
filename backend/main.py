@@ -871,7 +871,9 @@ async def config_modal_new(model: str):
         # env-var-heavy and the structured save path rewrites the script body,
         # which would destroy the preamble (doc 21 decision 2 — Phase 2 lifts this).
         if model_config.engine == "vllm":
-            from kv_calc import DEFAULT_OVERHEAD_GB, bytes_per_token_from_config
+            from kv_calc import (
+                DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, bytes_per_token_from_config,
+            )
 
             manifest = get_vllm_manifest_runtime() or {}
             args = dict(model_config.launch_args)
@@ -911,6 +913,7 @@ async def config_modal_new(model: str):
                 bytes_per_token_source=bpt_source,
                 weights_gb=model_config.size_gb or 0,
                 overhead_gb=DEFAULT_OVERHEAD_GB,
+                kv_headroom=DEFAULT_KV_HEADROOM,
                 gpu_free=gpu_free,
             ))
 
@@ -1703,8 +1706,8 @@ async def calculate_vllm_vram(
     script as --kv-cache-memory-bytes.
     """
     from kv_calc import (
-        DEFAULT_OVERHEAD_GB, GIB, bytes_per_token_from_config,
-        context_for_vram, pool_tokens, vram_gb_for,
+        DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, GIB,
+        bytes_per_token_from_config, context_for_vram, vram_gb_for,
     )
     try:
         mc = config_manager.get_model_config(model)
@@ -1729,16 +1732,19 @@ async def calculate_vllm_vram(
         ctx = context_for_vram(
             vram_gb=vram_gb, concurrency=concurrency, bytes_per_token=bpt,
             weights_gb=weights, max_context=mc.max_context,
+            headroom=DEFAULT_KV_HEADROOM,
         )
         total, tokens = vram_gb_for(
             context_length=ctx, concurrency=concurrency,
             bytes_per_token=bpt, weights_gb=weights,
+            headroom=DEFAULT_KV_HEADROOM,
         )
     else:
         ctx = max(0, context_length)
         total, tokens = vram_gb_for(
             context_length=ctx, concurrency=concurrency,
             bytes_per_token=bpt, weights_gb=weights,
+            headroom=DEFAULT_KV_HEADROOM,
         )
 
     return JSONResponse({
@@ -1749,6 +1755,7 @@ async def calculate_vllm_vram(
         "bytes_per_token_source": source,
         "weights_gb": round(weights, 2),
         "overhead_gb": DEFAULT_OVERHEAD_GB,
+        "headroom": DEFAULT_KV_HEADROOM,
         "kv_gb": round(tokens * bpt / GIB, 2),
         "total_gb": total,
         "kv_cache_memory_bytes": tokens * bpt,

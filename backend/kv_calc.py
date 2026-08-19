@@ -45,6 +45,12 @@ DEFAULT_OVERHEAD_GB = 1.5
 # length on the same grid stops the engine silently rounding the pool down.
 CONTEXT_GRANULARITY = 256
 
+# Policy, not arithmetic: a pool sized to exactly L × C has no room for
+# preemption or prefix caching, and vLLM refuses to start if the pool cannot
+# hold one full request. The math helpers below default to 1.0 (no padding) so
+# they stay honest; call sites that size a real budget apply this.
+DEFAULT_KV_HEADROOM = 1.2
+
 
 def max_context_from_config(model_dir: str) -> Optional[int]:
     """Trained context length from a HF config.json — the slider's upper bound.

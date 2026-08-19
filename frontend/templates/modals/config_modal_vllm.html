@@ -43,10 +43,10 @@
 
                 <div class="flex items-center gap-3 mb-4">
                     <label class="text-xs font-bold text-gray-400">Host</label>
-                    <input type="text" id="v-host" value="{{ host }}"
+                    <input type="text" id="v-host" value="{{ host }}" oninput="vSyncRows()"
                            class="w-28 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-300">
                     <label class="text-xs font-bold text-gray-400">Port</label>
-                    <input type="number" id="v-port" value="{{ port }}"
+                    <input type="number" id="v-port" value="{{ port }}" oninput="vSyncRows()"
                            class="w-24 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-300">
                     <span class="text-xs text-gray-500">· {{ gpu_count }} GPU{{ 's' if gpu_count > 1 else '' }} (tp × pp)</span>
                 </div>
@@ -99,6 +99,24 @@
                          style="grid-template-columns: 1fr 1fr auto;">
                         <span>Argument</span><span>Value</span><span></span>
                     </div>
+
+                    {# Args written from the controls above. Shown read-only so the
+                       invocation is fully visible here rather than half-hidden. #}
+                    {% for flag, vid in [
+                        ('--host', 'v-row-host'), ('--port', 'v-row-port'),
+                        ('--max-model-len', 'v-row-maxlen'),
+                        ('--max-num-seqs', 'v-row-seqs'),
+                        ('--kv-cache-memory-bytes', 'v-row-kv')] %}
+                    <div class="px-4 py-2 border-t border-gray-700 grid gap-2 items-center bg-gray-800"
+                         style="grid-template-columns: 1fr 1fr auto;">
+                        <input type="text" value="{{ flag }}" disabled
+                               class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-500 cursor-not-allowed">
+                        <input type="text" id="{{ vid }}" disabled
+                               class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-500 cursor-not-allowed">
+                        <span class="text-gray-600 text-xs text-center whitespace-nowrap">auto</span>
+                    </div>
+                    {% endfor %}
+
                     {% for key, value in advanced_options.items() %}
                     <div class="px-4 py-2 border-t border-gray-700 grid gap-2 items-center"
                          style="grid-template-columns: 1fr 1fr auto;">
@@ -184,6 +202,7 @@ window.V = {
     maxContext: {{ max_context or 0 }},
     gpuFree: {{ gpu_free | tojson }},
     kvBudget: {{ kv_cache_memory_bytes | tojson }},
+    headroom: {{ kv_headroom }},
 };
 const GIB = 1024 ** 3;
 
@@ -200,14 +219,35 @@ function vRecalc() {
         note.textContent = '';
         return;
     }
-    const tokens = ctx * c;
+    const tokens = Math.floor(ctx * c * window.V.headroom);
     const kvGb = tokens * bpt / GIB;
     const total = window.V.weightsGb + window.V.overheadGb + kvGb;
-    derived.innerHTML = `${ctx.toLocaleString()} × ${c} = <b class="text-gray-200">${tokens.toLocaleString()} tokens</b>`;
+    const pad = Math.round((window.V.headroom - 1) * 100);
+    derived.innerHTML = `${ctx.toLocaleString()} × ${c}`
+        + (pad ? ` + ${pad}% headroom` : '')
+        + ` = <b class="text-gray-200">${tokens.toLocaleString()} tokens</b>`;
     document.getElementById('v-vram').value = total.toFixed(2);
     note.textContent = `weights ${window.V.weightsGb.toFixed(2)} + overhead ${window.V.overheadGb} `
         + `+ KV ${kvGb.toFixed(2)} GB · ${bpt.toLocaleString()} bytes/token (${window.V.bptSource})`
         + (window.V.gpuCount > 1 ? ` · split across ${window.V.gpuCount} GPUs` : '');
+    vSyncRows();
+}
+
+// Mirror the args these controls write into the read-only table rows, so the
+// full invocation is visible in one place.
+function vSyncRows() {
+    const args = vCollectArgs();
+    const map = {
+        'v-row-host': '--host', 'v-row-port': '--port',
+        'v-row-maxlen': '--max-model-len', 'v-row-seqs': '--max-num-seqs',
+        'v-row-kv': '--kv-cache-memory-bytes',
+    };
+    for (const [id, flag] of Object.entries(map)) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const v = args[flag];
+        el.value = (v === undefined || v === null) ? '(not set)' : v;
+    }
 }
 
 function vOnSlider(value) {
@@ -222,7 +262,7 @@ function vOnVram(vramGb) {
     if (!bpt) return;
     const available = parseFloat(vramGb) - window.V.weightsGb - window.V.overheadGb;
     if (!(available > 0)) { vOnSlider(256); return; }
-    let ctx = Math.floor(available * GIB / bpt / vConc());
+    let ctx = Math.floor(available * GIB / bpt / vConc() / window.V.headroom);
     ctx = Math.floor(ctx / 256) * 256;
     if (window.V.maxContext) ctx = Math.min(ctx, Math.floor(window.V.maxContext / 256) * 256);
     vOnSlider(Math.max(256, ctx));
@@ -308,7 +348,8 @@ function vCollectArgs() {
     args['--max-model-len'] = String(vCtx());
     args['--max-num-seqs'] = String(vConc());
     if (window.V.bytesPerToken) {
-        args['--kv-cache-memory-bytes'] = String(vCtx() * vConc() * window.V.bytesPerToken);
+        args['--kv-cache-memory-bytes'] =
+            String(Math.floor(vCtx() * vConc() * window.V.headroom) * window.V.bytesPerToken);
     } else if (window.V.kvBudget) {
         args['--kv-cache-memory-bytes'] = String(window.V.kvBudget);
     }
@@ -362,4 +403,5 @@ window.closeModalAndRefresh = function () {
 };
 
 vRecalc();
+vSyncRows();
 </script>
