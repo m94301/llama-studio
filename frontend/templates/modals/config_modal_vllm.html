@@ -1,84 +1,365 @@
-<!-- Reduced config modal for engine:vllm models — raw-script editing only.
-     The structured modal's save path rewrites the script body, which would
-     destroy a vLLM script's env-var preamble (doc 21 decision 2). -->
+<!-- Structured config modal for engine:vllm models (doc 21 §2.3/§2.4).
+     Saves through /api/save-vllm-config, which rewrites only the exec line, so
+     the script's env preamble and tuning comments survive. -->
 <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
      id="modal"
      onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
     <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-3xl max-h-[90vh] flex flex-col"
          onclick="event.stopPropagation()">
 
-        <div class="flex justify-between items-center mb-2">
+        <div class="flex justify-between items-center mb-3">
             <h2 class="text-xl font-bold">
-                Edit vLLM Model
-                <span class="ml-2 text-xs font-bold text-teal-300 bg-teal-900 bg-opacity-40 border border-teal-700 rounded px-1.5 py-0.5 align-middle">vLLM</span>
+                Edit Model Configuration
+                <span class="ml-2 text-xs font-bold text-teal-300 bg-teal-900 bg-opacity-40 border border-teal-700 rounded px-1.5 py-0.5 align-middle">vLLM {{ vllm_version }}</span>
             </h2>
             <button onclick="document.getElementById('modal').remove();"
                     class="text-gray-400 hover:text-white text-2xl">×</button>
         </div>
 
-        <p class="text-sm text-gray-400 mb-1">{{ display_name }}</p>
-        <p class="text-xs text-gray-500 mb-3">
-            GPUs: {{ gpu_count }} · claims ~{{ (gpu_memory_utilization * 100)|round(0)|int }}% of each visible GPU
-            {% if config_error %}
-            · <span class="text-yellow-400">⚠ {{ config_error }}</span>
-            {% endif %}
-        </p>
+        <div class="flex-1 overflow-y-auto pr-2 space-y-6">
 
-        <div class="mb-3 p-3 rounded border border-gray-700 bg-gray-900 text-xs text-gray-400">
-            vLLM configs are edited as the launch script itself. The meta fence at the top
-            holds <code>display_name</code>, <code>health_timeout</code> (seconds; vLLM startup is slow),
-            and optional <code>vram_gb</code>. Everything below it — env vars, comments,
-            the <code>exec ... vllm serve</code> line with <code>--port</code> — is yours and is
-            preserved exactly as written.
+            <!-- Identity -->
+            <fieldset class="flex gap-3 items-end">
+                <div class="flex-1">
+                    <label class="text-xs font-bold text-gray-400">Display Name</label>
+                    <input type="text" id="v-display-name" value="{{ display_name }}"
+                           class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                </div>
+                <div class="w-44">
+                    <label class="text-xs font-bold text-gray-400"
+                           title="vLLM startup is slow; large multi-GPU loads need several minutes.">
+                        Health timeout (s)
+                    </label>
+                    <input type="number" id="v-health-timeout" min="1" max="1800" step="1"
+                           value="{{ health_timeout if health_timeout is not none else '' }}"
+                           placeholder="{{ default_health_timeout }} (default)"
+                           class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                </div>
+            </fieldset>
+
+            <!-- Required for load -->
+            <fieldset class="p-4 bg-gray-800 border border-gray-700 rounded">
+                <p class="text-xs font-bold text-gray-300 mb-3">Required for Load</p>
+
+                <div class="flex items-center gap-3 mb-4">
+                    <label class="text-xs font-bold text-gray-400">Host</label>
+                    <input type="text" id="v-host" value="{{ host }}"
+                           class="w-28 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-300">
+                    <label class="text-xs font-bold text-gray-400">Port</label>
+                    <input type="number" id="v-port" value="{{ port }}"
+                           class="w-24 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-300">
+                    <span class="text-xs text-gray-500">· {{ gpu_count }} GPU{{ 's' if gpu_count > 1 else '' }} (tp × pp)</span>
+                </div>
+
+                <!-- Context / concurrency / VRAM: one relation, driven from either end -->
+                <div class="flex items-center gap-3 mb-2">
+                    <label class="text-xs font-bold text-gray-400 w-28">Context</label>
+                    <input type="range" id="v-ctx-slider" min="256" step="256"
+                           max="{{ max_context or 131072 }}" value="{{ context_length or 8192 }}"
+                           oninput="vOnSlider(this.value)"
+                           class="flex-1 h-2 bg-gray-700 rounded appearance-none cursor-pointer">
+                    <input type="number" id="v-ctx-value" value="{{ context_length or 8192 }}"
+                           step="256" min="256" max="{{ max_context or 131072 }}"
+                           onchange="vOnSlider(this.value); document.getElementById('v-ctx-slider').value = this.value;"
+                           class="w-28 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-sm text-white text-right font-bold">
+                </div>
+
+                <div class="flex items-center gap-3 mb-3">
+                    <label class="text-xs font-bold text-gray-400 w-28">Concurrency</label>
+                    <input type="number" id="v-concurrency" min="1" step="1"
+                           value="{{ concurrency or 1 }}" oninput="vRecalc()"
+                           class="w-20 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                    <span class="text-xs text-gray-500">conversations served at once</span>
+                </div>
+
+                <div class="bg-gray-900 border border-gray-700 rounded p-3">
+                    <div class="flex items-center justify-between gap-4 flex-wrap">
+                        <div id="v-derived" class="text-xs text-gray-400">—</div>
+                        <div class="flex items-center gap-2">
+                            <label class="text-xs font-bold text-gray-400">VRAM</label>
+                            <input type="number" id="v-vram" step="0.1" min="0"
+                                   onchange="vOnVram(this.value)"
+                                   class="w-24 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-sm text-yellow-300 text-right font-bold">
+                            <span class="text-xs text-gray-500">GB</span>
+                            <button type="button" id="v-fit-btn" onclick="vFitToFree()"
+                                    class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs font-bold">
+                                fit to free VRAM
+                            </button>
+                        </div>
+                    </div>
+                    <p id="v-kv-note" class="text-xs text-gray-600 mt-2"></p>
+                </div>
+            </fieldset>
+
+            <!-- Advanced args -->
+            <fieldset>
+                <legend class="text-sm font-bold text-gray-300 mb-3">Launch Args</legend>
+                <div id="v-args-table" class="border border-gray-700 rounded mb-3 overflow-hidden">
+                    <div class="bg-gray-900 px-4 py-2 grid gap-2 font-bold text-sm text-gray-400"
+                         style="grid-template-columns: 1fr 1fr auto;">
+                        <span>Argument</span><span>Value</span><span></span>
+                    </div>
+                    {% for key, value in advanced_options.items() %}
+                    <div class="px-4 py-2 border-t border-gray-700 grid gap-2 items-center"
+                         style="grid-template-columns: 1fr 1fr auto;">
+                        <input type="text" data-arg-name value="{{ key }}"
+                               class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300">
+                        <input type="text" data-arg-value value="{{ value if value is not none else '' }}"
+                               placeholder="(no value)"
+                               class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300">
+                        <button type="button" onclick="this.closest('div').remove()"
+                                class="text-red-500 hover:text-red-400 text-xl leading-none w-6 h-6">×</button>
+                    </div>
+                    {% endfor %}
+                </div>
+                <div class="flex gap-2">
+                    <button type="button" onclick="vAddArg('', '')"
+                            class="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">+ Add Argument</button>
+                    <button type="button" onclick="vShowBrowser()"
+                            class="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">🔍 Option Browser</button>
+                    <button type="button" onclick="vOpenRaw()"
+                            class="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm font-bold">Edit Raw Script</button>
+                </div>
+                <p class="text-xs text-gray-600 mt-2">
+                    Saving rewrites only the <code>exec</code> line. Env exports, comments and
+                    variable defaults above it are preserved, and arguments you don't change keep
+                    their original form (so <code>"$MAXLEN"</code> stays a variable).
+                </p>
+            </fieldset>
         </div>
 
-        <textarea id="vllm-script-input"
-                  spellcheck="false"
-                  class="flex-1 min-h-[20rem] w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded text-xs font-mono text-gray-200"
-                  style="resize: vertical;">{{ script_text }}</textarea>
-
-        <div id="vllm-save-result" class="text-xs mt-2"></div>
-
-        <div class="flex gap-3 mt-4">
-            <button type="button"
-                    onclick="document.getElementById('modal').remove();"
-                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">
-                Cancel
-            </button>
-            <button type="button"
-                    onclick="saveVllmScript()"
-                    class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">
-                Save Script
-            </button>
+        <div id="v-save-result" class="text-xs mt-2"></div>
+        <div class="flex gap-3 mt-3 border-t border-gray-700 pt-3">
+            <button type="button" onclick="document.getElementById('modal').remove();"
+                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">Cancel</button>
+            <button type="button" onclick="vSave()"
+                    class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">Save Configuration</button>
         </div>
     </div>
 </div>
 
+<!-- Raw script editor (nested) -->
+<div id="v-raw-modal" class="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center z-[70] hidden"
+     onclick="if(event.target.id === 'v-raw-modal') this.classList.add('hidden');">
+    <div class="bg-gray-800 border border-purple-600 rounded-lg p-6 w-full max-w-2xl max-h-[85vh] flex flex-col"
+         onclick="event.stopPropagation()">
+        <h2 class="text-lg font-bold text-purple-300 mb-3">Edit Launch Script</h2>
+        <textarea id="v-raw-text" spellcheck="false"
+                  class="flex-1 min-h-[22rem] w-full px-2 py-2 bg-gray-950 border border-gray-700 rounded text-xs font-mono text-gray-200">{{ script_text }}</textarea>
+        <div class="flex gap-3 mt-3">
+            <button type="button" onclick="document.getElementById('v-raw-modal').classList.add('hidden');"
+                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">Cancel</button>
+            <button type="button" onclick="vSaveRaw()"
+                    class="flex-1 px-4 py-2 rounded bg-purple-600 hover:bg-purple-500 text-white font-bold">Save Raw Script</button>
+        </div>
+    </div>
+</div>
+
+<!-- Option browser (nested) -->
+<div id="v-browser" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[60] hidden"
+     onclick="if(event.target.id === 'v-browser') this.classList.add('hidden');">
+    <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-2xl max-h-[80vh] flex flex-col"
+         onclick="event.stopPropagation()">
+        <div class="flex justify-between items-center mb-3">
+            <h2 class="text-xl font-bold">Option Browser — vllm {{ vllm_version }}</h2>
+            <button onclick="document.getElementById('v-browser').classList.add('hidden');"
+                    class="text-gray-400 hover:text-white text-2xl">×</button>
+        </div>
+        <input type="text" id="v-browser-search" placeholder="Search options (e.g. 'cache', 'lora', 'parallel')…"
+               oninput="vFilter(this.value)"
+               class="w-full px-3 py-2 mb-3 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+        <div id="v-browser-body" class="flex-1 overflow-y-auto space-y-4"></div>
+    </div>
+</div>
+
 <script>
-// The save-result popup's OK button calls these; define them globally here so
-// the button works even if the popup's own inline script doesn't execute.
+window.V = {
+    model: {{ model_name | tojson }},
+    schema: {{ option_schema | tojson }},
+    bytesPerToken: {{ bytes_per_token }},
+    bptSource: {{ bytes_per_token_source | tojson }},
+    weightsGb: {{ weights_gb }},
+    overheadGb: {{ overhead_gb }},
+    gpuCount: {{ gpu_count }},
+    maxContext: {{ max_context or 0 }},
+    gpuFree: {{ gpu_free | tojson }},
+    kvBudget: {{ kv_cache_memory_bytes | tojson }},
+};
+const GIB = 1024 ** 3;
+
+function vCtx()  { return parseInt(document.getElementById('v-ctx-value').value) || 0; }
+function vConc() { return Math.max(1, parseInt(document.getElementById('v-concurrency').value) || 1); }
+
+// Forward: context + concurrency -> pool -> VRAM. Same arithmetic as kv_calc.
+function vRecalc() {
+    const ctx = vCtx(), c = vConc(), bpt = window.V.bytesPerToken;
+    const derived = document.getElementById('v-derived');
+    const note = document.getElementById('v-kv-note');
+    if (!bpt) {
+        derived.textContent = 'KV size per token unknown — load the model once to measure it.';
+        note.textContent = '';
+        return;
+    }
+    const tokens = ctx * c;
+    const kvGb = tokens * bpt / GIB;
+    const total = window.V.weightsGb + window.V.overheadGb + kvGb;
+    derived.innerHTML = `${ctx.toLocaleString()} × ${c} = <b class="text-gray-200">${tokens.toLocaleString()} tokens</b>`;
+    document.getElementById('v-vram').value = total.toFixed(2);
+    note.textContent = `weights ${window.V.weightsGb.toFixed(2)} + overhead ${window.V.overheadGb} `
+        + `+ KV ${kvGb.toFixed(2)} GB · ${bpt.toLocaleString()} bytes/token (${window.V.bptSource})`
+        + (window.V.gpuCount > 1 ? ` · split across ${window.V.gpuCount} GPUs` : '');
+}
+
+function vOnSlider(value) {
+    document.getElementById('v-ctx-value').value = value;
+    document.getElementById('v-ctx-slider').value = value;
+    vRecalc();
+}
+
+// Inverse: VRAM budget -> largest context that fits, snapped down to 256.
+function vOnVram(vramGb) {
+    const bpt = window.V.bytesPerToken;
+    if (!bpt) return;
+    const available = parseFloat(vramGb) - window.V.weightsGb - window.V.overheadGb;
+    if (!(available > 0)) { vOnSlider(256); return; }
+    let ctx = Math.floor(available * GIB / bpt / vConc());
+    ctx = Math.floor(ctx / 256) * 256;
+    if (window.V.maxContext) ctx = Math.min(ctx, Math.floor(window.V.maxContext / 256) * 256);
+    vOnSlider(Math.max(256, ctx));
+}
+
+function vFitToFree() {
+    const entries = Object.entries(window.V.gpuFree || {});
+    if (!entries.length) return;
+    // No GPU is assigned at config time, so target the emptiest one and say which.
+    const [gid, free] = entries.reduce((a, b) => (b[1] > a[1] ? b : a));
+    document.getElementById('v-fit-btn').textContent = `fit to GPU ${gid} — ${free} GB free`;
+    vOnVram(free);
+}
+
+function vAddArg(name, value) {
+    const table = document.getElementById('v-args-table');
+    const row = document.createElement('div');
+    row.className = 'px-4 py-2 border-t border-gray-700 grid gap-2 items-center';
+    row.style.gridTemplateColumns = '1fr 1fr auto';
+    row.innerHTML = `
+        <input type="text" data-arg-name class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300">
+        <input type="text" data-arg-value placeholder="(no value)" class="px-2 py-1 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300">
+        <button type="button" onclick="this.closest('div').remove()" class="text-red-500 hover:text-red-400 text-xl leading-none w-6 h-6">×</button>`;
+    table.appendChild(row);
+    row.querySelector('[data-arg-name]').value = name;
+    row.querySelector('[data-arg-value]').value = value;
+    return row;
+}
+
+function vShowBrowser() {
+    const body = document.getElementById('v-browser-body');
+    const byCat = {};
+    for (const [key, spec] of Object.entries(window.V.schema)) {
+        if (!key.startsWith('--')) continue;   // short aliases add noise
+        (byCat[spec.category || 'other'] ||= []).push({ key, ...spec });
+    }
+    body.innerHTML = '';
+    for (const cat of Object.keys(byCat).sort()) {
+        const div = document.createElement('div');
+        div.setAttribute('data-category', cat);
+        div.innerHTML = `<h3 class="text-sm font-bold text-gray-300 mb-2">${cat}</h3>`;
+        const list = document.createElement('div');
+        list.className = 'space-y-1';
+        for (const opt of byCat[cat].sort((a, b) => a.key.localeCompare(b.key))) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.setAttribute('data-option-key', opt.key);
+            btn.className = 'w-full text-left px-3 py-2 rounded bg-gray-700 hover:bg-gray-600 text-sm text-gray-300';
+            btn.innerHTML = `<span class="font-mono font-bold">${opt.key}</span>`
+                + (opt.takes_value ? ' <span class="text-xs text-gray-500">takes a value</span>' : '')
+                + `<br><span class="text-xs text-gray-400">${(opt.description || '').slice(0, 160)}</span>`;
+            btn.onclick = () => {
+                const row = vAddArg(opt.key, '');
+                document.getElementById('v-browser').classList.add('hidden');
+                row.querySelector('[data-arg-value]').focus();
+            };
+            list.appendChild(btn);
+        }
+        div.appendChild(list);
+        body.appendChild(div);
+    }
+    document.getElementById('v-browser').classList.remove('hidden');
+}
+
+function vFilter(query) {
+    const q = query.toLowerCase().trim();
+    document.querySelectorAll('#v-browser-body [data-category]').forEach(cat => {
+        let visible = 0;
+        cat.querySelectorAll('[data-option-key]').forEach(btn => {
+            const hit = !q || btn.textContent.toLowerCase().includes(q);
+            btn.style.display = hit ? 'block' : 'none';
+            if (hit) visible++;
+        });
+        cat.style.display = visible ? 'block' : 'none';
+    });
+}
+
+function vCollectArgs() {
+    const args = {};
+    args['--host'] = document.getElementById('v-host').value.trim() || '0.0.0.0';
+    const port = document.getElementById('v-port').value.trim();
+    if (port) args['--port'] = port;
+    args['--max-model-len'] = String(vCtx());
+    args['--max-num-seqs'] = String(vConc());
+    if (window.V.bytesPerToken) {
+        args['--kv-cache-memory-bytes'] = String(vCtx() * vConc() * window.V.bytesPerToken);
+    } else if (window.V.kvBudget) {
+        args['--kv-cache-memory-bytes'] = String(window.V.kvBudget);
+    }
+    document.querySelectorAll('#v-args-table [data-arg-name]').forEach(input => {
+        const row = input.closest('div');
+        const name = input.value.trim();
+        if (!name) return;
+        const value = row.querySelector('[data-arg-value]').value.trim();
+        args[name] = value === '' ? null : value;
+    });
+    return args;
+}
+
+function vSave() {
+    document.getElementById('v-save-result').innerHTML = '<span class="text-gray-400">Saving…</span>';
+    htmx.ajax('POST', '/api/save-vllm-config', {
+        target: '#modal-container', swap: 'innerHTML',
+        values: {
+            model_name: window.V.model,
+            display_name: document.getElementById('v-display-name').value,
+            health_timeout: document.getElementById('v-health-timeout').value,
+            args_json: JSON.stringify(vCollectArgs()),
+        },
+    });
+}
+
+function vOpenRaw() {
+    fetch('/api/model-script-raw?model=' + encodeURIComponent(window.V.model))
+        .then(r => r.text())
+        .then(t => { document.getElementById('v-raw-text').value = t; })
+        .catch(() => {});
+    document.getElementById('v-raw-modal').classList.remove('hidden');
+}
+
+function vSaveRaw() {
+    htmx.ajax('POST', '/api/save-raw-script', {
+        target: '#modal-container', swap: 'innerHTML',
+        values: { model_name: window.V.model, script_text: document.getElementById('v-raw-text').value },
+    });
+}
+
+// The save-result popup's OK button calls these; define them globally so it
+// works regardless of whether its own inline script executes.
 window.refreshModelList = function () {
-    setTimeout(() => {
-        htmx.ajax('GET', '/api/model-list', { target: '#models-container', swap: 'innerHTML' });
-    }, 100);
+    setTimeout(() => htmx.ajax('GET', '/api/model-list',
+        { target: '#models-container', swap: 'innerHTML' }), 100);
 };
 window.closeModalAndRefresh = function () {
     document.getElementById('modal')?.remove();
     window.refreshModelList();
 };
 
-function saveVllmScript() {
-    document.getElementById('vllm-save-result').innerHTML =
-        '<span class="text-gray-400">Saving…</span>';
-    // htmx swap (not raw innerHTML) so the result modal's inline <script> runs —
-    // it defines the closeModalAndRefresh() its OK button calls.
-    htmx.ajax('POST', '/api/save-raw-script', {
-        target: '#modal-container',
-        swap: 'innerHTML',
-        values: {
-            model_name: '{{ model_name }}',
-            script_text: document.getElementById('vllm-script-input').value,
-        },
-    });
-}
+vRecalc();
 </script>

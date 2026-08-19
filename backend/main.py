@@ -24,7 +24,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config_manager import ConfigManager, ModelConfig, calculate_kv_cache_gb
 from engine_flags import get_vllm_manifest
-from launch_script import parse_pasted_script, set_vllm_manifest
+from launch_script import (
+    get_vllm_manifest as get_vllm_manifest_runtime,
+    parse_pasted_script,
+    patch_meta_fence,
+    set_vllm_manifest,
+)
 import migrate_configs
 from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
@@ -866,6 +871,24 @@ async def config_modal_new(model: str):
         # env-var-heavy and the structured save path rewrites the script body,
         # which would destroy the preamble (doc 21 decision 2 — Phase 2 lifts this).
         if model_config.engine == "vllm":
+            from kv_calc import DEFAULT_OVERHEAD_GB, bytes_per_token_from_config
+
+            manifest = get_vllm_manifest_runtime() or {}
+            args = dict(model_config.launch_args)
+            core_keys = {"--host", "--port", "--max-model-len", "--max-num-seqs",
+                         "--kv-cache-memory-bytes"}
+            bpt = model_config.parsed.kv_bytes_per_token
+            bpt_source = "measured"
+            if not bpt and model_config.model_path:
+                bpt = bytes_per_token_from_config(
+                    model_config.model_path, args.get("--kv-cache-dtype")
+                )
+                bpt_source = "estimated"
+
+            gpu_free = {}
+            for gid, info in (gpu_manager.get_gpu_status() or {}).items():
+                gpu_free[gid] = round(info["memory"] - info["allocated"], 1)
+
             template = jinja_env.get_template("modals/config_modal_vllm.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -873,7 +896,22 @@ async def config_modal_new(model: str):
                 script_text=config_manager.get_script_text(model),
                 config_error=model_config.config_error,
                 gpu_count=model_config.gpu_count,
-                gpu_memory_utilization=model_config.gpu_memory_utilization,
+                health_timeout=model_config.health_timeout,
+                default_health_timeout=model_config.effective_health_timeout(),
+                host=args.get("--host", "0.0.0.0"),
+                port=args.get("--port", ""),
+                context_length=model_config.context_length or "",
+                concurrency=model_config.concurrency or "",
+                kv_cache_memory_bytes=model_config.kv_cache_memory_bytes or "",
+                max_context=model_config.max_context or 0,
+                advanced_options={k: v for k, v in args.items() if k not in core_keys},
+                option_schema=manifest.get("flags", {}),
+                vllm_version=manifest.get("version", "unknown"),
+                bytes_per_token=bpt or 0,
+                bytes_per_token_source=bpt_source,
+                weights_gb=model_config.size_gb or 0,
+                overhead_gb=DEFAULT_OVERHEAD_GB,
+                gpu_free=gpu_free,
             ))
 
         # Determine which schema to use based on model's llama_path
@@ -1570,6 +1608,81 @@ async def calculate_vram(
     except Exception as e:
         logger.error(f"Error calculating VRAM: {e}")
         return {"error": str(e)}
+
+
+@app.post("/api/save-vllm-config", response_class=HTMLResponse)
+async def save_vllm_config(
+    model_name: str = Form(...),
+    display_name: str = Form(""),
+    health_timeout: str = Form(""),
+    args_json: str = Form(...),
+):
+    """Structured save for a vLLM model — rewrites only the exec line (§2.2).
+
+    The meta fence takes display_name / health_timeout; everything else is an
+    engine argument and goes into the invocation. The script's preamble (env
+    exports, tuning comments, variable defaults) is preserved byte-for-byte,
+    and arguments the user didn't change keep their original spelling, so
+    `$VAR` indirection survives.
+    """
+    from launch_script import patch_exec_invocation
+
+    logger.info(f"💾 Saving vLLM config for: {model_name}")
+    try:
+        mc = config_manager.get_model_config(model_name)
+    except FileNotFoundError:
+        return _error_modal(f"Model not found: {model_name}")
+    if mc.engine != "vllm":
+        return _error_modal(f"{model_name} is not a vLLM model")
+
+    try:
+        args = json.loads(args_json)
+    except json.JSONDecodeError as e:
+        return _error_modal(f"Could not parse launch arguments: {e}")
+    if not isinstance(args, dict):
+        return _error_modal("Launch arguments must be an object")
+
+    ht: Optional[int] = None
+    if health_timeout.strip():
+        try:
+            ht = int(health_timeout)
+        except ValueError:
+            return _error_modal("Health-check timeout must be a whole number of seconds.")
+        from launch_script import HEALTH_TIMEOUT_MAX, HEALTH_TIMEOUT_MIN
+        if not (HEALTH_TIMEOUT_MIN <= ht <= HEALTH_TIMEOUT_MAX):
+            return _error_modal(
+                f"Health-check timeout must be between {HEALTH_TIMEOUT_MIN} and {HEALTH_TIMEOUT_MAX} seconds."
+            )
+
+    for key in ("--max-model-len", "--max-num-seqs", "--kv-cache-memory-bytes"):
+        value = args.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if int(value) <= 0:
+                return _error_modal(f"{key} must be a positive whole number.")
+        except (TypeError, ValueError):
+            return _error_modal(f"{key} must be a whole number, got {value!r}.")
+
+    try:
+        script_path = config_manager.get_script_path(model_name)
+        text = script_path.read_text()
+        text = patch_exec_invocation(text, args=args, parsed=mc.parsed)
+        text = patch_meta_fence(
+            text,
+            display_name=display_name.strip() or None,
+            health_timeout=ht,
+        )
+        from config_manager import write_script_atomic
+        write_script_atomic(script_path, text)
+        updated = config_manager.rescan_model(model_name)
+    except Exception as e:
+        logger.error(f"✗ vLLM save failed for {model_name}: {e}", exc_info=True)
+        return _error_modal(f"Failed to save: {e}")
+
+    if not updated:
+        return _error_modal(f"{model_name} could not be re-read after saving")
+    return _save_success_modal(updated)
 
 
 @app.post("/api/calculate-vllm-vram", response_class=JSONResponse)

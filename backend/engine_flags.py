@@ -28,7 +28,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from llama_version import get_vllm_version
 
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Bumped when the manifest layout changes, so stale caches regenerate instead
 # of being read with the wrong shape.
-MANIFEST_FORMAT = 2
+MANIFEST_FORMAT = 3  # added category + description
 
 # One option entry: a flag, optionally followed by a metavar. vLLM renders
 # metavars four ways, all of which mean "this flag takes a value":
@@ -52,33 +52,97 @@ _ENTRY_RE = re.compile(
 _OPTION_LINE_RE = re.compile(r"^\s{1,6}(-{1,2}[a-zA-Z0-9].*)$")
 
 
+# Group headers sit at column 0 and end in a colon ("CacheConfig:", "Frontend:").
+_GROUP_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 _-]*):\s*$")
+
+# Human-facing category names for the Option Browser; anything unlisted keeps
+# the group name vLLM printed.
+_GROUP_LABELS = {
+    "options": "general",
+    "Frontend": "server",
+    "ModelConfig": "model",
+    "LoadConfig": "loading",
+    "AttentionConfig": "attention",
+    "ParallelConfig": "parallel",
+    "CacheConfig": "cache",
+    "SchedulerConfig": "scheduler",
+    "LoRAConfig": "lora",
+    "MultiModalConfig": "multimodal",
+    "ObservabilityConfig": "observability",
+    "CompilationConfig": "compilation",
+    "StructuredOutputsConfig": "structured outputs",
+}
+
+
 def parse_vllm_help(help_text: str) -> Dict[str, dict]:
-    """Parse `vllm serve --help` output into {flags: {...}, aliases: {...}}."""
+    """Parse `vllm serve --help` into {flags: {...}, aliases: {...}}.
+
+    Each flag records whether it takes a value, its category (the config group
+    it was printed under) and its description (the indented help text), which is
+    what the Option Browser needs.
+    """
     flags: Dict[str, dict] = {}
     aliases: Dict[str, str] = {}
+    group = "general"
+    pending: List[str] = []          # flag names awaiting their description
+    description: List[str] = []
+
+    def _flush() -> None:
+        if not pending:
+            return
+        text = " ".join(" ".join(description).split())
+        for name in pending:
+            if name in flags:
+                flags[name]["description"] = text
+        pending.clear()
+        description.clear()
 
     for line in help_text.splitlines():
+        gm = _GROUP_RE.match(line)
+        if gm:
+            _flush()
+            raw_group = gm.group(1)
+            group = _GROUP_LABELS.get(raw_group, raw_group)
+            continue
+
         m = _OPTION_LINE_RE.match(line)
-        if not m:
+        if m:
+            _flush()
+            # The option list ends at the first run of 2+ spaces (the help column).
+            parts = re.split(r"\s{2,}", m.group(1), maxsplit=1)
+            head = parts[0]
+            entries = _ENTRY_RE.findall(head)
+            if not entries:
+                continue
+
+            takes_value = any(metavar.strip() for _, metavar in entries)
+            names = [name for name, _ in entries]
+            longs = [n for n in names if n.startswith("--")]
+            canonical = longs[0] if longs else names[0]
+
+            for name in names:
+                flags[name] = {
+                    "takes_value": takes_value,
+                    "category": group,
+                    "description": "",
+                }
+                # Only short forms are aliases. `--no-x` is a distinct flag with
+                # the opposite meaning, never an alias of `--x`.
+                if not name.startswith("--") and name != canonical:
+                    aliases[name] = canonical
+
+            pending.extend(names)
+            if len(parts) > 1 and parts[1].strip():
+                description.append(parts[1].strip())
             continue
-        # The option list ends at the first run of 2+ spaces (the help column).
-        head = re.split(r"\s{2,}", m.group(1), maxsplit=1)[0]
-        entries = _ENTRY_RE.findall(head)
-        if not entries:
-            continue
 
-        takes_value = any(metavar.strip() for _, metavar in entries)
-        names = [name for name, _ in entries]
-        longs = [n for n in names if n.startswith("--")]
-        canonical = longs[0] if longs else names[0]
+        # Indented continuation: part of the current flag's description.
+        if pending and line.startswith("  ") and line.strip():
+            description.append(line.strip())
+        elif not line.strip():
+            _flush()
 
-        for name in names:
-            flags[name] = {"takes_value": takes_value}
-            # Only short forms are aliases. `--no-x` is a distinct flag with the
-            # opposite meaning, never an alias of `--x`.
-            if not name.startswith("--") and name != canonical:
-                aliases[name] = canonical
-
+    _flush()
     return {"flags": flags, "aliases": aliases}
 
 
