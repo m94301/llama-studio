@@ -200,9 +200,9 @@ class GpuManager:
                 phase=LoadingPhase.IDLE,
             )
 
-        # Start GPU monitoring task for continuous power/temp updates
-        if self.gpus:
-            asyncio.create_task(self._monitor_gpu_stats())
+        # Start the monitor task: GPU power/temp/VRAM refresh + the session
+        # crash watchdog. Runs even without NVML so crash detection still works.
+        asyncio.create_task(self._monitor_gpu_stats())
 
     async def cleanup(self) -> None:
         """Terminate all running llama-server sessions."""
@@ -282,9 +282,16 @@ class GpuManager:
                 f"Port {model_config.port} is already in use. Cannot load {model_name}."
             )
 
-        # Compute per-GPU VRAM need (honors tensor-split weights; even-splits a
-        # flexible-split model across the chosen count).
-        per_gpu_need = model_config.per_gpu_vram(count=len(gpu_ids)) or [model_config.total_vram or model_config.size_gb or 0]
+        # Compute per-GPU VRAM need. vLLM claims util × capacity on every
+        # visible GPU regardless of model size (doc 21 decision 3); llama.cpp
+        # honors tensor-split weights / even-splits flexible models.
+        if model_config.engine == "vllm":
+            if self.gpus:
+                per_gpu_need = [model_config.needed_on_gpu(self.gpus[gid].memory) for gid in gpu_ids]
+            else:
+                per_gpu_need = [model_config.size_gb or 0] * len(gpu_ids)
+        else:
+            per_gpu_need = model_config.per_gpu_vram(count=len(gpu_ids)) or [model_config.total_vram or model_config.size_gb or 0]
         if len(per_gpu_need) != len(gpu_ids):
             # Defensive: pad/trim to match (shouldn't normally happen since gpu_count is the source)
             if len(gpu_ids) == 1:
@@ -325,9 +332,11 @@ class GpuManager:
         logger.info(f"⏳ Model state set to LOADING (queued)")
 
         try:
-            # Determine which llama-server binary to use
+            # Determine which llama-server binary to use. vLLM scripts carry
+            # their own executable path; the custom-binary version/schema check
+            # is llama.cpp-only.
             effective_binary = self.config.app_config.llama_server_binary
-            if model_config.llama_path and model_config.llama_path != "default":
+            if model_config.engine != "vllm" and model_config.llama_path and model_config.llama_path != "default":
                 custom_path = model_config.llama_path
                 if not Path(custom_path).is_file():
                     raise ValueError(f"Custom llama-server binary not found: {custom_path}")
@@ -349,6 +358,7 @@ class GpuManager:
                 log_file=log_path,
                 gpu_ids=gpu_ids,
                 health_timeout=model_config.effective_health_timeout(),
+                term_grace=30.0 if model_config.engine == "vllm" else 5.0,
             )
 
             # Store session BEFORE start() so cancel_load can find it
@@ -371,6 +381,7 @@ class GpuManager:
                         self.gpus[gid].allocated += need
                         loaded_model_dict = self.models[model_name].to_dict()
                         loaded_model_dict['port'] = model_config.port
+                        loaded_model_dict['engine'] = model_config.engine
                         # Surface per-GPU share for UI clarity
                         loaded_model_dict['vram_share'] = need
                         self.gpus[gid].loaded_models.append(loaded_model_dict)
@@ -543,30 +554,39 @@ class GpuManager:
         }
 
     async def _monitor_gpu_stats(self) -> None:
-        """Continuously monitor and broadcast GPU power/temperature updates."""
-        if not PYNVML_AVAILABLE:
-            return
-
+        """Monitor loop (~1s): GPU power/temp/VRAM refresh + session crash watchdog."""
         while True:
             try:
-                # Update GPU power and temperature every 1 second
-                for gpu_id, gpu in self.gpus.items():
-                    try:
-                        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-                        power = pynvml.nvmlDeviceGetPowerUsage(handle)
-                        gpu.power_draw = power / 1000.0  # Convert mW to W
-                        temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-                        gpu.temperature = temp
-                        # Refresh real VRAM usage so get_gpu_status() can serve it
-                        # from cache (the panel and GPU picker read this).
-                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                        gpu.mem_used_gb = mem_info.used / (1024**3)
-                    except Exception as e:
-                        logger.debug(f"   [GPU Monitor] Error reading GPU {gpu_id}: {e}")
-                        continue
+                if PYNVML_AVAILABLE and self.gpus:
+                    # Update GPU power and temperature every 1 second
+                    for gpu_id, gpu in self.gpus.items():
+                        try:
+                            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+                            power = pynvml.nvmlDeviceGetPowerUsage(handle)
+                            gpu.power_draw = power / 1000.0  # Convert mW to W
+                            temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                            gpu.temperature = temp
+                            # Refresh real VRAM usage so get_gpu_status() can serve it
+                            # from cache (the panel and GPU picker read this).
+                            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                            gpu.mem_used_gb = mem_info.used / (1024**3)
+                        except Exception as e:
+                            logger.debug(f"   [GPU Monitor] Error reading GPU {gpu_id}: {e}")
+                            continue
 
-                # Broadcast update to all connected WebSocket clients
-                await event_bus.broadcast({"type": "gpu_update"})
+                    # Broadcast update to all connected WebSocket clients
+                    await event_bus.broadcast({"type": "gpu_update"})
+
+                # Crash watchdog: a RUNNING session whose process has exited
+                # (OOM, crash, external kill) gets its allocations released and
+                # its row flipped to FAILED instead of showing RUNNING forever.
+                for name, session in list(self.sessions.items()):
+                    if (
+                        self.get_model_state(name) == ModelState.RUNNING
+                        and session.process is not None
+                        and session.process.poll() is not None
+                    ):
+                        await self._handle_crashed_session(name, session.process.returncode)
 
                 # Wait before next update
                 await asyncio.sleep(1.0)
@@ -575,6 +595,28 @@ class GpuManager:
             except Exception as e:
                 logger.error(f"✗ GPU monitoring error: {e}")
                 await asyncio.sleep(1.0)
+
+    async def _handle_crashed_session(self, model_name: str, returncode) -> None:
+        """Clean up after a session whose process died out from under us."""
+        logger.error(f"✗ {model_name} process exited unexpectedly (code {returncode})")
+        self.sessions.pop(model_name, None)
+        model = self.models.get(model_name)
+        if model and model.gpu_ids:
+            for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
+                if gid in self.gpus:
+                    gpu = self.gpus[gid]
+                    gpu.allocated = max(0.0, gpu.allocated - need)
+                    gpu.loaded_models = [
+                        m for m in gpu.loaded_models if m["name"] != model_name
+                    ]
+            model.gpu_ids = []
+            model.vram_per_gpu = []
+            model.pid = None
+        await self._set_model_state(
+            model_name, ModelState.FAILED, LoadingPhase.ERROR,
+            f"process exited unexpectedly (code {returncode}) — see log",
+        )
+        asyncio.create_task(event_bus.broadcast({"type": "gpu_update"}))
 
     def sync_models_from_config(self) -> None:
         """Register models from config that aren't in self.models (added after startup)."""

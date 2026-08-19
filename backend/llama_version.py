@@ -49,3 +49,39 @@ def get_version(binary_path: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"⚠ Error detecting version: {e}")
         return None
+
+
+# vllm --version imports torch on first run — slow — so cache per path.
+_VLLM_VERSION_CACHE: dict = {}
+
+
+def get_vllm_version(binary_path: str) -> Optional[str]:
+    """Run `vllm --version` and return the version string (e.g. '0.11.2'), cached."""
+    if binary_path in _VLLM_VERSION_CACHE:
+        return _VLLM_VERSION_CACHE[binary_path]
+    try:
+        p = Path(binary_path)
+        if not p.exists():
+            logger.warning(f"⚠ vllm executable not found: {binary_path}")
+            return None
+        result = subprocess.run(
+            [str(p), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        combined = result.stdout + result.stderr
+        m = re.search(r"(\d+\.\d+\S*)", combined)
+        version = m.group(1) if m else None
+        if version:
+            logger.info(f"✓ Detected vllm version: {version}")
+            _VLLM_VERSION_CACHE[binary_path] = version
+        else:
+            logger.warning(f"⚠ Could not parse vllm version from: {combined[:200]}")
+        return version
+    except subprocess.TimeoutExpired:
+        logger.warning("⚠ vllm --version timed out")
+        return None
+    except Exception as e:
+        logger.warning(f"⚠ Error detecting vllm version: {e}")
+        return None

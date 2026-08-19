@@ -23,12 +23,16 @@ class LlamaSession:
         log_file: Path,
         gpu_ids: Optional[list] = None,
         health_timeout: int = 120,
+        term_grace: float = 5.0,
     ):
         self.model_config = model_config
         self.llama_server_binary = llama_server_binary
         self.log_file = log_file
         self.gpu_ids = list(gpu_ids) if gpu_ids else [0]
         self.health_timeout = int(health_timeout)
+        # SIGTERM → SIGKILL window. vLLM multi-GPU teardown (NCCL, spawned
+        # workers) needs far longer than llama-server's near-instant exit.
+        self.term_grace = float(term_grace)
         self.process: Optional[subprocess.Popen] = None
         self.pid: Optional[int] = None
         self.cancelled: bool = False
@@ -117,7 +121,7 @@ class LlamaSession:
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(self.process.wait),
-                    timeout=5.0
+                    timeout=self.term_grace
                 )
                 logger.info(f"✓ {self.model_config.name} terminated gracefully")
             except asyncio.TimeoutError:

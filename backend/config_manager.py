@@ -20,6 +20,7 @@ from launch_script import (
     ParsedScript,
     parse_script,
     render_skeleton_script,
+    render_vllm_skeleton_script,
     patch_meta_fence,
     patch_launch_args_fence,
     patch_cuda_visible_devices,
@@ -103,6 +104,23 @@ class ModelConfig:
     @property
     def display_name(self) -> str:
         return self.parsed.display_name or self.name
+
+    @property
+    def engine(self) -> str:
+        return self.parsed.engine
+
+    @property
+    def gpu_memory_utilization(self) -> float:
+        return self.parsed.gpu_memory_utilization
+
+    def needed_on_gpu(self, gpu_total_gb: float) -> float:
+        """VRAM a vLLM model will claim on one GPU of the given capacity.
+
+        vLLM pre-allocates its KV pool to fill util × capacity on every visible
+        GPU regardless of model size, so the need depends on the target GPU,
+        not the model (doc 21 decision 3). llama.cpp callers use per_gpu_vram.
+        """
+        return round(self.gpu_memory_utilization * gpu_total_gb, 2)
 
     @property
     def model_path(self) -> Optional[str]:
@@ -218,6 +236,13 @@ class AppConfig(BaseModel):
     llama_server_binary: str = Field(
         default="/home/servers/llamacpp/bin/llama-server",
         description="Path to llama-server binary"
+    )
+    # vLLM support is dormant while unset: existing engine:vllm scripts still
+    # load (the script carries its own executable path), but directory
+    # discovery / skeleton generation is skipped.
+    vllm_binary: Optional[str] = Field(
+        default=None,
+        description="Path to a vllm executable (typically <venv>/bin/vllm)"
     )
     llama_schema_version: Optional[str] = Field(
         default=None,
@@ -345,6 +370,29 @@ class ConfigManager:
             if not script_path.exists():
                 self._generate_skeleton(script_path, model_name, gguf_path)
 
+        # Step 1b: vLLM model discovery — HF-format directories (config.json +
+        # safetensors). Only when a vllm executable is configured (doc 21 §1.4).
+        if self.app_config.vllm_binary and models_root.exists():
+            for cfg_file in models_root.rglob("config.json"):
+                model_dir = cfg_file.parent
+                if not any(model_dir.glob("*.safetensors")):
+                    continue
+                model_name = model_dir.name
+                script_path = config_models_dir / f"{model_name}.sh"
+                if script_path.exists() or (config_models_dir / f"{model_name}.sh.old").exists():
+                    continue
+                try:
+                    text = render_vllm_skeleton_script(
+                        display_name=self._format_display_name(model_name),
+                        model_path=str(model_dir),
+                        vllm_bin=self.app_config.vllm_binary,
+                    )
+                    script_path.write_text(text)
+                    script_path.chmod(0o755)
+                    logger.info(f"   Generated vLLM skeleton: {script_path.name}")
+                except Exception as e:
+                    logger.error(f"✗ Error generating vLLM skeleton {script_path}: {e}")
+
         # Step 2: load every .sh in config/models.
         # _load_one can trigger a GGUF re-parse (CPU-bound, ~1s/model on large
         # files), so run them concurrently across worker threads. parse_gguf
@@ -405,6 +453,27 @@ class ConfigManager:
         st = script_path.stat()
         if not (st.st_mode & stat.S_IXUSR):
             script_path.chmod(st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        # Backfill the mandatory engine tag into scripts that predate it
+        # (one-line meta-fence patch; inserts the fence if missing entirely).
+        if not parsed.engine_declared:
+            new_text = patch_meta_fence(
+                text,
+                display_name=parsed.display_name,
+                block_count=parsed.block_count,
+                max_context=parsed.max_context,
+                kv_cache_multiplier=parsed.kv_cache_multiplier,
+                health_timeout=parsed.health_timeout,
+                engine=parsed.engine,
+                vram_gb=parsed.vram_gb,
+            )
+            script_path.write_text(new_text)
+            text = new_text
+            parsed = parse_script(new_text)
+            logger.info(f"   Backfilled engine tag ({parsed.engine}) for {script_path.stem}")
+
+        if parsed.engine == "vllm":
+            return self._finish_vllm_model(script_path, parsed)
 
         # Backfill GGUF metadata if missing
         needs_backfill = (
@@ -499,6 +568,36 @@ class ConfigManager:
         mc.is_configured = ok
         mc.config_error = reason
         return mc
+
+    def _finish_vllm_model(self, script_path: Path, parsed: ParsedScript) -> ModelConfig:
+        """Build a ModelConfig for an engine:vllm script.
+
+        No GGUF metadata, no KV-cache math: size comes from the vram_gb meta
+        field or a safetensors sum, and total_vram stays None (fitting uses
+        gpu_memory_utilization × GPU capacity instead — doc 21 decision 3).
+        """
+        mc = ModelConfig(
+            name=script_path.stem,
+            script_path=script_path,
+            parsed=parsed,
+            default_llama_bin=self.app_config.llama_server_binary if self.app_config else None,
+        )
+        if parsed.vram_gb is not None:
+            mc.size_gb = parsed.vram_gb
+        elif parsed.model_path and Path(parsed.model_path).is_dir():
+            mc.size_gb = self._get_safetensors_size_gb(Path(parsed.model_path))
+        ok, reason = parsed.is_configured()
+        mc.is_configured = ok
+        mc.config_error = reason
+        return mc
+
+    def _get_safetensors_size_gb(self, model_dir: Path) -> Optional[float]:
+        try:
+            total = sum(p.stat().st_size for p in model_dir.rglob("*.safetensors"))
+            return round(total / (1024 ** 3), 1) if total else None
+        except Exception as e:
+            logger.warning(f"⚠ Could not size {model_dir}: {e}")
+            return None
 
     def _sync_disabled_scripts(self, config_dir: Path) -> None:
         """Rename `.sh` ↔ `.sh.old` based on whether each script's model file exists.

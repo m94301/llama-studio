@@ -1,0 +1,75 @@
+<!-- Reduced config modal for engine:vllm models — raw-script editing only.
+     The structured modal's save path rewrites the script body, which would
+     destroy a vLLM script's env-var preamble (doc 21 decision 2). -->
+<div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
+     id="modal"
+     onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
+    <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-3xl max-h-[90vh] flex flex-col"
+         onclick="event.stopPropagation()">
+
+        <div class="flex justify-between items-center mb-2">
+            <h2 class="text-xl font-bold">
+                Edit vLLM Model
+                <span class="ml-2 text-xs font-bold text-teal-300 bg-teal-900 bg-opacity-40 border border-teal-700 rounded px-1.5 py-0.5 align-middle">vLLM</span>
+            </h2>
+            <button onclick="document.getElementById('modal').remove();"
+                    class="text-gray-400 hover:text-white text-2xl">×</button>
+        </div>
+
+        <p class="text-sm text-gray-400 mb-1">{{ display_name }}</p>
+        <p class="text-xs text-gray-500 mb-3">
+            GPUs: {{ gpu_count }} · claims ~{{ (gpu_memory_utilization * 100)|round(0)|int }}% of each visible GPU
+            {% if config_error %}
+            · <span class="text-yellow-400">⚠ {{ config_error }}</span>
+            {% endif %}
+        </p>
+
+        <div class="mb-3 p-3 rounded border border-gray-700 bg-gray-900 text-xs text-gray-400">
+            vLLM configs are edited as the launch script itself. The meta fence at the top
+            holds <code>display_name</code>, <code>health_timeout</code> (seconds; vLLM startup is slow),
+            and optional <code>vram_gb</code>. Everything below it — env vars, comments,
+            the <code>exec ... vllm serve</code> line with <code>--port</code> — is yours and is
+            preserved exactly as written.
+        </div>
+
+        <textarea id="vllm-script-input"
+                  spellcheck="false"
+                  class="flex-1 min-h-[20rem] w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded text-xs font-mono text-gray-200"
+                  style="resize: vertical;">{{ script_text }}</textarea>
+
+        <div id="vllm-save-result" class="text-xs mt-2"></div>
+
+        <div class="flex gap-3 mt-4">
+            <button type="button"
+                    onclick="document.getElementById('modal').remove();"
+                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">
+                Cancel
+            </button>
+            <button type="button"
+                    onclick="saveVllmScript()"
+                    class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">
+                Save Script
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+async function saveVllmScript() {
+    const form = new FormData();
+    form.append('model_name', '{{ model_name }}');
+    form.append('script_text', document.getElementById('vllm-script-input').value);
+    const box = document.getElementById('vllm-save-result');
+    box.innerHTML = '<span class="text-gray-400">Saving…</span>';
+    try {
+        const resp = await fetch('/api/save-raw-script', { method: 'POST', body: form });
+        const html = await resp.text();
+        // save-raw-script returns a result modal; swap it in over this one.
+        document.getElementById('modal').remove();
+        document.getElementById('modal-container').innerHTML = html;
+        htmx.process(document.getElementById('modal-container'));
+    } catch (e) {
+        box.innerHTML = '<span class="text-red-400">✗ Save failed: ' + e + '</span>';
+    }
+}
+</script>

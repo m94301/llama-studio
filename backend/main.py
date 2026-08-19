@@ -29,7 +29,7 @@ from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
 from event_bus import event_bus
 from llama_options import get_option_schema, validate_option, set_runtime_schema
-from llama_version import get_version
+from llama_version import get_version, get_vllm_version
 from schema_parser import parse_help, load_schema, save_schema
 
 # Get project root (one level up from backend directory)
@@ -839,6 +839,20 @@ async def config_modal_new(model: str):
     try:
         model_config = config_manager.get_model_config(model)
 
+        # vLLM models get the reduced raw-script modal: their scripts are
+        # env-var-heavy and the structured save path rewrites the script body,
+        # which would destroy the preamble (doc 21 decision 2 — Phase 2 lifts this).
+        if model_config.engine == "vllm":
+            template = jinja_env.get_template("modals/config_modal_vllm.html")
+            return HTMLResponse(template.render(
+                model_name=model,
+                display_name=model_config.display_name or model,
+                script_text=config_manager.get_script_text(model),
+                config_error=model_config.config_error,
+                gpu_count=model_config.gpu_count,
+                gpu_memory_utilization=model_config.gpu_memory_utilization,
+            ))
+
         # Determine which schema to use based on model's llama_path
         version_raw = None
         if model_config.llama_path and model_config.llama_path != "default":
@@ -916,6 +930,18 @@ async def save_model_config_new(
     """Save config with validation at each step."""
     logger.info(f"💾 Saving config (v2) for model: {model_name}")
     try:
+        # Defense: the structured save rewrites the script body, which would
+        # destroy a vLLM script's env-var preamble. vLLM edits go through the
+        # raw-script editor until Phase 2's body-preserving save lands.
+        try:
+            if config_manager.get_model_config(model_name).engine == "vllm":
+                return _error_modal(
+                    "vLLM models are edited via the raw-script editor — "
+                    "the structured save would overwrite the script's env-var preamble."
+                )
+        except FileNotFoundError:
+            pass
+
         # Parse core fields
         try:
             core_data = json.loads(core_json)
@@ -1184,7 +1210,16 @@ def _stored_cvd_usability(model_config: ModelConfig, gpu_data: dict) -> tuple:
     slot is OK and the CVD count matches the model's split count.
     """
     cvd = model_config.cuda_visible_devices or []
-    if model_config.is_flexible_split:
+    if model_config.engine == "vllm":
+        # vLLM claims util × capacity on each visible GPU; need depends on the
+        # target GPU, not the model (doc 21 decision 3). Count must match tp×pp.
+        if model_config.gpu_count != len(cvd) or not cvd:
+            return [], False
+        needs = [
+            model_config.needed_on_gpu(gpu_data[gid]["memory"]) if gid in gpu_data else 0.0
+            for gid in cvd
+        ]
+    elif model_config.is_flexible_split:
         # Flexible split: any CVD of length >= 1 is valid; the share is the total
         # divided evenly across however many GPUs the CVD names.
         fallback = model_config.total_vram or model_config.size_gb or 0
@@ -1283,9 +1318,15 @@ async def gpu_selector(model: str, force_pick: int = 0):
 
         # Multi-pick path: tensor-split present, no usable CVD (or forced)
         if gpu_count > 1:
-            per_gpu_need = model_config.per_gpu_vram() or [
-                (model_config.total_vram or model_config.size_gb or 0) / gpu_count
-            ] * gpu_count
+            if model_config.engine == "vllm":
+                # Need is util × capacity of whichever GPU gets picked; show the
+                # largest-capacity figure so the display is conservative.
+                max_mem = max((g["memory"] for g in gpu_data.values()), default=0)
+                per_gpu_need = [model_config.needed_on_gpu(max_mem)] * gpu_count
+            else:
+                per_gpu_need = model_config.per_gpu_vram() or [
+                    (model_config.total_vram or model_config.size_gb or 0) / gpu_count
+                ] * gpu_count
             template = jinja_env.get_template("modals/gpu_multi_picker.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -1507,9 +1548,12 @@ async def get_current_settings():
         version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
     else:
         version_str = "unknown"
+    vllm_bin = config_manager.app_config.vllm_binary
     return {
         "llama_server": config_manager.app_config.llama_server_binary,
         "llama_server_version": version_str,
+        "vllm_binary": vllm_bin or "",
+        "vllm_version": (get_vllm_version(vllm_bin) or "unknown") if vllm_bin else "",
         "models_directory": config_manager.app_config.models_directory,
         "webui_port": config_manager.app_config.webui_port,
     }
@@ -1540,10 +1584,25 @@ async def config_paths():
                 </button>
             </div>
             
+            <!-- vLLM Executable (optional) -->
+            <div class="flex items-center gap-3">
+                <label class="w-32 text-sm font-bold text-gray-300">vLLM:</label>
+                <input type="text"
+                       value="{app_config.vllm_binary or '(not configured)'}"
+                       readonly
+                       class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
+                <button hx-get="/api/file-browser?path_type=vllm_binary&current_path={app_config.vllm_binary or str(Path.home())}"
+                        hx-target="#modal-container"
+                        hx-swap="innerHTML"
+                        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold transition-colors">
+                    Edit
+                </button>
+            </div>
+
             <!-- Models Directory -->
             <div class="flex items-center gap-3">
                 <label class="w-32 text-sm font-bold text-gray-300">Models Dir:</label>
-                <input type="text" 
+                <input type="text"
                        value="{models_dir_path}"
                        readonly
                        class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
@@ -1734,6 +1793,23 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
 
             # Re-detect schema when llama_server path changes
             await ensure_schema_for_binary(str(new_path_obj), config_manager, update_global=True)
+        elif path_type == "vllm_binary":
+            # Accept the executable directly, or a directory (venv root or its
+            # bin/) from which we locate `vllm`.
+            if new_path_obj.is_dir():
+                for candidate in (new_path_obj / "vllm", new_path_obj / "bin" / "vllm"):
+                    if candidate.is_file():
+                        new_path_obj = candidate
+                        break
+                else:
+                    raise ValueError(f"No 'vllm' executable found in {new_path}")
+            if not new_path_obj.is_file():
+                raise ValueError(f"Path is not a file: {new_path_obj}")
+            version = get_vllm_version(str(new_path_obj))
+            if version is None:
+                raise ValueError(f"Not a working vllm executable (--version failed): {new_path_obj}")
+            config_manager.app_config.vllm_binary = str(new_path_obj)
+            logger.info(f"✓ vLLM executable set: {new_path_obj} (version {version})")
         elif path_type == "models_directory":
             if not new_path_obj.is_dir():
                 raise ValueError(f"Path is not a directory: {new_path}")
