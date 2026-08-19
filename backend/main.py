@@ -1599,69 +1599,16 @@ async def get_current_settings():
     }
 
 
-@app.get("/api/config-paths", response_class=HTMLResponse)
-async def config_paths():
-    """Return configuration paths UI."""
-    try:
-        app_config = config_manager.app_config
-        llama_server_path = app_config.llama_server_binary
-        models_dir_path = app_config.models_directory
-        
-        html = f"""
-        <div class="space-y-4">
-            <!-- Llama Server Path -->
-            <div class="flex items-center gap-3">
-                <label class="w-32 text-sm font-bold text-gray-300">Llama Server:</label>
-                <input type="text" 
-                       value="{llama_server_path}"
-                       readonly
-                       class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
-                <button hx-get="/api/file-browser?path_type=llama_server&current_path={llama_server_path}"
-                        hx-target="#modal-container"
-                        hx-swap="innerHTML"
-                        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold transition-colors">
-                    Edit
-                </button>
-            </div>
-            
-            <!-- Models Directory -->
-            <!-- NOTE: the vLLM executable field lives in the Settings modal
-                 (frontend/templates/index.html); this endpoint renders into
-                 #config-paths-panel, which is permanently hidden. -->
-
-            <div class="flex items-center gap-3">
-                <label class="w-32 text-sm font-bold text-gray-300">Models Dir:</label>
-                <input type="text"
-                       value="{models_dir_path}"
-                       readonly
-                       class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
-                <button hx-get="/api/file-browser?path_type=models_directory&current_path={models_dir_path}"
-                        hx-target="#modal-container"
-                        hx-swap="innerHTML"
-                        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold transition-colors">
-                    Edit
-                </button>
-            </div>
-        </div>
-        """
-        return html
-    except Exception as e:
-        logger.error(f"✗ Error in config_paths: {type(e).__name__}: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
-
-
-
 @app.get("/api/file-browser", response_class=HTMLResponse)
-async def file_browser(path_type: str, current_path: str = "/", modal: str = None):
-    """Return file browser modal for selecting a directory.
+async def file_browser(path_type: str, current_path: str = "/"):
+    """Return the directory-picker fragment for the Settings / model-config modals.
 
-    Args:
-        path_type: 'llama_server' or 'models_directory'
-        current_path: Current directory path
-        modal: If 'settings', use callback to settings modal; else use form submission
+    Swapped into #file-browser-content; the caller supplies selectPath() and
+    closeFileBrowser(). Args: path_type is 'llama_server', 'vllm_binary', or
+    'models_directory'; current_path is where to start browsing.
     """
     try:
-        logger.info(f"📂 File browser requested for {path_type} at {current_path} (modal={modal})")
+        logger.info(f"📂 File browser requested for {path_type} at {current_path}")
         
         # Parse current path
         current_path_obj = Path(current_path)
@@ -1693,13 +1640,10 @@ async def file_browser(path_type: str, current_path: str = "/", modal: str = Non
         # Build directory list HTML
         dir_html = ""
 
-        # Build modal parameter for nested calls
-        modal_param = f"&modal={modal}" if modal else ""
-
         # Parent directory link
         if current_path_obj != current_path_obj.parent:
             dir_html += f"""
-            <button hx-get="/api/file-browser?path_type={path_type}&current_path={parent_path}{modal_param}"
+            <button hx-get="/api/file-browser?path_type={path_type}&current_path={parent_path}"
                     hx-target="#file-browser-content"
                     hx-swap="innerHTML"
                     class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors text-blue-400">
@@ -1710,7 +1654,7 @@ async def file_browser(path_type: str, current_path: str = "/", modal: str = Non
         # Subdirectories
         for directory in directories:
             dir_html += f"""
-            <button hx-get="/api/file-browser?path_type={path_type}&current_path={directory}{modal_param}"
+            <button hx-get="/api/file-browser?path_type={path_type}&current_path={directory}"
                     hx-target="#file-browser-content"
                     hx-swap="innerHTML"
                     class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors text-gray-300">
@@ -1719,81 +1663,38 @@ async def file_browser(path_type: str, current_path: str = "/", modal: str = Non
             """
         
         # Build action buttons based on modal type
-        if modal == "settings":
-            # For settings modal, use onclick callback instead of form submission
-            html = f"""
-            <div class="flex justify-between items-center mb-4">
-                <h2 class="text-xl font-bold">Select Directory</h2>
-                <button type="button"
-                        onclick="closeFileBrowser()"
-                        class="text-gray-400 hover:text-white text-2xl">
-                    ×
-                </button>
-            </div>
+        html = f"""
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold">Select Directory</h2>
+            <button type="button"
+                    onclick="closeFileBrowser()"
+                    class="text-gray-400 hover:text-white text-2xl">
+                ×
+            </button>
+        </div>
 
-            <div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
-                <p class="text-xs text-gray-500 mb-1">Current Path:</p>
-                <p class="text-sm text-gray-300 font-mono">{current_path_obj}</p>
-            </div>
+        <div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
+            <p class="text-xs text-gray-500 mb-1">Current Path:</p>
+            <p class="text-sm text-gray-300 font-mono">{current_path_obj}</p>
+        </div>
 
-            <div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
-                {dir_html if dir_html else '<div class="p-4 text-gray-500">No subdirectories</div>'}
-            </div>
+        <div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
+            {dir_html if dir_html else '<div class="p-4 text-gray-500">No subdirectories</div>'}
+        </div>
 
-            <div class="flex gap-3">
-                <button type="button"
-                        onclick="closeFileBrowser()"
-                        class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                    Cancel
-                </button>
-                <button type="button"
-                        onclick="selectPath('{current_path_obj}')"
-                        class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                    Select
-                </button>
-            </div>
-            """
-        else:
-            # For default mode, use form submission
-            html = f"""
-            <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-                 id="modal"
-                 onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-                <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-2xl max-h-96 flex flex-col"
-                     onclick="event.stopPropagation()">
-                    <div class="flex justify-between items-center mb-4">
-                        <h2 class="text-xl font-bold">Select Directory</h2>
-                        <button onclick="document.getElementById('modal').remove();"
-                                class="text-gray-400 hover:text-white text-2xl">
-                            ×
-                        </button>
-                    </div>
-
-                    <div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
-                        <p class="text-xs text-gray-500 mb-1">Current Path:</p>
-                        <p class="text-sm text-gray-300 font-mono">{current_path_obj}</p>
-                    </div>
-
-                    <div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
-                        {dir_html if dir_html else '<div class="p-4 text-gray-500">No subdirectories</div>'}
-                    </div>
-
-                    <div class="flex gap-3">
-                        <button onclick="document.getElementById('modal').remove();"
-                                class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                            Cancel
-                        </button>
-                        <button hx-post="/api/update-config-path"
-                                hx-vals='{{"path_type": "{path_type}", "new_path": "{current_path_obj}"}}'
-                                hx-target="#modal-container"
-                                hx-swap="innerHTML"
-                                class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                            Select This Path
-                        </button>
-                    </div>
-                </div>
-            </div>
-            """
+        <div class="flex gap-3">
+            <button type="button"
+                    onclick="closeFileBrowser()"
+                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+                Cancel
+            </button>
+            <button type="button"
+                    onclick="selectPath('{current_path_obj}')"
+                    class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
+                Select
+            </button>
+        </div>
+        """
         return html
     except Exception as e:
         logger.error(f"✗ Error in file_browser: {type(e).__name__}: {e}", exc_info=True)
@@ -1886,7 +1787,7 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
                     <span class="font-bold text-gray-200">{path_type}:</span><br>
                     <span class="font-mono text-xs text-gray-400">{new_path}</span>
                 </p>
-                <button onclick="document.getElementById('modal').remove(); htmx.ajax('GET', '/api/config-paths', '#config-paths')"
+                <button onclick="document.getElementById('modal').remove();"
                         class="w-full px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
                     OK
                 </button>

@@ -758,7 +758,7 @@ window.validateLlamaPath = async function() {
 
 window.openConfigFileBrowser = function(pathType) {
     const currentPath = document.getElementById('llama-path-input').value || '';
-    const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}&modal=settings`;
+    const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}`;
 
     htmx.ajax('GET', url, {
         target: '#file-browser-content',

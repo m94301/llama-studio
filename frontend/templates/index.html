@@ -458,16 +458,6 @@
     <!-- Main Content -->
     <main class="max-w-7xl mx-auto px-6 py-6 space-y-8">
 
-        <!-- Configuration Paths Panel (Collapsible) -->
-        <section id="config-paths-panel" class="hidden bg-gray-800 border border-gray-700 rounded p-4">
-            <h2 class="text-sm font-bold text-gray-300 mb-4">Configuration Paths</h2>
-            <div id="config-paths-content"
-                 hx-get="/api/config-paths"
-                 hx-trigger="load"
-                 hx-swap="innerHTML">
-            </div>
-        </section>
-
         <!-- GPU Panel -->
         <section>
             <h2 class="text-lg font-bold text-gray-300 mb-3">GPUs</h2>
@@ -816,7 +806,7 @@
         function openFileBrowser(pathType) {
             filePickerMode = pathType;
             const currentPath = currentSettingsPaths[pathType] || '/';
-            const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}&modal=settings`;
+            const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}`;
 
             htmx.ajax('GET', url, {
                 target: '#file-browser-content',
