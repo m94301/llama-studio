@@ -891,6 +891,20 @@ async def config_modal_new(model: str):
             for gid, info in (gpu_manager.get_gpu_status() or {}).items():
                 gpu_free[gid] = round(info["memory"] - info["allocated"], 1)
 
+            # Render the opening VRAM figure server-side. The box previously
+            # relied entirely on JS having run to show anything, so it appeared
+            # blank on open if the script hadn't executed yet.
+            from kv_calc import vram_gb_for
+            initial_ctx = model_config.context_length or 8192
+            initial_conc = model_config.concurrency or 1
+            initial_vram, initial_tokens = ("", 0)
+            if bpt:
+                initial_vram, initial_tokens = vram_gb_for(
+                    context_length=initial_ctx, concurrency=initial_conc,
+                    bytes_per_token=bpt, weights_gb=model_config.size_gb or 0,
+                    headroom=DEFAULT_KV_HEADROOM,
+                )
+
             template = jinja_env.get_template("modals/config_modal_vllm.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -922,6 +936,8 @@ async def config_modal_new(model: str):
                 env_assignments=model_config.parsed.env_assignments,
                 pp_size=model_config.parsed.pipeline_parallel_size,
                 gpu_free=gpu_free,
+                initial_vram=initial_vram,
+                initial_tokens=initial_tokens,
             ))
 
         # Determine which schema to use based on model's llama_path

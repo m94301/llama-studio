@@ -83,10 +83,11 @@
 
                 <div class="bg-gray-900 border border-gray-700 rounded p-3">
                     <div class="flex items-center justify-between gap-4 flex-wrap">
-                        <div id="v-derived" class="text-xs text-gray-400">—</div>
+                        <div id="v-derived" class="text-xs text-gray-400">{% if initial_tokens %}{{ "{:,}".format(context_length or 8192) }} × {{ concurrency or 1 }} + 20% headroom = <b class="text-gray-200">{{ "{:,}".format(initial_tokens) }} tokens</b>{% else %}—{% endif %}</div>
                         <div class="flex items-center gap-2">
                             <label class="text-xs font-bold text-gray-400">VRAM</label>
                             <input type="number" id="v-vram" step="0.1" min="0"
+                                   value="{{ initial_vram }}"
                                    onchange="vOnVram(this.value)"
                                    class="w-24 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-sm text-yellow-300 text-right font-bold">
                             <span class="text-xs text-gray-500">GB</span>
