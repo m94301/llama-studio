@@ -1,10 +1,11 @@
-"""Parse and render llama-server launch shell scripts.
+"""Parse and render model launch shell scripts (llama-server and vllm serve).
 
-Script format:
+Script format (llama.cpp):
 
     #!/usr/bin/env bash
     # === llama-studio:meta BEGIN ===
     # display_name: Human Name
+    # engine: llamacpp
     # block_count: 64
     # max_context: 262144
     # kv_cache_multiplier: 213
@@ -24,6 +25,17 @@ and is patched in place by the UI. Everything after the meta fence is the
 launch invocation; the UI rewrites it wholesale on save. The parser tolerates
 legacy fenced launch-args blocks (used during the initial migration) but new
 scripts are written without those markers.
+
+Script format (vLLM) — `# engine: vllm` in the meta fence, and the invocation
+is `exec ".../vllm" serve <model-dir> --flags...` with the model as a
+positional argument. vLLM scripts commonly carry an env-var preamble
+(`export VLLM_*=...`, `MODEL=...` variable defaults); the parser resolves
+`$VAR` / `${VAR}` / `${VAR:-default}` references against assignments found in
+the script body, and the structured-save paths must never rewrite the body
+(raw-editor only until doc 21 Phase 2).
+
+The `engine` field is mandatory going forward. Scripts missing it parse as
+llamacpp with `engine_declared=False`; the scanner backfills the tag.
 """
 
 import logging
@@ -71,6 +83,25 @@ KNOWN_FLAG_ONLY = {
     "-v",
 }
 
+# Known flag-only (boolean) options for `vllm serve`. vLLM has no short-flag
+# aliases, so FLAG_ALIASES never applies to vllm scripts.
+KNOWN_FLAG_ONLY_VLLM = {
+    "--trust-remote-code",
+    "--enable-auto-tool-choice",
+    "--enforce-eager",
+    "--no-enable-flashinfer-autotune",
+    "--disable-log-requests",
+    "--disable-log-stats",
+    "--enable-prefix-caching",
+    "--no-enable-prefix-caching",
+    "--enable-chunked-prefill",
+    "--enable-expert-parallel",
+    "--disable-frontend-multiprocessing",
+    "--enable-sleep-mode",
+}
+
+VALID_ENGINES = ("llamacpp", "vllm")
+
 # Meta fields that are GGUF-derived (integers); user-owned fields are str.
 META_INT_FIELDS = {"block_count", "max_context", "kv_cache_multiplier"}
 
@@ -95,6 +126,16 @@ class ParsedScript:
     kv_cache_multiplier: Optional[int] = None
     # Optional per-model overrides (None = use default at read time)
     health_timeout: Optional[int] = None
+    # Engine dispatch. Meta tag wins; else inferred from the invocation form;
+    # else llamacpp. engine_declared=False marks a script the scanner should
+    # backfill the tag into.
+    engine: str = "llamacpp"
+    engine_declared: bool = False
+    # Optional user-declared model weights size (GB) for display; vLLM models
+    # have no GGUF to size from when the dir path can't be summed.
+    vram_gb: Optional[float] = None
+    # VLLM_PP_LAYER_PARTITION assignment from the body, parsed to ints.
+    pp_layer_partition: Optional[List[int]] = None
 
     # Launch-args fence contents
     llama_bin: Optional[str] = None  # binary path used in the exec line
@@ -141,15 +182,45 @@ class ParsedScript:
             return None
         return parts
 
+    def _int_arg(self, key: str, default: int = 1) -> int:
+        try:
+            v = self.args.get(key)
+            return int(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    @property
+    def tensor_parallel_size(self) -> int:
+        return self._int_arg("--tensor-parallel-size", 1) if self.engine == "vllm" else 1
+
+    @property
+    def pipeline_parallel_size(self) -> int:
+        return self._int_arg("--pipeline-parallel-size", 1) if self.engine == "vllm" else 1
+
+    @property
+    def gpu_memory_utilization(self) -> float:
+        """vLLM's per-GPU claim fraction (--gpu-memory-utilization, default 0.9)."""
+        raw = self.args.get("--gpu-memory-utilization")
+        try:
+            return float(raw) if raw is not None else 0.9
+        except (TypeError, ValueError):
+            return 0.9
+
     @property
     def gpu_count(self) -> int:
         """Number of GPUs this model wants. 1 if no --tensor-split (or split=[1]).
+
+        vLLM engine: tensor_parallel_size × pipeline_parallel_size (exact count;
+        vLLM splits evenly, uneven pipeline splits go via VLLM_PP_LAYER_PARTITION
+        in the preamble and don't change the count).
 
         Note: a flexible-split model (--split-mode layer/row without
         --tensor-split) reports 1 here because its count is not fixed by the
         script — it's chosen at load time. Use `is_flexible_split` to detect
         that case; the GPU count then comes from the user's selection / CVD.
         """
+        if self.engine == "vllm":
+            return max(1, self.tensor_parallel_size * self.pipeline_parallel_size)
         weights = self.tensor_split_weights
         if weights is None:
             return 1
@@ -172,6 +243,8 @@ class ParsedScript:
         than a value baked into the script. (`--split-mode none` and the absence
         of --split-mode both mean single-GPU here.)
         """
+        if self.engine == "vllm":
+            return False
         if self.tensor_split_weights is not None:
             return False
         return self.split_mode in ("layer", "row")
@@ -179,11 +252,15 @@ class ParsedScript:
     def is_configured(self) -> Tuple[bool, Optional[str]]:
         """Return (configured, reason_if_not)."""
         if not self.has_args_fence:
-            return False, "launch-args fence missing"
+            return False, "no launch invocation found"
         if not self.model_path:
-            return False, "no -m / --model in launch args"
+            return False, (
+                "no model in launch invocation"
+                if self.engine == "vllm"
+                else "no -m / --model in launch args"
+            )
         if not Path(self.model_path).exists():
-            return False, f"model file not found: {self.model_path}"
+            return False, f"model path not found: {self.model_path}"
         if self.port is None:
             return False, "--port not set"
         return True, None
@@ -225,6 +302,48 @@ def _parse_meta_fence(inner: str) -> Dict[str, str]:
         k, v = body.split(":", 1)
         meta[k.strip()] = v.strip()
     return meta
+
+
+# ---------- shell variable resolution ----------
+
+_VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}?")
+
+
+def _lookup_assignment(name: str, text: str) -> Optional[str]:
+    """Find `NAME=value` (optionally exported/quoted) in the script body."""
+    for pat in (
+        rf'^[ \t]*(?:export[ \t]+)?{name}[ \t]*=[ \t]*"([^"]*)"',
+        rf"^[ \t]*(?:export[ \t]+)?{name}[ \t]*=[ \t]*'([^']*)'",
+        rf"^[ \t]*(?:export[ \t]+)?{name}[ \t]*=[ \t]*(\S+)",
+    ):
+        m = re.search(pat, text, re.MULTILINE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def resolve_var_refs(token: str, full_text: str, warnings: Optional[List[str]] = None) -> str:
+    """Substitute $NAME / ${NAME} / ${NAME:-default} using assignments in the script.
+
+    Handles the common self-referencing default idiom (`MAXLEN="${MAXLEN:-524288}"`)
+    by falling back to the default once a name is already being resolved.
+    Unresolvable references are left literal (with a warning appended).
+    """
+    def _resolve(tok: str, seen: frozenset) -> str:
+        def repl(m: re.Match) -> str:
+            name, default = m.group(1), m.group(2)
+            if name not in seen:
+                val = _lookup_assignment(name, full_text)
+                if val is not None:
+                    return _resolve(val, seen | {name})
+            if default is not None:
+                return _resolve(default, seen | {name})
+            if warnings is not None:
+                warnings.append(f"unresolved shell variable ${name}")
+            return m.group(0)
+        return _VAR_REF_RE.sub(repl, tok)
+
+    return _resolve(token, frozenset())
 
 
 # ---------- launch-args tokenization ----------
@@ -364,6 +483,18 @@ def parse_script(text: str) -> ParsedScript:
                 ps.health_timeout = int(ht)
             except ValueError:
                 ps.warnings.append(f"meta health_timeout={ht!r} is not an integer")
+        eng = (meta.get("engine") or "").strip().lower()
+        if eng in VALID_ENGINES:
+            ps.engine = eng
+            ps.engine_declared = True
+        elif eng:
+            ps.warnings.append(f"meta engine={eng!r} is not one of {VALID_ENGINES}; treating as llamacpp")
+        vg = meta.get("vram_gb")
+        if vg is not None and vg != "":
+            try:
+                ps.vram_gb = float(vg)
+            except ValueError:
+                ps.warnings.append(f"meta vram_gb={vg!r} is not a number")
     else:
         ps.warnings.append("meta fence missing")
 
@@ -389,11 +520,37 @@ def parse_script(text: str) -> ParsedScript:
     # Shell-level CVD (read from the whole script regardless of fence presence)
     ps.cuda_visible_devices = _extract_cuda_visible_devices(text)
 
+    # vLLM uneven pipeline split (env var, preserved as preamble — doc 21 §4).
+    raw_part = _lookup_assignment("VLLM_PP_LAYER_PARTITION", text)
+    if raw_part is not None:
+        resolved = resolve_var_refs(raw_part, text, ps.warnings)
+        try:
+            ps.pp_layer_partition = [int(p.strip()) for p in resolved.split(",") if p.strip()]
+        except ValueError:
+            ps.warnings.append(f"VLLM_PP_LAYER_PARTITION={resolved!r} is not a comma-separated int list")
+        if (
+            ps.pp_layer_partition is not None
+            and ps.engine == "vllm"
+            and len(ps.pp_layer_partition) != ps.pipeline_parallel_size
+        ):
+            ps.warnings.append(
+                f"VLLM_PP_LAYER_PARTITION has {len(ps.pp_layer_partition)} entries but "
+                f"--pipeline-parallel-size is {ps.pipeline_parallel_size} (vLLM will refuse to start)"
+            )
+
     return ps
 
 
+def _is_vllm_tokens(tokens: List[str]) -> bool:
+    """True when the token list is a `<...>/vllm serve ...` invocation."""
+    if len(tokens) < 2 or tokens[1] != "serve":
+        return False
+    return Path(tokens[0]).name == "vllm" or tokens[0].rstrip('"').endswith("/vllm") or tokens[0] == "vllm"
+
+
 def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
-    """Find the llama-server invocation in `body` and populate ps.{llama_bin, args, model_path}."""
+    """Find the launch invocation (llama-server or vllm serve) in `body` and
+    populate ps.{llama_bin, args, model_path}."""
     collapsed = _collapse_continuations(body)
     invocation = None
     for line in collapsed.splitlines():
@@ -402,13 +559,16 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
             continue
         if re.match(r"^(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=", s):
             continue
-        if s.startswith("exec ") or "$LLAMA_BIN" in s or "${LLAMA_BIN" in s or "llama-server" in s:
+        if (
+            s.startswith("exec ") or "$LLAMA_BIN" in s or "${LLAMA_BIN" in s
+            or "llama-server" in s or re.search(r"vllm[\"']?\s+serve\b", s)
+        ):
             invocation = s
             break
 
     if invocation is None:
         ps.has_args_fence = False  # no invocation found
-        ps.warnings.append("no llama-server invocation found")
+        ps.warnings.append("no launch invocation found")
         return
 
     try:
@@ -422,9 +582,74 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
     if not tokens:
         return
 
+    # Resolve $VAR in the binary token so `"$VENV/bin/vllm"` is recognizable.
+    binary = resolve_var_refs(tokens[0], full_text, ps.warnings)
+    tokens = [binary] + tokens[1:]
+
+    if _is_vllm_tokens(tokens):
+        # Meta tag wins; an undeclared script with a vllm invocation is inferred.
+        if not ps.engine_declared:
+            ps.engine = "vllm"
+        ps.has_args_fence = True
+        ps.llama_bin = binary
+        ps.args, ps.model_path = _vllm_arg_tokens_to_dict(tokens[2:], full_text, ps.warnings)
+        return
+
     ps.has_args_fence = True  # found a valid invocation; treat as "configured-able"
-    ps.llama_bin = _resolve_llama_bin(tokens[0], full_text)
+    ps.llama_bin = _resolve_llama_bin(binary, full_text)
     ps.args, ps.model_path = _arg_tokens_to_dict(tokens[1:], ps.warnings)
+
+
+def _vllm_arg_tokens_to_dict(
+    tokens: List[str], full_text: str, warnings: List[str]
+) -> Tuple[Dict[str, Optional[str]], Optional[str]]:
+    """Walk `vllm serve` arg tokens (after 'serve') into a dict.
+
+    The model is the positional token before any flag. vLLM has no short-flag
+    aliases. Multi-value flags (nargs+, e.g. --served-model-name a b c)
+    accumulate trailing non-flag tokens onto the last flag, space-joined.
+    $VAR references in values are resolved against script-body assignments.
+    """
+    args: Dict[str, Optional[str]] = {}
+    model_path: Optional[str] = None
+    last_flag: Optional[str] = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("-"):
+            value = resolve_var_refs(tok, full_text, warnings)
+            if model_path is None and last_flag is None:
+                model_path = value
+            elif last_flag is not None:
+                prev = args.get(last_flag)
+                args[last_flag] = f"{prev} {value}" if prev else value
+            else:
+                warnings.append(f"stray token in vllm invocation: {tok!r}")
+            i += 1
+            continue
+
+        # Flag-only vs takes-a-value (same next-token heuristic as llama.cpp)
+        is_flag_only = tok in KNOWN_FLAG_ONLY_VLLM
+        if not is_flag_only:
+            if i + 1 >= len(tokens):
+                is_flag_only = True
+            else:
+                nxt = tokens[i + 1]
+                if nxt.startswith("--") or (
+                    len(nxt) >= 2 and nxt[0] == "-" and nxt[1].isalpha()
+                ):
+                    is_flag_only = True
+
+        if is_flag_only:
+            args[tok] = None
+            last_flag = None  # boolean flags never accumulate values
+            i += 1
+        else:
+            args[tok] = resolve_var_refs(tokens[i + 1], full_text, warnings)
+            last_flag = tok
+            i += 2
+
+    return args, model_path
 
 
 def parse_pasted_script(text: str) -> ParsedScript:
@@ -460,6 +685,10 @@ _CVD_KEY = "CUDA_VISIBLE_DEVICES"
 def _parse_cvd_value(raw: str) -> Optional[List[int]]:
     """Parse a 'CUDA_VISIBLE_DEVICES=...' value into a list of ints, or None on malformed."""
     s = raw.strip().strip('"').strip("'")
+    # Guarded default form: ${CUDA_VISIBLE_DEVICES:-0,1,2} → parse the default.
+    m = re.match(rf"^\$\{{{_CVD_KEY}:-([^}}]*)\}}$", s)
+    if m:
+        s = m.group(1)
     if not s:
         return None
     try:
@@ -530,6 +759,7 @@ def render_script(
     args: Dict[str, Optional[str]],
     preserved_body: Optional[str] = None,
     health_timeout: Optional[int] = None,
+    engine: str = "llamacpp",
 ) -> str:
     """Render a complete script.
 
@@ -542,6 +772,7 @@ def render_script(
     meta_lines = [META_BEGIN]
     if display_name:
         meta_lines.append(f"# display_name: {display_name}")
+    meta_lines.append(f"# engine: {engine}")
     if block_count is not None:
         meta_lines.append(f"# block_count: {block_count}")
     if max_context is not None:
@@ -595,14 +826,20 @@ def patch_meta_fence(
     max_context: Optional[int] = None,
     kv_cache_multiplier: Optional[int] = None,
     health_timeout: Optional[int] = None,
+    engine: str = "llamacpp",
+    vram_gb: Optional[float] = None,
 ) -> str:
     """Rewrite only the meta fence. Add it after the shebang if missing.
 
-    Any of the kwargs left as None will be omitted from the new meta block.
+    Any of the kwargs left as None will be omitted from the new meta block
+    (except `engine`, which is always emitted — the tag is mandatory).
     """
     new_lines = [META_BEGIN]
     if display_name:
         new_lines.append(f"# display_name: {display_name}")
+    new_lines.append(f"# engine: {engine}")
+    if vram_gb is not None:
+        new_lines.append(f"# vram_gb: {vram_gb:g}")
     if block_count is not None:
         new_lines.append(f"# block_count: {block_count}")
     if max_context is not None:
@@ -777,4 +1014,35 @@ def render_skeleton_script(
         llama_bin=llama_bin,
         model_path=model_path,
         args=args,
+        engine="llamacpp",
+    )
+
+
+def render_vllm_skeleton_script(
+    *,
+    display_name: str,
+    model_path: str,
+    vllm_bin: str,
+) -> str:
+    """Render a skeleton script for a newly-discovered vLLM model directory.
+
+    --port is intentionally omitted so the model shows as unconfigured (same
+    convention as llama.cpp skeletons). --disable-log-requests keeps per-request
+    spam out of the tailed log; health_timeout defaults high because vLLM
+    startup (weight load + graph capture) far exceeds llama.cpp's.
+    """
+    meta = "\n".join([
+        META_BEGIN,
+        f"# display_name: {display_name}",
+        "# engine: vllm",
+        "# health_timeout: 600",
+        META_END,
+    ])
+    return (
+        f"#!/usr/bin/env bash\n{meta}\n\n"
+        f"VLLM_BIN={shlex.quote(vllm_bin)}\n\n"
+        f'exec "$VLLM_BIN" serve {shlex.quote(model_path)} \\\n'
+        f"  --host 0.0.0.0 \\\n"
+        f"  --gpu-memory-utilization 0.9 \\\n"
+        f"  --disable-log-requests\n"
     )
