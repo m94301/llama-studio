@@ -190,12 +190,47 @@ class TestVllmSkeleton:
             display_name="My Model",
             model_path=str(model_dir),
             vllm_bin="/opt/venv/bin/vllm",
+            available_flags={"--host", "--port", "--gpu-memory-utilization"},
         )
         ps = parse_script(text)
         assert ps.engine == "vllm" and ps.engine_declared
         assert ps.model_path == str(model_dir)
         assert ps.health_timeout == 600
-        assert "--disable-log-requests" in ps.args
+        assert ps.args["--gpu-memory-utilization"] == "0.9"
         # No port → unconfigured, matching the llama.cpp skeleton convention
         ok, reason = ps.is_configured()
         assert not ok and "--port" in reason
+
+    def test_optional_flags_filtered_by_manifest(self, tmp_path):
+        """A skeleton must never contain a flag absent from the engine's manifest."""
+        model_dir = tmp_path / "m"
+        model_dir.mkdir()
+        # Manifest without --disable-log-requests (modern vllm builds)
+        text = render_vllm_skeleton_script(
+            display_name="M",
+            model_path=str(model_dir),
+            vllm_bin="/opt/venv/bin/vllm",
+            available_flags={"--host", "--port", "--gpu-memory-utilization"},
+        )
+        assert "--disable-log-requests" not in text
+        assert "--gpu-memory-utilization" in text
+        # Manifest that does have it (older builds) → included
+        text2 = render_vllm_skeleton_script(
+            display_name="M",
+            model_path=str(model_dir),
+            vllm_bin="/opt/venv/bin/vllm",
+            available_flags={"--gpu-memory-utilization", "--disable-log-requests"},
+        )
+        assert "--disable-log-requests" in text2
+
+    def test_no_manifest_emits_no_optional_flags(self, tmp_path):
+        model_dir = tmp_path / "m"
+        model_dir.mkdir()
+        text = render_vllm_skeleton_script(
+            display_name="M",
+            model_path=str(model_dir),
+            vllm_bin="/opt/venv/bin/vllm",
+            available_flags=None,
+        )
+        ps = parse_script(text)
+        assert set(ps.args.keys()) == {"--host"}

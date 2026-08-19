@@ -1808,8 +1808,16 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
             version = get_vllm_version(str(new_path_obj))
             if version is None:
                 raise ValueError(f"Not a working vllm executable (--version failed): {new_path_obj}")
+            # Capture the engine's flag manifest now (its own `serve --help`) —
+            # generated args are only ever drawn from this file.
+            from engine_flags import get_vllm_serve_flags
+            flags = get_vllm_serve_flags(str(new_path_obj), config_manager.project_root / "config")
+            if not flags:
+                raise ValueError(
+                    f"Could not capture the flag manifest from `vllm serve --help` for {new_path_obj}"
+                )
             config_manager.app_config.vllm_binary = str(new_path_obj)
-            logger.info(f"✓ vLLM executable set: {new_path_obj} (version {version})")
+            logger.info(f"✓ vLLM executable set: {new_path_obj} (version {version}, {len(flags)} flags)")
         elif path_type == "models_directory":
             if not new_path_obj.is_dir():
                 raise ValueError(f"Path is not a directory: {new_path}")

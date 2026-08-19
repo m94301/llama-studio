@@ -373,6 +373,7 @@ class ConfigManager:
         # Step 1b: vLLM model discovery — HF-format directories (config.json +
         # safetensors). Only when a vllm executable is configured (doc 21 §1.4).
         if self.app_config.vllm_binary and models_root.exists():
+            vllm_flags = None  # captured lazily, only if a skeleton is needed
             for cfg_file in models_root.rglob("config.json"):
                 model_dir = cfg_file.parent
                 if not any(model_dir.glob("*.safetensors")):
@@ -381,11 +382,19 @@ class ConfigManager:
                 script_path = config_models_dir / f"{model_name}.sh"
                 if script_path.exists() or (config_models_dir / f"{model_name}.sh.old").exists():
                     continue
+                if vllm_flags is None:
+                    # The engine's own `serve --help` is the only source of
+                    # truth for what flags a skeleton may contain.
+                    from engine_flags import get_vllm_serve_flags
+                    vllm_flags = get_vllm_serve_flags(
+                        self.app_config.vllm_binary, self.project_root / "config"
+                    ) or set()
                 try:
                     text = render_vllm_skeleton_script(
                         display_name=self._format_display_name(model_name),
                         model_path=str(model_dir),
                         vllm_bin=self.app_config.vllm_binary,
+                        available_flags=vllm_flags,
                     )
                     script_path.write_text(text)
                     script_path.chmod(0o755)

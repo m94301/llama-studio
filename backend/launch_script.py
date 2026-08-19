@@ -1018,18 +1018,29 @@ def render_skeleton_script(
     )
 
 
+# Optional skeleton args, emitted ONLY when present in the engine's captured
+# flag manifest (engine_flags.get_vllm_serve_flags). Never assume a flag exists.
+_VLLM_SKELETON_CANDIDATES: List[Tuple[str, Optional[str]]] = [
+    ("--gpu-memory-utilization", "0.9"),
+    ("--disable-log-requests", None),  # older builds; newer ones default quiet
+]
+
+
 def render_vllm_skeleton_script(
     *,
     display_name: str,
     model_path: str,
     vllm_bin: str,
+    available_flags: Optional[set] = None,
 ) -> str:
     """Render a skeleton script for a newly-discovered vLLM model directory.
 
     --port is intentionally omitted so the model shows as unconfigured (same
-    convention as llama.cpp skeletons). --disable-log-requests keeps per-request
-    spam out of the tailed log; health_timeout defaults high because vLLM
-    startup (weight load + graph capture) far exceeds llama.cpp's.
+    convention as llama.cpp skeletons). `available_flags` is the flag manifest
+    captured from this executable's own `serve --help`; optional args are
+    filtered against it, and with no manifest (None) none are emitted — a
+    skeleton must never contain a flag the engine wasn't proven to accept.
+    health_timeout defaults high because vLLM startup far exceeds llama.cpp's.
     """
     meta = "\n".join([
         META_BEGIN,
@@ -1038,11 +1049,15 @@ def render_vllm_skeleton_script(
         "# health_timeout: 600",
         META_END,
     ])
+    arg_lines = [f"  --host 0.0.0.0"]
+    if available_flags:
+        for flag, value in _VLLM_SKELETON_CANDIDATES:
+            if flag in available_flags:
+                arg_lines.append(f"  {flag} {value}" if value is not None else f"  {flag}")
+    invocation = f'exec "$VLLM_BIN" serve {shlex.quote(model_path)} \\\n'
+    invocation += " \\\n".join(arg_lines) + "\n"
     return (
         f"#!/usr/bin/env bash\n{meta}\n\n"
         f"VLLM_BIN={shlex.quote(vllm_bin)}\n\n"
-        f'exec "$VLLM_BIN" serve {shlex.quote(model_path)} \\\n'
-        f"  --host 0.0.0.0 \\\n"
-        f"  --gpu-memory-utilization 0.9 \\\n"
-        f"  --disable-log-requests\n"
+        f"{invocation}"
     )
