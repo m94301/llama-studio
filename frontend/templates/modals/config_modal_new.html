@@ -760,17 +760,21 @@ window.openConfigFileBrowser = function(pathType) {
     const currentPath = document.getElementById('llama-path-input').value || '';
     const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}`;
 
+    // The file browser is shared with the Settings modal, so register where this
+    // pick should land instead of redefining the global selectPath — doing that
+    // used to leave Settings permanently broken once a model config was opened.
+    window.filePickerOnSelect = function(path) {
+        document.getElementById('llama-path-input').value = path;
+        document.getElementById('file-browser-modal').classList.add('hidden');
+        window.filePickerOnSelect = null;
+        validateLlamaPath();
+    };
+
     htmx.ajax('GET', url, {
         target: '#file-browser-content',
         swap: 'innerHTML'
     });
     document.getElementById('file-browser-modal').classList.remove('hidden');
-};
-
-window.selectPath = function(path) {
-    document.getElementById('llama-path-input').value = path;
-    document.getElementById('file-browser-modal').classList.add('hidden');
-    validateLlamaPath();
 };
 
 // Run calculation on modal load

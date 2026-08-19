@@ -805,6 +805,7 @@
 
         function openFileBrowser(pathType) {
             filePickerMode = pathType;
+            window.filePickerOnSelect = null;  // this pick belongs to Settings
             const currentPath = currentSettingsPaths[pathType] || '/';
             const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}`;
 
@@ -818,14 +819,31 @@
         function closeFileBrowser() {
             document.getElementById('file-browser-modal').classList.add('hidden');
             filePickerMode = null;
+            window.filePickerOnSelect = null;
         }
 
+        // The file browser is shared between this modal and the per-model config
+        // modal. Whoever opens it registers window.filePickerOnSelect; unset
+        // means the Settings fields are the target.
         function selectPath(path) {
-            // Called by file browser when user selects a path
+            if (typeof window.filePickerOnSelect === 'function') {
+                window.filePickerOnSelect(path);
+                return;
+            }
+            if (!filePickerMode) {
+                console.error('selectPath called with no active picker');
+                closeFileBrowser();
+                return;
+            }
             currentSettingsPaths[filePickerMode] = path;
             // Convert underscores to hyphens for HTML ID (llama_server -> llama-server)
             const displayId = filePickerMode.replace(/_/g, '-') + '-display';
-            document.getElementById(displayId).value = path;
+            const field = document.getElementById(displayId);
+            if (field) {
+                field.value = path;
+            } else {
+                console.error('no settings field for picker mode: ' + filePickerMode);
+            }
             closeFileBrowser();
             // Focus back on settings modal
             document.getElementById('settings-modal').focus();
