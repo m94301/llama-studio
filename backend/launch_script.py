@@ -83,22 +83,26 @@ KNOWN_FLAG_ONLY = {
     "-v",
 }
 
-# Known flag-only (boolean) options for `vllm serve`. vLLM has no short-flag
-# aliases, so FLAG_ALIASES never applies to vllm scripts.
-KNOWN_FLAG_ONLY_VLLM = {
-    "--trust-remote-code",
-    "--enable-auto-tool-choice",
-    "--enforce-eager",
-    "--no-enable-flashinfer-autotune",
-    "--disable-log-requests",
-    "--disable-log-stats",
-    "--enable-prefix-caching",
-    "--no-enable-prefix-caching",
-    "--enable-chunked-prefill",
-    "--enable-expert-parallel",
-    "--disable-frontend-multiprocessing",
-    "--enable-sleep-mode",
-}
+# What `vllm serve` accepts is read from the engine's own --help (see
+# engine_flags.py) and installed here at startup — never hardcoded, because
+# flag sets differ per build. Unset means "no manifest available": the parser
+# then falls back to the next-token heuristic instead of guessing from a list.
+_VLLM_MANIFEST: Optional[Dict[str, dict]] = None
+
+
+def set_vllm_manifest(manifest: Optional[Dict[str, dict]]) -> None:
+    """Install the captured `vllm serve` flag manifest for parsing."""
+    global _VLLM_MANIFEST
+    _VLLM_MANIFEST = manifest
+    if manifest:
+        logger.debug(
+            f"✓ vllm manifest active: {len(manifest.get('flags', {}))} flags, "
+            f"{len(manifest.get('aliases', {}))} aliases"
+        )
+
+
+def get_vllm_manifest() -> Optional[Dict[str, dict]]:
+    return _VLLM_MANIFEST
 
 VALID_ENGINES = ("llamacpp", "vllm")
 
@@ -622,11 +626,17 @@ def _vllm_arg_tokens_to_dict(
 ) -> Tuple[Dict[str, Optional[str]], Optional[str]]:
     """Walk `vllm serve` arg tokens (after 'serve') into a dict.
 
-    The model is the positional token before any flag. vLLM has no short-flag
-    aliases. Multi-value flags (nargs+, e.g. --served-model-name a b c)
-    accumulate trailing non-flag tokens onto the last flag, space-joined.
-    $VAR references in values are resolved against script-body assignments.
+    The model is the positional token before any flag. Whether a flag takes a
+    value, and how short forms (-tp, -pp, -sc) map to their long names, come
+    from the captured manifest; without one we fall back to the same next-token
+    heuristic llama.cpp parsing uses. Multi-value flags (nargs+, e.g.
+    --served-model-name a b c) accumulate trailing non-flag tokens onto the
+    last flag, space-joined. $VAR references are resolved against the body.
     """
+    manifest = _VLLM_MANIFEST or {}
+    known_flags: Dict[str, dict] = manifest.get("flags", {})
+    aliases: Dict[str, str] = manifest.get("aliases", {})
+
     args: Dict[str, Optional[str]] = {}
     model_path: Optional[str] = None
     last_flag: Optional[str] = None
@@ -645,25 +655,33 @@ def _vllm_arg_tokens_to_dict(
             i += 1
             continue
 
-        # Flag-only vs takes-a-value (same next-token heuristic as llama.cpp)
-        is_flag_only = tok in KNOWN_FLAG_ONLY_VLLM
-        if not is_flag_only:
-            if i + 1 >= len(tokens):
-                is_flag_only = True
-            else:
-                nxt = tokens[i + 1]
-                if nxt.startswith("--") or (
-                    len(nxt) >= 2 and nxt[0] == "-" and nxt[1].isalpha()
-                ):
-                    is_flag_only = True
+        # Normalize short forms (-tp → --tensor-parallel-size) so downstream
+        # lookups like gpu_count see one canonical key.
+        canonical = aliases.get(tok, tok)
+        next_tok = tokens[i + 1] if i + 1 < len(tokens) else None
+        next_is_flag = next_tok is not None and (
+            next_tok.startswith("--")
+            or (len(next_tok) >= 2 and next_tok[0] == "-" and next_tok[1].isalpha())
+        )
 
-        if is_flag_only:
-            args[tok] = None
+        spec = known_flags.get(canonical) or known_flags.get(tok)
+        if spec is not None:
+            takes_value = spec.get("takes_value", False)
+            if takes_value and (next_tok is None or next_is_flag):
+                warnings.append(f"{tok} expects a value but none was given")
+                takes_value = False
+        else:
+            if known_flags:
+                warnings.append(f"unknown vllm option: {tok}")
+            takes_value = next_tok is not None and not next_is_flag
+
+        if not takes_value:
+            args[canonical] = None
             last_flag = None  # boolean flags never accumulate values
             i += 1
         else:
-            args[tok] = resolve_var_refs(tokens[i + 1], full_text, warnings)
-            last_flag = tok
+            args[canonical] = resolve_var_refs(tokens[i + 1], full_text, warnings)
+            last_flag = canonical
             i += 2
 
     return args, model_path

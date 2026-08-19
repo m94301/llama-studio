@@ -23,7 +23,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from config_manager import ConfigManager, ModelConfig, calculate_kv_cache_gb
-from launch_script import parse_pasted_script
+from engine_flags import get_vllm_manifest
+from launch_script import parse_pasted_script, set_vllm_manifest
 import migrate_configs
 from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
@@ -107,6 +108,21 @@ async def lifespan(app: FastAPI):
         await config_manager.load_app_config()
         # Load or detect llama-server schema BEFORE model scanning
         await ensure_schema_for_binary(config_manager.app_config.llama_server_binary, config_manager, update_global=True)
+
+        # Install the vllm flag manifest before scanning too: it decides which
+        # `vllm serve` flags take values and how -tp/-pp normalize, so parsing
+        # is wrong without it. Cached after first capture, so this is cheap.
+        if config_manager.app_config.vllm_binary:
+            manifest = await asyncio.to_thread(
+                get_vllm_manifest,
+                config_manager.app_config.vllm_binary,
+                PROJECT_ROOT / "config",
+            )
+            set_vllm_manifest(manifest)
+            if manifest:
+                logger.info(f"✓ vLLM manifest: {len(manifest['flags'])} flags for v{manifest['version']}")
+            else:
+                logger.warning("⚠ No vLLM flag manifest — vllm scripts will parse heuristically")
 
         # Hard-block on legacy JSON configs — they must be migrated to shell scripts.
         if migrate_configs.has_legacy_configs(PROJECT_ROOT):
@@ -1833,15 +1849,20 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
             if version is None:
                 raise ValueError(f"Not a working vllm executable (--version failed): {new_path_obj}")
             # Capture the engine's flag manifest now (its own `serve --help`) —
-            # generated args are only ever drawn from this file.
-            from engine_flags import get_vllm_serve_flags
-            flags = get_vllm_serve_flags(str(new_path_obj), config_manager.project_root / "config")
-            if not flags:
+            # both generated args and arg parsing are drawn only from this.
+            manifest = await asyncio.to_thread(
+                get_vllm_manifest, str(new_path_obj), config_manager.project_root / "config"
+            )
+            if not manifest:
                 raise ValueError(
                     f"Could not capture the flag manifest from `vllm serve --help` for {new_path_obj}"
                 )
+            set_vllm_manifest(manifest)
             config_manager.app_config.vllm_binary = str(new_path_obj)
-            logger.info(f"✓ vLLM executable set: {new_path_obj} (version {version}, {len(flags)} flags)")
+            logger.info(
+                f"✓ vLLM executable set: {new_path_obj} "
+                f"(version {version}, {len(manifest['flags'])} flags)"
+            )
         elif path_type == "models_directory":
             if not new_path_obj.is_dir():
                 raise ValueError(f"Path is not a directory: {new_path}")
