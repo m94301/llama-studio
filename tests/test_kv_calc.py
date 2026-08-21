@@ -282,3 +282,41 @@ class TestPerGpuKvSemantics:
             weights_gb=155.4, overhead_gb=1.5, headroom=1.2, gpu_count=4,
         )
         assert abs(back - 262144) <= CONTEXT_GRANULARITY
+
+
+class TestMeasuredLoadProfile:
+    """Pipeline ranks are not equal — vLLM's own log showed 37.07 / 37.09 /
+    38.30 / 46.19 GiB on a 4-card DSV4. Predicting against the average
+    under-shot the card that actually decides the fit by ~9 GiB."""
+
+    LOG = """
+    (Worker_PP0) INFO Model loading took 37.07 GiB and 60 seconds
+    (Worker_PP1) INFO Model loading took 37.09 GiB and 61 seconds
+    (Worker_PP2) INFO Model loading took 38.30 GiB and 59 seconds
+    (Worker_PP3) INFO Model loading took 46.19 GiB and 62 seconds
+    """
+
+    def test_reads_the_heaviest_rank(self):
+        from kv_calc import heaviest_rank_weights_from_log
+        assert heaviest_rank_weights_from_log(self.LOG) == 46.19
+
+    def test_none_without_the_lines(self):
+        from kv_calc import heaviest_rank_weights_from_log
+        assert heaviest_rank_weights_from_log("nothing here") is None
+
+    def test_measured_weights_override_the_even_split(self):
+        args = dict(context_length=1048576, concurrency=1, bytes_per_token=2252,
+                    weights_gb=155.4, overhead_gb=4.01, headroom=1.2, gpu_count=4)
+        even, _ = vram_gb_for(**args)
+        measured, _ = vram_gb_for(**args, weights_per_gpu_gb=46.19)
+        assert even == pytest.approx(45.5, abs=0.5)      # 155.4/4 + 4.01 + 2.64
+        assert measured == pytest.approx(52.84, abs=0.1)  # heaviest rank
+        assert measured > even
+
+    def test_inverse_uses_the_measured_share_too(self):
+        common = dict(concurrency=1, bytes_per_token=2252, weights_gb=155.4,
+                      overhead_gb=4.01, headroom=1.2, gpu_count=4,
+                      weights_per_gpu_gb=46.19)
+        per_gpu, _ = vram_gb_for(context_length=1048576, **common)
+        back = context_for_vram(vram_gb=per_gpu, **common)
+        assert abs(back - 1048576) <= CONTEXT_GRANULARITY

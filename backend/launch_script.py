@@ -150,6 +150,11 @@ class ParsedScript:
     # config.json, calibrated from a real load's log), not a setting — the same
     # category as kv_cache_multiplier. Settings live in the args, never here.
     kv_bytes_per_token: Optional[int] = None
+    # Heaviest rank's weight footprint, and the runtime overhead observed on that
+    # rank. Both measured from a real load — pipeline ranks are not equal, and
+    # the heaviest one decides whether a placement fits.
+    weights_max_gb: Optional[float] = None
+    runtime_overhead_gb: Optional[float] = None
     # VLLM_PP_LAYER_PARTITION assignment from the body, parsed to ints.
     pp_layer_partition: Optional[List[int]] = None
 
@@ -613,6 +618,13 @@ def parse_script(text: str) -> ParsedScript:
             ps.engine_declared = True
         elif eng:
             ps.warnings.append(f"meta engine={eng!r} is not one of {VALID_ENGINES}; treating as llamacpp")
+        for fname in ("weights_max_gb", "runtime_overhead_gb"):
+            fv = meta.get(fname)
+            if fv is not None and fv != "":
+                try:
+                    setattr(ps, fname, float(fv))
+                except ValueError:
+                    ps.warnings.append(f"meta {fname}={fv!r} is not a number")
         kvb = meta.get("kv_bytes_per_token")
         if kvb is not None and kvb != "":
             try:
@@ -975,8 +987,8 @@ def _render_invocation(llama_bin: str, model_path: Optional[str], args: Dict[str
 
 def _render_meta_line(key: str, value) -> str:
     """Render one `# key: value` meta line."""
-    if key == "vram_gb":
-        return f"# vram_gb: {float(value):g}"
+    if key in ("vram_gb", "weights_max_gb", "runtime_overhead_gb"):
+        return f"# {key}: {float(value):g}"
     return f"# {key}: {value}"
 
 
@@ -991,6 +1003,8 @@ def patch_meta_fence(
     engine=_UNSET,
     vram_gb=_UNSET,
     kv_bytes_per_token=_UNSET,
+    weights_max_gb=_UNSET,
+    runtime_overhead_gb=_UNSET,
 ) -> str:
     """Merge the given fields into the meta fence, preserving everything else.
 
@@ -1013,6 +1027,8 @@ def patch_meta_fence(
         "kv_cache_multiplier": kv_cache_multiplier,
         "health_timeout": health_timeout,
         "kv_bytes_per_token": kv_bytes_per_token,
+        "weights_max_gb": weights_max_gb,
+        "runtime_overhead_gb": runtime_overhead_gb,
     }
     updates = {k: v for k, v in updates.items() if v is not _UNSET}
     # An empty string display_name behaves like a delete (legacy callers pass "").
@@ -1045,6 +1061,7 @@ def patch_meta_fence(
 
     # Append fields that weren't already present, in canonical order.
     for key in ("display_name", "engine", "vram_gb", "kv_bytes_per_token",
+                "weights_max_gb", "runtime_overhead_gb",
                 "block_count", "max_context", "kv_cache_multiplier", "health_timeout"):
         if key in updates and key not in seen and updates[key] is not None:
             out.append(_render_meta_line(key, updates[key]))

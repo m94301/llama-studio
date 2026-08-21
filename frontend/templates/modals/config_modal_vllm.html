@@ -222,6 +222,7 @@ window.V = {
     kvBudget: {{ kv_cache_memory_bytes | tojson }},
     headroom: {{ kv_headroom }},
     gpuCapacity: {{ gpu_capacity }},
+    weightsPerGpu: {{ weights_per_gpu_gb }},
     utilSafety: 1.05,
     utilMax: 0.98,
 };
@@ -243,13 +244,16 @@ function vRecalc() {
     const tokens = Math.floor(ctx * c * window.V.headroom);
     const kvGb = tokens * bpt / GIB;          // per GPU — vLLM's budget is per GPU
     const gpus = Math.max(1, window.V.gpuCount);
-    const total = window.V.weightsGb / gpus + window.V.overheadGb + kvGb;
+    // Measured heaviest-rank weights when a load has supplied them; ranks are
+    // not equal and the heaviest decides the fit.
+    const wShare = window.V.weightsPerGpu || (window.V.weightsGb / gpus);
+    const total = wShare + window.V.overheadGb + kvGb;
     const pad = Math.round((window.V.headroom - 1) * 100);
     derived.innerHTML = `${ctx.toLocaleString()} × ${c}`
         + (pad ? ` + ${pad}% headroom` : '')
         + ` = <b class="text-gray-200">${tokens.toLocaleString()} tokens</b>`;
     document.getElementById('v-vram').value = total.toFixed(2);
-    note.textContent = `per GPU: weights ${(window.V.weightsGb / gpus).toFixed(2)} `
+    note.textContent = `per GPU: weights ${wShare.toFixed(2)}${window.V.weightsPerGpu ? ' (measured)' : ''} `
         + `+ overhead ${window.V.overheadGb} + KV ${kvGb.toFixed(2)} GB`
         + ` · ${bpt.toLocaleString()} bytes/token (${window.V.bptSource})`
         + (gpus > 1 ? ` · ${gpus} GPUs, ${(total * gpus).toFixed(1)} GB total` : '');
@@ -290,7 +294,8 @@ function vOnVram(vramGb) {
     const bpt = window.V.bytesPerToken;
     if (!bpt) return;
     const available = parseFloat(vramGb)
-        - window.V.weightsGb / Math.max(1, window.V.gpuCount) - window.V.overheadGb;
+        - (window.V.weightsPerGpu || window.V.weightsGb / Math.max(1, window.V.gpuCount))
+        - window.V.overheadGb;
     if (!(available > 0)) { vOnSlider(256); return; }
     let ctx = Math.floor(available * GIB / bpt / vConc() / window.V.headroom);
     ctx = Math.floor(ctx / 256) * 256;
@@ -381,8 +386,8 @@ function vUtilization() {
     if (!cap || !window.V.bytesPerToken) return null;
     const tokens = Math.floor(vCtx() * vConc() * window.V.headroom);
     const gpus = Math.max(1, window.V.gpuCount);
-    const perGpu = window.V.weightsGb / gpus + window.V.overheadGb
-                   + tokens * window.V.bytesPerToken / GIB;
+    const perGpu = (window.V.weightsPerGpu || window.V.weightsGb / gpus)
+                   + window.V.overheadGb + tokens * window.V.bytesPerToken / GIB;
     const util = Math.ceil(perGpu * window.V.utilSafety / cap * 1000) / 1000;
     return Math.min(window.V.utilMax, Math.max(0.001, util));
 }

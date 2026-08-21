@@ -907,6 +907,10 @@ async def config_modal_new(model: str):
                     context_length=initial_ctx, concurrency=initial_conc,
                     bytes_per_token=bpt, weights_gb=model_config.size_gb or 0,
                     headroom=DEFAULT_KV_HEADROOM, gpu_count=model_config.gpu_count,
+                    overhead_gb=(model_config.parsed.runtime_overhead_gb
+                                 if model_config.parsed.runtime_overhead_gb is not None
+                                 else DEFAULT_OVERHEAD_GB),
+                    weights_per_gpu_gb=model_config.parsed.weights_max_gb,
                 )
 
             template = jinja_env.get_template("modals/config_modal_vllm.html")
@@ -935,7 +939,10 @@ async def config_modal_new(model: str):
                 bytes_per_token=bpt or 0,
                 bytes_per_token_source=bpt_source,
                 weights_gb=model_config.size_gb or 0,
-                overhead_gb=DEFAULT_OVERHEAD_GB,
+                overhead_gb=(model_config.parsed.runtime_overhead_gb
+                             if model_config.parsed.runtime_overhead_gb is not None
+                             else DEFAULT_OVERHEAD_GB),
+                weights_per_gpu_gb=model_config.parsed.weights_max_gb or 0,
                 kv_headroom=DEFAULT_KV_HEADROOM,
                 env_assignments=model_config.parsed.env_assignments,
                 pp_size=model_config.parsed.pipeline_parallel_size,
@@ -1768,17 +1775,24 @@ async def calculate_vllm_vram(
         }, status_code=422)
 
     weights = mc.size_gb or 0.0
+    # Measured figures from a real load beat the even-split assumption.
+    weights_per_gpu = mc.parsed.weights_max_gb
+    overhead = mc.parsed.runtime_overhead_gb
+    if overhead is None:
+        overhead = DEFAULT_OVERHEAD_GB
     concurrency = max(1, concurrency)
     if solve_for == "context":
         ctx = context_for_vram(
             vram_gb=vram_gb, concurrency=concurrency, bytes_per_token=bpt,
             weights_gb=weights, max_context=mc.max_context,
             headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
+            overhead_gb=overhead, weights_per_gpu_gb=weights_per_gpu,
         )
         total, tokens = vram_gb_for(
             context_length=ctx, concurrency=concurrency,
             bytes_per_token=bpt, weights_gb=weights,
             headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
+            overhead_gb=overhead, weights_per_gpu_gb=weights_per_gpu,
         )
     else:
         ctx = max(0, context_length)
@@ -1786,6 +1800,7 @@ async def calculate_vllm_vram(
             context_length=ctx, concurrency=concurrency,
             bytes_per_token=bpt, weights_gb=weights,
             headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
+            overhead_gb=overhead, weights_per_gpu_gb=weights_per_gpu,
         )
 
     return JSONResponse({
@@ -1795,7 +1810,9 @@ async def calculate_vllm_vram(
         "bytes_per_token": bpt,
         "bytes_per_token_source": source,
         "weights_gb": round(weights, 2),
-        "overhead_gb": DEFAULT_OVERHEAD_GB,
+        "overhead_gb": overhead,
+        "weights_per_gpu_gb": weights_per_gpu,
+        "measured": bool(weights_per_gpu),
         "headroom": DEFAULT_KV_HEADROOM,
         "kv_gb": round(tokens * bpt / GIB, 2),
         "per_gpu_gb": total,

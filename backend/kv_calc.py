@@ -118,6 +118,18 @@ def bytes_per_token_from_config(model_dir: str, kv_cache_dtype: Optional[str] = 
     return int(2 * layers * kv_heads * head_dim * per_element)
 
 
+# Pipeline parallelism does not split weights evenly — one rank also carries the
+# embeddings and LM head. vLLM prints each rank's share, and the heaviest decides
+# whether a placement fits.
+_WEIGHTS_RE = re.compile(r"Model loading took ([\d.]+) GiB")
+
+
+def heaviest_rank_weights_from_log(log_text: str) -> Optional[float]:
+    """Largest per-rank weight footprint reported by a successful load."""
+    values = [float(v) for v in _WEIGHTS_RE.findall(log_text)]
+    return round(max(values), 2) if values else None
+
+
 # vLLM reports both numbers during startup; their ratio is the exact figure.
 _KV_MEM_RE = re.compile(r"Available KV cache memory:\s*([\d.]+)\s*GiB")
 _KV_TOK_RE = re.compile(r"GPU KV cache size:\s*([\d,]+)\s*tokens")
@@ -194,6 +206,7 @@ def vram_gb_for(
     overhead_gb: float = DEFAULT_OVERHEAD_GB,
     headroom: float = 1.0,
     gpu_count: int = 1,
+    weights_per_gpu_gb: Optional[float] = None,
 ) -> Tuple[float, int]:
     """Forward solve: (VRAM per GPU in GB, pool tokens) for a context/concurrency pair.
 
@@ -205,7 +218,11 @@ def vram_gb_for(
     """
     tokens = pool_tokens(context_length, concurrency, headroom)
     gpus = max(1, gpu_count)
-    per_gpu = weights_gb / gpus + overhead_gb + kv_gb(tokens, bytes_per_token)
+    # A measured heaviest-rank figure beats dividing evenly: on a 4-card DSV4 the
+    # ranks carried 37.07 / 37.09 / 38.30 / 46.19 GiB, so the even split
+    # under-predicted the card that actually decides the fit by ~9 GiB.
+    weights_share = weights_per_gpu_gb if weights_per_gpu_gb else weights_gb / gpus
+    per_gpu = weights_share + overhead_gb + kv_gb(tokens, bytes_per_token)
     return round(per_gpu, 2), tokens
 
 
@@ -218,6 +235,7 @@ def context_for_vram(
     overhead_gb: float = DEFAULT_OVERHEAD_GB,
     headroom: float = 1.0,
     gpu_count: int = 1,
+    weights_per_gpu_gb: Optional[float] = None,
     max_context: Optional[int] = None,
     granularity: int = CONTEXT_GRANULARITY,
 ) -> int:
@@ -227,7 +245,8 @@ def context_for_vram(
     to `max_context` when the model's trained length is known. Returns 0 when
     the budget cannot even cover weights + overhead.
     """
-    available = vram_gb - weights_gb / max(1, gpu_count) - overhead_gb
+    weights_share = weights_per_gpu_gb if weights_per_gpu_gb else weights_gb / max(1, gpu_count)
+    available = vram_gb - weights_share - overhead_gb
     if available <= 0 or bytes_per_token <= 0:
         return 0
     tokens = int(available * GIB / bytes_per_token / max(1.0, headroom))

@@ -505,6 +505,14 @@ class GpuManager:
                 on_spawn=self._registry_sync,
             )
 
+            # Baseline the target GPUs so the post-load sample measures *this*
+            # model rather than whatever else is resident on the card.
+            baseline = {}
+            if PYNVML_AVAILABLE and self.gpus:
+                for gid in gpu_ids:
+                    if gid in self.gpus:
+                        baseline[gid] = self.gpus[gid].mem_used_gb
+
             # Store session BEFORE start() so cancel_load can find it
             self.sessions[model_name] = session
 
@@ -535,8 +543,20 @@ class GpuManager:
             if model_config.engine == "vllm":
                 try:
                     await asyncio.to_thread(self.config.calibrate_kv_bytes_per_token, model_name)
+                    # Peak on the heaviest card, net of what was already there.
+                    peak = None
+                    if baseline:
+                        await asyncio.sleep(2)  # let allocation settle
+                        deltas = []
+                        for gid, before in baseline.items():
+                            if gid in self.gpus:
+                                deltas.append(max(0.0, self.gpus[gid].mem_used_gb - before))
+                        peak = round(max(deltas), 2) if deltas else None
+                    await asyncio.to_thread(
+                        self.config.calibrate_load_profile, model_name, peak
+                    )
                 except Exception as e:
-                    logger.debug(f"   KV calibration skipped for {model_name}: {e}")
+                    logger.debug(f"   Load calibration skipped for {model_name}: {e}")
 
             # Mark as running
             await self._set_model_state(model_name, ModelState.RUNNING, LoadingPhase.RUNNING)

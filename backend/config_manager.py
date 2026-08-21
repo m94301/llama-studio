@@ -214,8 +214,14 @@ class ModelConfig:
             return round(gate, 2)
         from kv_calc import DEFAULT_OVERHEAD_GB, GIB
         per_gpu = max(1, self.gpu_count)
+        # Measured figures win where a real load has provided them: ranks are not
+        # equal, and the heaviest one decides whether a placement fits.
+        weights_share = self.parsed.weights_max_gb or (self.size_gb or 0.0) / per_gpu
+        overhead = self.parsed.runtime_overhead_gb
+        if overhead is None:
+            overhead = DEFAULT_OVERHEAD_GB
         # --kv-cache-memory-bytes is per GPU; only the weights divide.
-        usage = (self.size_gb or 0.0) / per_gpu + DEFAULT_OVERHEAD_GB + budget / GIB
+        usage = weights_share + overhead + budget / GIB
         # --gpu-memory-utilization is a startup gate as well as a sizing knob:
         # vLLM refuses to launch unless `free >= util × capacity`, however little
         # it then uses. Requiring only the predicted usage would green-light loads
@@ -669,6 +675,46 @@ class ConfigManager:
         mc.is_configured = ok
         mc.config_error = reason
         return mc
+
+    def calibrate_load_profile(self, model_name: str, peak_per_gpu_gb: Optional[float] = None) -> None:
+        """Record what a successful load actually cost, for the next prediction.
+
+        Two figures the even-split model cannot know: the heaviest pipeline
+        rank's weight share (vLLM prints one line per rank) and the runtime
+        overhead on that rank, derived from the measured peak minus weights and
+        the KV budget we asked for.
+        """
+        from kv_calc import GIB, heaviest_rank_weights_from_log
+
+        mc = self.models.get(model_name)
+        if mc is None or mc.engine != "vllm":
+            return
+        try:
+            log_text = self.get_log_path(model_name).read_text(errors="replace")
+        except Exception:
+            return
+
+        weights_max = heaviest_rank_weights_from_log(log_text)
+        overhead = None
+        if peak_per_gpu_gb and weights_max:
+            budget_gb = (mc.kv_cache_memory_bytes or 0) / GIB
+            overhead = round(max(0.0, peak_per_gpu_gb - weights_max - budget_gb), 2)
+
+        updates = {}
+        if weights_max and weights_max != mc.parsed.weights_max_gb:
+            updates["weights_max_gb"] = weights_max
+        if overhead is not None and overhead != mc.parsed.runtime_overhead_gb:
+            updates["runtime_overhead_gb"] = overhead
+        if not updates:
+            return
+        try:
+            script_path = self.get_script_path(model_name)
+            new_text = patch_meta_fence(script_path.read_text(), **updates)
+            if write_script_atomic(script_path, new_text):
+                logger.info(f"   Load profile for {model_name}: {updates}")
+            self.rescan_model(model_name)
+        except Exception as e:
+            logger.warning(f"⚠ Could not store load profile for {model_name}: {e}")
 
     def calibrate_kv_bytes_per_token(self, model_name: str) -> Optional[int]:
         """Read the exact KV bytes/token back from a successful load's log.
