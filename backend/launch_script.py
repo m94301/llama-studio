@@ -709,14 +709,6 @@ def parse_script(text: str) -> ParsedScript:
 
     ps.env_assignments = extract_assignments(text)
 
-    if ps.engine == "vllm":
-        stale_from = ps.load_profile["stale_from"]
-        if stale_from:
-            ps.warnings.append(
-                f"VRAM measurements were taken with {stale_from}; this config has "
-                f"changed, so they are ignored until the model is loaded again "
-                f"and re-measured"
-            )
 
     # vLLM uneven pipeline split (env var, preserved as preamble — doc 21 §4).
     raw_part = _lookup_assignment("VLLM_PP_LAYER_PARTITION", text)
@@ -734,6 +726,17 @@ def parse_script(text: str) -> ParsedScript:
             ps.warnings.append(
                 f"VLLM_PP_LAYER_PARTITION has {len(ps.pp_layer_partition)} entries but "
                 f"--pipeline-parallel-size is {ps.pipeline_parallel_size} (vLLM will refuse to start)"
+            )
+
+    # Only now is pp_layer_partition populated, so the staleness comparison
+    # against calibrated_partition is meaningful.
+    if ps.engine == "vllm":
+        stale_from = ps.load_profile["stale_from"]
+        if stale_from:
+            ps.warnings.append(
+                f"VRAM measurements were taken with {stale_from}; this config has "
+                f"changed, so they are ignored until the model is loaded again "
+                f"and re-measured"
             )
 
     return ps

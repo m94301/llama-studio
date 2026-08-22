@@ -382,3 +382,35 @@ class TestCvdWithTrailingComment:
             "export CUDA_VISIBLE_DEVICES=2,3   # the big cards",
         )
         assert parse_script(text).cuda_visible_devices == [2, 3]
+
+
+class TestStalenessOrdering:
+    """The staleness check must run after pp_layer_partition is parsed.
+
+    It originally sat before that, so it compared calibrated_partition against
+    an empty string and reported a split change on every unchanged script.
+    """
+
+    def _script(self, tmp_path, partition="15,16,12", calibrated="15,16,12"):
+        d = tmp_path / "m"; d.mkdir(exist_ok=True)
+        return (
+            f"#!/usr/bin/env bash\n{META_BEGIN}\n# engine: vllm\n"
+            f"# weights_max_gb: 53.76\n# calibrated_gpus: 3\n"
+            f"# calibrated_partition: {calibrated}\n{META_END}\n"
+            f"export VLLM_PP_LAYER_PARTITION={partition}\n"
+            f"exec /opt/venv/bin/vllm serve {d} --host 0.0.0.0 --port 8000 "
+            f"--pipeline-parallel-size 3 --max-model-len 4096 --max-num-seqs 1 "
+            f"--kv-cache-memory-bytes 1000\n"
+        )
+
+    def test_matching_partition_is_not_stale(self, tmp_path):
+        ps = parse_script(self._script(tmp_path))
+        assert ps.load_profile["stale_from"] is None
+        assert ps.load_profile["weights_max_gb"] == 53.76
+        assert not [w for w in ps.warnings if "measurements" in w]
+
+    def test_changed_partition_is_stale(self, tmp_path):
+        ps = parse_script(self._script(tmp_path, partition="16,16,11"))
+        assert ps.load_profile["stale_from"] == "layer split 15,16,12"
+        assert ps.load_profile["weights_max_gb"] is None
+        assert any("re-measured" in w for w in ps.warnings)
