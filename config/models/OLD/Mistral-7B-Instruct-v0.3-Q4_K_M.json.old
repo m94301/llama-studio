@@ -1,0 +1,21 @@
+{
+  "name": "Mistral-7B-Instruct-v0.3-Q4_K_M",
+  "display_name": "Mistral 7b Instruct V0.3 Q4 K M",
+  "model_path": "/home/m6/models/drive1/lmstudio-community/Mistral-7B-Instruct-v0.3-GGUF/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+  "llama_path": "default",
+  "block_count": 32,
+  "max_context": 32768,
+  "kv_cache_multiplier": 1024,
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8001",
+    "--ctx-size": "32768",
+    "--cache-type-k": "q8_0",
+    "--cache-type-v": "q8_0",
+    "--batch-size": "512",
+    "--ubatch-size": "512",
+    "--threads": "12",
+    "--no-mmap": null,
+    "--direct-io": null
+  }
+}

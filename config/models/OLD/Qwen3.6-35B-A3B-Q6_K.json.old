@@ -1,0 +1,19 @@
+{
+  "name": "Qwen3.6-35B-A3B-Q6_K",
+  "display_name": "Qwen3.6 35b A3b Q6 K",
+  "model_path": "/home/m6/models/drive1/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q6_K.gguf",
+  "llama_path": "default",
+  "block_count": 40,
+  "max_context": 262144,
+  "kv_cache_multiplier": 102,
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8151",
+    "--ctx-size": "262144",
+    "--cache-type-k": "q8_0",
+    "--cache-type-v": "q8_0",
+    "--gpu-layers": "999",
+    "--batch-size": "512",
+    "--threads": "12"
+  }
+}

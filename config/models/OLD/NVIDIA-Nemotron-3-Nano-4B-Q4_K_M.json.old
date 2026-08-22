@@ -1,0 +1,19 @@
+{
+  "name": "NVIDIA-Nemotron-3-Nano-4B-Q4_K_M",
+  "display_name": "Nvidia Nemotron 3 Nano 4b Q4 K M",
+  "model_path": "/home/m6/models/drive1/lmstudio-community/NVIDIA-Nemotron-3-Nano-4B-GGUF/NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf",
+  "llama_path": "default",
+  "block_count": 42,
+  "max_context": 1048576,
+  "kv_cache_multiplier": 597,
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8003",
+    "--ctx-size": "30208",
+    "--cache-type-k": "q8_0",
+    "--cache-type-v": "q8_0",
+    "--gpu-layers": "999",
+    "--batch-size": "512",
+    "--threads": "12"
+  }
+}

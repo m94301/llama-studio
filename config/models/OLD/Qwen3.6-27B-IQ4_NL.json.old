@@ -1,0 +1,28 @@
+{
+  "name": "Qwen3.6-27B-IQ4_NL",
+  "display_name": "46t 262k unsloth Qwen3.6 27b Iq4 Nl",
+  "model_path": "/home/m6/models/drive1/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-IQ4_NL.gguf",
+  "block_count": 65,
+  "max_context": 262144,
+  "kv_cache_multiplier": 209,
+  "llama_path": "default",
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8200",
+    "--ctx-size": "262144",
+    "--cache-type-k": "q8_0",
+    "--cache-type-v": "q8_0",
+    "--gpu-layers": "999",
+    "--batch-size": "2048",
+    "--threads": "1",
+    "--spec-type": "draft-mtp",
+    "--spec-draft-n-max": "3",
+    "--draft-p-min": "0.75",
+    "--parallel": "1",
+    "--no-mmap": null,
+    "-dio": null,
+    "--jinja": null,
+    "--chat-template-file": "/home/m6/projects/llama_studio/templates/chat_template.jinja",
+    "--fit": "off"
+  }
+}

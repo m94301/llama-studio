@@ -1,0 +1,20 @@
+{
+  "name": "gpt-oss-20b-MXFP4",
+  "display_name": "Gpt Oss 20b Mxfp4",
+  "model_path": "/home/m6/models/drive1/lmstudio-community/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf",
+  "llama_path": "default",
+  "block_count": 24,
+  "max_context": 131072,
+  "kv_cache_multiplier": 360,
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": 8104,
+    "--gpu-layers": "999",
+    "--ctx-size": "131072",
+    "--cache-type-k": "f16",
+    "--cache-type-v": "f16",
+    "--batch-size": "4096",
+    "--threads": "12",
+    "--ubatch-size": "4096"
+  }
+}

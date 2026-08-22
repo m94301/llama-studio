@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# === llama-studio:meta BEGIN ===
+# display_name: Gemma 4 31b It Qat Q4 0
+# block_count: 60
+# max_context: 262144
+# kv_cache_multiplier: 511
+# === llama-studio:meta END ===
+LLAMA_BIN=/home/m6/projects/llama.cpp/build-cuda-avx1/bin/llama-server
+export CUDA_VISIBLE_DEVICES=2
+
+exec "$LLAMA_BIN" \
+  -m /home/m6/models/drive1/lmstudio-community/gemma-4-31B-it-QAT-GGUF/gemma-4-31B-it-QAT-Q4_0.gguf \
+  --host 0.0.0.0 \
+  --port 8500 \
+  --ctx-size 249344 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --gpu-layers 999 \
+  --batch-size 512 \
+  --threads 12 \
+  -dio \
+  --no-mmap

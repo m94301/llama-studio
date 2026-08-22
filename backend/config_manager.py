@@ -707,8 +707,12 @@ class ConfigManager:
         if overhead is not None and overhead != mc.parsed.runtime_overhead_gb:
             updates["runtime_overhead_gb"] = overhead
         # Stamp the topology so the figures are discarded if it changes.
-        if updates and mc.parsed.calibrated_gpus != mc.gpu_count:
-            updates["calibrated_gpus"] = mc.gpu_count
+        if updates:
+            part = ",".join(str(n) for n in (mc.parsed.pp_layer_partition or []))
+            if mc.parsed.calibrated_gpus != mc.gpu_count:
+                updates["calibrated_gpus"] = mc.gpu_count
+            if (mc.parsed.calibrated_partition or "") != part:
+                updates["calibrated_partition"] = part or None
         if not updates:
             return
         try:

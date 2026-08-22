@@ -1,0 +1,26 @@
+{
+  "name": "Qwen3.6-35B-A3B-UD-IQ4_NL",
+  "display_name": "101t 262k unsloth Qwen3.6 35b A3b Ud Iq4 Nl",
+  "model_path": "/home/m6/models/drive1/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf",
+  "block_count": 41,
+  "max_context": 262144,
+  "kv_cache_multiplier": 99,
+  "llama_path": "default",
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8300",
+    "--ctx-size": "262144",
+    "--cache-type-k": "f16",
+    "--cache-type-v": "f16",
+    "--gpu-layers": "999",
+    "--batch-size": "2048",
+    "--threads": "1",
+    "--spec-type": "draft-mtp",
+    "--spec-draft-n-max": "3",
+    "--draft-p-min": "0.75",
+    "--parallel": "1",
+    "--no-mmap": null,
+    "-dio": null,
+    "-fit": "off"
+  }
+}

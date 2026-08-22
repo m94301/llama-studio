@@ -1,0 +1,19 @@
+{
+  "name": "Mistral-Nemo-Instruct-2407-Q4_K_M",
+  "display_name": "Mistral Nemo Instruct 2407 Q4 K M",
+  "model_path": "/home/m6/models/drive1/lmstudio-community/Mistral-Nemo-Instruct-2407-GGUF/Mistral-Nemo-Instruct-2407-Q4_K_M.gguf",
+  "llama_path": "default",
+  "block_count": 40,
+  "max_context": 1024000,
+  "kv_cache_multiplier": 1280,
+  "launch_args": {
+    "--host": "0000",
+    "--port": "8012",
+    "--ctx-size": "203264",
+    "--cache-type-k": "q8_0",
+    "--cache-type-v": "q8_0",
+    "--gpu-layers": "999",
+    "--batch-size": "512",
+    "--threads": "12"
+  }
+}

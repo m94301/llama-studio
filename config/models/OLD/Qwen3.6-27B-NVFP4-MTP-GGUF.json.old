@@ -1,0 +1,18 @@
+{
+  "name": "Qwen3.6-27B-NVFP4-MTP-GGUF",
+  "display_name": "Qwen3.6 27b Nvfp4 Mtp Gguf",
+  "model_path": "/home/m6/models/drive1/michaelw9999/Qwen3.6-27B-NVFP4-MTP-GGUF/Qwen3.6-27B-NVFP4-MTP-GGUF.gguf",
+  "block_count": 65,
+  "max_context": 262144,
+  "kv_cache_multiplier": 209,
+  "launch_args": {
+    "--host": null,
+    "--port": null,
+    "--gpu-layers": "999",
+    "--ctx-size": "4096",
+    "--cache-type-k": "f16",
+    "--cache-type-v": "f16",
+    "--batch-size": "512",
+    "--threads": "12"
+  }
+}

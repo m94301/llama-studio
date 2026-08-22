@@ -160,6 +160,10 @@ class ParsedScript:
     # measured on 4 cards is wrong for 3 — `load_profile` discards it rather
     # than predicting from stale numbers.
     calibrated_gpus: Optional[int] = None
+    # Layer split the measurements were taken at. Weights per rank follow the
+    # partition directly, so re-balancing invalidates them just as surely as
+    # changing the card count does.
+    calibrated_partition: Optional[str] = None
     # VLLM_PP_LAYER_PARTITION assignment from the body, parsed to ints.
     pp_layer_partition: Optional[List[int]] = None
 
@@ -277,13 +281,21 @@ class ParsedScript:
         Everything here scales with layers-per-rank, so a profile captured at a
         different GPU count is discarded rather than used to predict.
         """
-        stale = (
-            self.calibrated_gpus is not None
-            and self.calibrated_gpus != self.gpu_count
+        current_partition = (
+            ",".join(str(n) for n in self.pp_layer_partition)
+            if self.pp_layer_partition else ""
         )
-        if stale:
+        stale_reason = None
+        if self.calibrated_gpus is not None and self.calibrated_gpus != self.gpu_count:
+            stale_reason = f"{self.calibrated_gpus} GPU(s)"
+        elif (
+            self.calibrated_partition is not None
+            and self.calibrated_partition != current_partition
+        ):
+            stale_reason = f"layer split {self.calibrated_partition}"
+        if stale_reason:
             return {"weights_max_gb": None, "runtime_overhead_gb": None,
-                    "kv_bytes_per_token": None, "stale_from": self.calibrated_gpus}
+                    "kv_bytes_per_token": None, "stale_from": stale_reason}
         return {"weights_max_gb": self.weights_max_gb,
                 "runtime_overhead_gb": self.runtime_overhead_gb,
                 "kv_bytes_per_token": self.kv_bytes_per_token,
@@ -642,6 +654,9 @@ def parse_script(text: str) -> ParsedScript:
             ps.engine_declared = True
         elif eng:
             ps.warnings.append(f"meta engine={eng!r} is not one of {VALID_ENGINES}; treating as llamacpp")
+        cp = meta.get("calibrated_partition")
+        if cp:
+            ps.calibrated_partition = str(cp).strip()
         cg = meta.get("calibrated_gpus")
         if cg is not None and cg != "":
             try:
@@ -694,16 +709,14 @@ def parse_script(text: str) -> ParsedScript:
 
     ps.env_assignments = extract_assignments(text)
 
-    if (
-        ps.calibrated_gpus is not None
-        and ps.engine == "vllm"
-        and ps.calibrated_gpus != ps.gpu_count
-    ):
-        ps.warnings.append(
-            f"VRAM measurements were taken on {ps.calibrated_gpus} GPU(s) but this "
-            f"config now uses {ps.gpu_count} — they will be ignored until the "
-            f"model is loaded again and re-measured"
-        )
+    if ps.engine == "vllm":
+        stale_from = ps.load_profile["stale_from"]
+        if stale_from:
+            ps.warnings.append(
+                f"VRAM measurements were taken with {stale_from}; this config has "
+                f"changed, so they are ignored until the model is loaded again "
+                f"and re-measured"
+            )
 
     # vLLM uneven pipeline split (env var, preserved as preamble — doc 21 §4).
     raw_part = _lookup_assignment("VLLM_PP_LAYER_PARTITION", text)
@@ -1047,6 +1060,7 @@ def patch_meta_fence(
     weights_max_gb=_UNSET,
     runtime_overhead_gb=_UNSET,
     calibrated_gpus=_UNSET,
+    calibrated_partition=_UNSET,
 ) -> str:
     """Merge the given fields into the meta fence, preserving everything else.
 
@@ -1072,6 +1086,7 @@ def patch_meta_fence(
         "weights_max_gb": weights_max_gb,
         "runtime_overhead_gb": runtime_overhead_gb,
         "calibrated_gpus": calibrated_gpus,
+        "calibrated_partition": calibrated_partition,
     }
     updates = {k: v for k, v in updates.items() if v is not _UNSET}
     # An empty string display_name behaves like a delete (legacy callers pass "").
@@ -1105,6 +1120,7 @@ def patch_meta_fence(
     # Append fields that weren't already present, in canonical order.
     for key in ("display_name", "engine", "vram_gb", "kv_bytes_per_token",
                 "weights_max_gb", "runtime_overhead_gb", "calibrated_gpus",
+                "calibrated_partition",
                 "block_count", "max_context", "kv_cache_multiplier", "health_timeout"):
         if key in updates and key not in seen and updates[key] is not None:
             out.append(_render_meta_line(key, updates[key]))

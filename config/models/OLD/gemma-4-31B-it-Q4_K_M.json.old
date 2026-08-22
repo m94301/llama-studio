@@ -1,0 +1,23 @@
+{
+  "name": "gemma-4-31B-it-Q4_K_M",
+  "display_name": "Gemma 4 31b It Q4 K M",
+  "model_path": "/home/m6/models/drive1/lmstudio-community/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf",
+  "block_count": 60,
+  "max_context": 262144,
+  "kv_cache_multiplier": 2688,
+  "llama_path": "default",
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8103",
+    "--ctx-size": "46592",
+    "--cache-type-k": "q8_0",
+    "--cache-type-v": "q8_0",
+    "--gpu-layers": "999",
+    "--batch-size": "4096",
+    "--ubatch-size": "4096",
+    "--threads": "12",
+    "--no-mmap": null,
+    "--direct-io": null,
+    "--chat-template-kwargs": "\"{\\\"enable_thinking\\\": false}\""
+  }
+}
