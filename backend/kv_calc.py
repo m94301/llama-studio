@@ -162,6 +162,20 @@ def calibrate_from_log(log_text: str, kv_budget_bytes: Optional[int] = None) -> 
 # staying as low as possible, because it is *also* a startup gate: vLLM refuses to launch
 # unless `free >= util × capacity`, whether or not it means to use that much. Too high and
 # a model blocks a card it isn't filling; too low and it won't start at all.
+# A configuration must leave at least this much free on every GPU it lands on.
+# Filling a card is not a clean failure: a 640K config that projected under a
+# gigabyte of headroom drove rank 1 to 99.2%, cuBLAS could not allocate its
+# workspace, and the card stopped responding to NVML until the host rebooted.
+MIN_HEADROOM_GB = 1.5
+
+
+def headroom_ok(peak_per_gpu_gb: float, capacity_gb: float,
+                minimum: float = MIN_HEADROOM_GB) -> Tuple[bool, float]:
+    """(fits, free_gb) for a projected per-GPU peak against a card's capacity."""
+    free = round(capacity_gb - peak_per_gpu_gb, 2)
+    return free >= minimum, free
+
+
 UTILIZATION_SAFETY = 1.05
 UTILIZATION_MAX = 0.98
 

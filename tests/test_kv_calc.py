@@ -320,3 +320,33 @@ class TestMeasuredLoadProfile:
         per_gpu, _ = vram_gb_for(context_length=1048576, **common)
         back = context_for_vram(vram_gb=per_gpu, **common)
         assert abs(back - 1048576) <= CONTEXT_GRANULARITY
+
+
+class TestHeadroomFloor:
+    """A config must leave MIN_HEADROOM_GB free on the tightest card.
+
+    The 640K attempt projected under a gigabyte of headroom, drove rank 1 to
+    99.2%, and left the GPU unresponsive to NVML until the host rebooted — the
+    one hardware incident of the tuning session. This is the guard that would
+    have refused to write it.
+    """
+
+    def test_accepts_the_verified_768k_config(self):
+        from kv_calc import headroom_ok
+        ok, free = headroom_ok(62.06, 64.0)      # measured peak at 768K
+        assert ok and free == 1.94
+
+    def test_refuses_the_config_that_wedged_the_gpu(self):
+        from kv_calc import headroom_ok
+        ok, free = headroom_ok(63.5, 64.0)       # measured at the 640K failure
+        assert not ok and free < 1.5
+
+    def test_boundary_is_inclusive(self):
+        from kv_calc import MIN_HEADROOM_GB, headroom_ok
+        ok, _ = headroom_ok(64.0 - MIN_HEADROOM_GB, 64.0)
+        assert ok
+
+    def test_smaller_cards_scale(self):
+        from kv_calc import headroom_ok
+        assert headroom_ok(22.0, 24.0)[0]        # 2.0 free on a 24 GB card
+        assert not headroom_ok(23.0, 24.0)[0]    # 1.0 free

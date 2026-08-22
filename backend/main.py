@@ -1704,6 +1704,29 @@ async def save_vllm_config(
         except (TypeError, ValueError):
             return _error_modal(f"{key} must be a whole number, got {value!r}.")
 
+    # Refuse to write a configuration that would fill a card. Checked here
+    # rather than only at load time, because the damage is done by the config
+    # existing: a load that OOMs mid-GEMM can wedge the GPU entirely.
+    from kv_calc import DEFAULT_OVERHEAD_GB, GIB, headroom_ok, MIN_HEADROOM_GB
+    budget = args.get("--kv-cache-memory-bytes")
+    caps = [i["memory"] for i in (gpu_manager.get_gpu_status() or {}).values()]
+    if budget and caps:
+        profile = mc.parsed.load_profile
+        gpus = max(1, mc.gpu_count)
+        weights = profile["weights_max_gb"] or (mc.size_gb or 0.0) / gpus
+        overhead = profile["runtime_overhead_gb"]
+        if overhead is None:
+            overhead = DEFAULT_OVERHEAD_GB
+        peak = weights + overhead + int(budget) / GIB
+        fits, free = headroom_ok(peak, min(caps))
+        if not fits:
+            return _error_modal(
+                f"This configuration would leave only {free:.2f} GB free on the "
+                f"tightest GPU ({peak:.2f} of {min(caps):.1f} GB used), below the "
+                f"{MIN_HEADROOM_GB} GB floor. Reduce context or concurrency. "
+                f"Filling a card risks an allocation failure that can require a reboot."
+            )
+
     try:
         script_path = config_manager.get_script_path(model_name)
         text = script_path.read_text()
