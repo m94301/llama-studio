@@ -155,6 +155,11 @@ class ParsedScript:
     # the heaviest one decides whether a placement fits.
     weights_max_gb: Optional[float] = None
     runtime_overhead_gb: Optional[float] = None
+    # GPU count the measurements above were taken at. Weights per rank, runtime
+    # overhead and KV bytes/token all scale with layers-per-rank, so a profile
+    # measured on 4 cards is wrong for 3 — `load_profile` discards it rather
+    # than predicting from stale numbers.
+    calibrated_gpus: Optional[int] = None
     # VLLM_PP_LAYER_PARTITION assignment from the body, parsed to ints.
     pp_layer_partition: Optional[List[int]] = None
 
@@ -264,6 +269,25 @@ class ParsedScript:
         if value is not None and value < 0:
             return None  # llama.cpp's -1 sentinel is "auto"
         return value
+
+    @property
+    def load_profile(self) -> Dict[str, Optional[float]]:
+        """Measured figures from a real load, or empties when they don't apply.
+
+        Everything here scales with layers-per-rank, so a profile captured at a
+        different GPU count is discarded rather than used to predict.
+        """
+        stale = (
+            self.calibrated_gpus is not None
+            and self.calibrated_gpus != self.gpu_count
+        )
+        if stale:
+            return {"weights_max_gb": None, "runtime_overhead_gb": None,
+                    "kv_bytes_per_token": None, "stale_from": self.calibrated_gpus}
+        return {"weights_max_gb": self.weights_max_gb,
+                "runtime_overhead_gb": self.runtime_overhead_gb,
+                "kv_bytes_per_token": self.kv_bytes_per_token,
+                "stale_from": None}
 
     @property
     def kv_unified(self) -> bool:
@@ -618,6 +642,12 @@ def parse_script(text: str) -> ParsedScript:
             ps.engine_declared = True
         elif eng:
             ps.warnings.append(f"meta engine={eng!r} is not one of {VALID_ENGINES}; treating as llamacpp")
+        cg = meta.get("calibrated_gpus")
+        if cg is not None and cg != "":
+            try:
+                ps.calibrated_gpus = int(cg)
+            except ValueError:
+                ps.warnings.append(f"meta calibrated_gpus={cg!r} is not an integer")
         for fname in ("weights_max_gb", "runtime_overhead_gb"):
             fv = meta.get(fname)
             if fv is not None and fv != "":
@@ -663,6 +693,17 @@ def parse_script(text: str) -> ParsedScript:
     ps.cuda_visible_devices = _extract_cuda_visible_devices(text)
 
     ps.env_assignments = extract_assignments(text)
+
+    if (
+        ps.calibrated_gpus is not None
+        and ps.engine == "vllm"
+        and ps.calibrated_gpus != ps.gpu_count
+    ):
+        ps.warnings.append(
+            f"VRAM measurements were taken on {ps.calibrated_gpus} GPU(s) but this "
+            f"config now uses {ps.gpu_count} — they will be ignored until the "
+            f"model is loaded again and re-measured"
+        )
 
     # vLLM uneven pipeline split (env var, preserved as preamble — doc 21 §4).
     raw_part = _lookup_assignment("VLLM_PP_LAYER_PARTITION", text)
@@ -1005,6 +1046,7 @@ def patch_meta_fence(
     kv_bytes_per_token=_UNSET,
     weights_max_gb=_UNSET,
     runtime_overhead_gb=_UNSET,
+    calibrated_gpus=_UNSET,
 ) -> str:
     """Merge the given fields into the meta fence, preserving everything else.
 
@@ -1029,6 +1071,7 @@ def patch_meta_fence(
         "kv_bytes_per_token": kv_bytes_per_token,
         "weights_max_gb": weights_max_gb,
         "runtime_overhead_gb": runtime_overhead_gb,
+        "calibrated_gpus": calibrated_gpus,
     }
     updates = {k: v for k, v in updates.items() if v is not _UNSET}
     # An empty string display_name behaves like a delete (legacy callers pass "").
@@ -1061,7 +1104,7 @@ def patch_meta_fence(
 
     # Append fields that weren't already present, in canonical order.
     for key in ("display_name", "engine", "vram_gb", "kv_bytes_per_token",
-                "weights_max_gb", "runtime_overhead_gb",
+                "weights_max_gb", "runtime_overhead_gb", "calibrated_gpus",
                 "block_count", "max_context", "kv_cache_multiplier", "health_timeout"):
         if key in updates and key not in seen and updates[key] is not None:
             out.append(_render_meta_line(key, updates[key]))

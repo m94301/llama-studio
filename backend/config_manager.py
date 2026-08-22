@@ -216,8 +216,9 @@ class ModelConfig:
         per_gpu = max(1, self.gpu_count)
         # Measured figures win where a real load has provided them: ranks are not
         # equal, and the heaviest one decides whether a placement fits.
-        weights_share = self.parsed.weights_max_gb or (self.size_gb or 0.0) / per_gpu
-        overhead = self.parsed.runtime_overhead_gb
+        profile = self.parsed.load_profile
+        weights_share = profile["weights_max_gb"] or (self.size_gb or 0.0) / per_gpu
+        overhead = profile["runtime_overhead_gb"]
         if overhead is None:
             overhead = DEFAULT_OVERHEAD_GB
         # --kv-cache-memory-bytes is per GPU; only the weights divide.
@@ -705,6 +706,9 @@ class ConfigManager:
             updates["weights_max_gb"] = weights_max
         if overhead is not None and overhead != mc.parsed.runtime_overhead_gb:
             updates["runtime_overhead_gb"] = overhead
+        # Stamp the topology so the figures are discarded if it changes.
+        if updates and mc.parsed.calibrated_gpus != mc.gpu_count:
+            updates["calibrated_gpus"] = mc.gpu_count
         if not updates:
             return
         try:
@@ -739,9 +743,12 @@ class ConfigManager:
             return None
         if not measured or measured == mc.parsed.kv_bytes_per_token:
             return measured
+        stamp = {"calibrated_gpus": mc.gpu_count} if mc.parsed.calibrated_gpus != mc.gpu_count else {}
         try:
             script_path = self.get_script_path(model_name)
-            new_text = patch_meta_fence(script_path.read_text(), kv_bytes_per_token=measured)
+            new_text = patch_meta_fence(
+                script_path.read_text(), kv_bytes_per_token=measured, **stamp
+            )
             if write_script_atomic(script_path, new_text):
                 logger.info(f"   Calibrated KV for {model_name}: {measured} bytes/token")
             self.rescan_model(model_name)

@@ -879,7 +879,8 @@ async def config_modal_new(model: str):
             args = dict(model_config.launch_args)
             core_keys = {"--host", "--port", "--max-model-len", "--max-num-seqs",
                          "--kv-cache-memory-bytes"}
-            bpt = model_config.parsed.kv_bytes_per_token
+            mprofile = model_config.parsed.load_profile
+            bpt = mprofile["kv_bytes_per_token"]
             bpt_source = "measured"
             if not bpt and model_config.model_path:
                 bpt = bytes_per_token_from_config(
@@ -907,10 +908,10 @@ async def config_modal_new(model: str):
                     context_length=initial_ctx, concurrency=initial_conc,
                     bytes_per_token=bpt, weights_gb=model_config.size_gb or 0,
                     headroom=DEFAULT_KV_HEADROOM, gpu_count=model_config.gpu_count,
-                    overhead_gb=(model_config.parsed.runtime_overhead_gb
-                                 if model_config.parsed.runtime_overhead_gb is not None
+                    overhead_gb=(mprofile["runtime_overhead_gb"]
+                                 if mprofile["runtime_overhead_gb"] is not None
                                  else DEFAULT_OVERHEAD_GB),
-                    weights_per_gpu_gb=model_config.parsed.weights_max_gb,
+                    weights_per_gpu_gb=mprofile["weights_max_gb"],
                 )
 
             template = jinja_env.get_template("modals/config_modal_vllm.html")
@@ -939,10 +940,10 @@ async def config_modal_new(model: str):
                 bytes_per_token=bpt or 0,
                 bytes_per_token_source=bpt_source,
                 weights_gb=model_config.size_gb or 0,
-                overhead_gb=(model_config.parsed.runtime_overhead_gb
-                             if model_config.parsed.runtime_overhead_gb is not None
+                overhead_gb=(mprofile["runtime_overhead_gb"]
+                             if mprofile["runtime_overhead_gb"] is not None
                              else DEFAULT_OVERHEAD_GB),
-                weights_per_gpu_gb=model_config.parsed.weights_max_gb or 0,
+                weights_per_gpu_gb=mprofile["weights_max_gb"] or 0,
                 kv_headroom=DEFAULT_KV_HEADROOM,
                 env_assignments=model_config.parsed.env_assignments,
                 pp_size=model_config.parsed.pipeline_parallel_size,
@@ -1762,7 +1763,9 @@ async def calculate_vllm_vram(
     except FileNotFoundError:
         return JSONResponse({"error": f"model not found: {model}"}, status_code=404)
 
-    bpt = mc.parsed.kv_bytes_per_token
+    # Measured figures, or empties when the profile was taken at a different GPU count.
+    profile = mc.parsed.load_profile
+    bpt = profile["kv_bytes_per_token"]
     source = "measured"
     if not bpt and mc.model_path:
         bpt = bytes_per_token_from_config(
@@ -1775,9 +1778,8 @@ async def calculate_vllm_vram(
         }, status_code=422)
 
     weights = mc.size_gb or 0.0
-    # Measured figures from a real load beat the even-split assumption.
-    weights_per_gpu = mc.parsed.weights_max_gb
-    overhead = mc.parsed.runtime_overhead_gb
+    weights_per_gpu = profile["weights_max_gb"]
+    overhead = profile["runtime_overhead_gb"]
     if overhead is None:
         overhead = DEFAULT_OVERHEAD_GB
     concurrency = max(1, concurrency)
