@@ -99,15 +99,14 @@
 
     window.submitFlexPick = function() {
         const checked = Array.from(form.querySelectorAll('input[type=checkbox]:checked'));
-        const fd = new FormData();
-        fd.append('model_name', '{{ model_name }}');
-        checked.forEach(b => fd.append('gpu_ids', b.value));
-        fetch('/api/trigger-load', { method: 'POST', body: fd })
-            .then(r => r.text())
-            .then(html => {
-                document.getElementById('modal-container').innerHTML = html;
-                if (window.htmx) htmx.process(document.getElementById('modal-container'));
-            });
+        const ids = checked.map(b => b.value);
+        // htmx.ajax (not a raw fetch + innerHTML) so <script> tags in the
+        // swapped-in modal actually execute. An array value is serialized as
+        // repeated gpu_ids keys, which trigger-load reads as List[int].
+        htmx.ajax('POST', '/api/trigger-load', {
+            target: '#modal-container', swap: 'innerHTML',
+            values: { model_name: '{{ model_name }}', gpu_ids: ids },
+        });
     };
 })();
 </script>

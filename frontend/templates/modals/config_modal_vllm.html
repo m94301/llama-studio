@@ -1,22 +1,15 @@
-<!-- Structured config modal for engine:vllm models (doc 21 §2.3/§2.4).
-     Saves through /api/save-vllm-config, which rewrites only the exec line, so
-     the script's env preamble and tuning comments survive. -->
-<div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-     id="modal"
-     onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-    <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-3xl max-h-[90vh] flex flex-col"
-         onclick="event.stopPropagation()">
+{# Structured config modal for engine:vllm models (doc 21 §2.3/§2.4).
+   Saves through /api/save-vllm-config, which rewrites only the exec line, so
+   the script's env preamble and tuning comments survive. #}
+{% extends "modals/config_modal_base.html" %}
+{% set form_id = "v-struct-form" %}
 
-        <div class="flex justify-between items-center mb-3">
-            <h2 class="text-xl font-bold">
-                Edit Model Configuration
+{% block badge %}
                 <span class="ml-2 text-xs font-bold text-teal-300 bg-teal-900 bg-opacity-40 border border-teal-700 rounded px-1.5 py-0.5 align-middle">vLLM {{ vllm_version }}</span>
-            </h2>
-            <button onclick="document.getElementById('modal').remove();"
-                    class="text-gray-400 hover:text-white text-2xl">×</button>
-        </div>
+{% endblock %}
 
-        <div class="flex-1 overflow-y-auto pr-2 space-y-6">
+{% block fields %}
+        <div class="space-y-6">
 
             {% if warnings %}
             <div class="p-3 rounded border border-yellow-600 bg-yellow-900 bg-opacity-25">
@@ -27,11 +20,22 @@
             </div>
             {% endif %}
 
+            <!-- Structured save. Same shape as the llama.cpp modal: a native form
+                 carrying a hidden model_name, submitted by htmx. Identity travels
+                 with the request from this DOM node — never from a page-global —
+                 so the script selected, edited, and written are always the same. -->
+            <form id="v-struct-form" hx-post="/api/save-vllm-config"
+                  hx-target="#modal-container" hx-swap="innerHTML" class="space-y-6">
+            <input type="hidden" id="modal-model-name" name="model_name" value="{{ model_name }}">
+            {# Dynamic launch args are serialized into this hidden field by
+               modalSerialize() on submit (mirrors llama.cpp core_json/advanced_json). #}
+            <textarea name="args_json" id="v-args-json" class="hidden"></textarea>
+
             <!-- Identity -->
             <fieldset class="flex gap-3 items-end">
                 <div class="flex-1">
                     <label class="text-xs font-bold text-gray-400">Display Name</label>
-                    <input type="text" id="v-display-name" value="{{ display_name }}"
+                    <input type="text" id="v-display-name" name="display_name" value="{{ display_name }}"
                            class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
                 </div>
                 <div class="w-44">
@@ -39,7 +43,7 @@
                            title="vLLM startup is slow; large multi-GPU loads need several minutes.">
                         Health timeout (s)
                     </label>
-                    <input type="number" id="v-health-timeout" min="1" max="1800" step="1"
+                    <input type="number" id="v-health-timeout" name="health_timeout" min="1" max="1800" step="1"
                            value="{{ health_timeout if health_timeout is not none else '' }}"
                            placeholder="{{ default_health_timeout }} (default)"
                            class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
@@ -86,7 +90,7 @@
                         <div id="v-derived" class="text-xs text-gray-400">{% if initial_tokens %}{{ "{:,}".format(context_length or 8192) }} × {{ concurrency or 1 }} + 20% headroom = <b class="text-gray-200">{{ "{:,}".format(initial_tokens) }} tokens</b>{% else %}—{% endif %}</div>
                         <div class="flex items-center gap-2">
                             <label class="text-xs font-bold text-gray-400">VRAM{% if gpu_count > 1 %}/GPU{% endif %}</label>
-                            <input type="number" id="v-vram" step="0.1" min="0"
+                            <input type="number" id="v-vram" step="any" min="0"
                                    value="{{ initial_vram }}"
                                    onchange="vOnVram(this.value)"
                                    class="w-24 px-2 py-1 bg-gray-800 border border-gray-600 rounded text-sm text-yellow-300 text-right font-bold">
@@ -153,10 +157,14 @@
                     their original form (so <code>"$MAXLEN"</code> stays a variable).
                 </p>
             </fieldset>
+            </form>
 
             <!-- Launch script: always visible. Anything with no field above — env
                  exports like VLLM_PP_LAYER_PARTITION, pre-launch commands — is
-                 edited directly here. -->
+                 edited directly here. Its own form, same DOM-bound-identity pattern. -->
+            <form id="v-raw-form" hx-post="/api/save-raw-script"
+                  hx-target="#modal-container" hx-swap="innerHTML">
+            <input type="hidden" name="model_name" value="{{ model_name }}">
             <fieldset id="v-raw-section">
                 <legend class="text-sm font-bold text-gray-300 mb-1">Launch Script</legend>
                 <p class="text-xs text-gray-500 mb-2">
@@ -164,11 +172,11 @@
                     here saves the whole file, including env exports such as
                     <code>VLLM_PP_LAYER_PARTITION</code> that have no command-line flag.
                 </p>
-                <textarea id="v-raw-text" spellcheck="false"
+                <textarea id="v-raw-text" name="script_text" spellcheck="false"
                           class="w-full h-72 px-2 py-2 bg-gray-950 border border-gray-700 rounded text-xs font-mono text-gray-200"
                           style="resize: vertical;">{{ script_text }}</textarea>
                 <div class="flex gap-2 mt-2">
-                    <button type="button" onclick="vSaveRaw()"
+                    <button type="submit"
                             class="px-3 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">
                         Save Raw Script
                     </button>
@@ -179,18 +187,11 @@
                     <span id="v-raw-note" class="text-xs text-gray-500 self-center"></span>
                 </div>
             </fieldset>
+            </form>
         </div>
+{% endblock %}
 
-        <div id="v-save-result" class="text-xs mt-2"></div>
-        <div class="flex gap-3 mt-3 border-t border-gray-700 pt-3">
-            <button type="button" onclick="document.getElementById('modal').remove();"
-                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">Cancel</button>
-            <button type="button" onclick="vSave()"
-                    class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">Save Configuration</button>
-        </div>
-    </div>
-</div>
-
+{% block overlays %}
 <!-- Option browser (nested) -->
 <div id="v-browser" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[60] hidden"
      onclick="if(event.target.id === 'v-browser') this.classList.add('hidden');">
@@ -207,10 +208,12 @@
         <div id="v-browser-body" class="flex-1 overflow-y-auto space-y-4"></div>
     </div>
 </div>
+{% endblock %}
 
-<script>
+{% block engine_js %}
+// Calculator scratchpad only — VRAM/context math. Identity is NOT here; it
+// lives in the forms' hidden model_name inputs.
 window.V = {
-    model: {{ model_name | tojson }},
     schema: {{ option_schema | tojson }},
     bytesPerToken: {{ bytes_per_token }},
     bptSource: {{ bytes_per_token_source | tojson }},
@@ -417,31 +420,37 @@ function vCollectArgs() {
     return args;
 }
 
-function vSave() {
-    document.getElementById('v-save-result').innerHTML = '<span class="text-gray-400">Saving…</span>';
-    htmx.ajax('POST', '/api/save-vllm-config', {
-        target: '#modal-container', swap: 'innerHTML',
-        values: {
-            model_name: window.V.model,
-            display_name: document.getElementById('v-display-name').value,
+// Which script this modal edits lives in the hidden model_name inputs inside
+// the two forms above — read from the DOM, never a page-global — so identity
+// and field values always come from the same place. This helper is only for
+// the reload fetch, which needs the name in a URL.
+function vModel() { return document.getElementById('modal-model-name').value; }
+
+// Footer Save button calls this before submitting the primary form. Fills the
+// hidden args_json field (mirrors the llama.cpp modal's serializeFormData()).
+function modalSerialize() {
+    document.getElementById('v-args-json').value = JSON.stringify(vCollectArgs());
+}
+
+// Save-As hooks consumed by the shared dialog (_saveas_dialog.html).
+window.SAVEAS = {
+    saveUrl: '/api/save-vllm-config',
+    sourceName: () => document.getElementById('modal-model-name').value,
+    currentPort: () => parseInt(document.getElementById('v-port').value) || 8000,
+    currentDisplay: () => document.getElementById('v-display-name').value,
+    collect: ({ port, displayName }) => {
+        const args = vCollectArgs();
+        if (port) args['--port'] = port;          // fork gets its own port
+        return {
+            display_name: displayName,
             health_timeout: document.getElementById('v-health-timeout').value,
-            args_json: JSON.stringify(vCollectArgs()),
-        },
-    });
-}
-
-
-
-function vSaveRaw() {
-    document.getElementById('v-raw-note').textContent = 'Saving…';
-    htmx.ajax('POST', '/api/save-raw-script', {
-        target: '#modal-container', swap: 'innerHTML',
-        values: { model_name: window.V.model, script_text: document.getElementById('v-raw-text').value },
-    });
-}
+            args_json: JSON.stringify(args),
+        };
+    },
+};
 
 function vReloadRaw() {
-    fetch('/api/model-script-raw?model=' + encodeURIComponent(window.V.model))
+    fetch('/api/model-script-raw?model=' + encodeURIComponent(vModel()))
         .then(r => r.text())
         .then(t => {
             document.getElementById('v-raw-text').value = t;
@@ -463,4 +472,4 @@ window.closeModalAndRefresh = function () {
 
 vRecalc();
 vSyncRows();
-</script>
+{% endblock %}

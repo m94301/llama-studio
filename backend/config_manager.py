@@ -463,6 +463,7 @@ class ConfigManager:
         logger.info(f"🔍 Searching for GGUF files in: {models_root}")
         gguf_files = list(models_root.rglob("*.gguf")) if models_root.exists() else []
         logger.info(f"   Found {len(gguf_files)} GGUF file(s)")
+        claimed_ggufs = self._claimed_gguf_paths(config_models_dir)
 
         for gguf_path in sorted(gguf_files):
             split = parse_split_gguf(gguf_path)
@@ -476,8 +477,15 @@ class ConfigManager:
                 model_name = base_name
             else:
                 model_name = gguf_path.stem
-            if model_name.startswith("mmproj"):
-                logger.debug(f"   Skipping mmproj model: {model_name}")
+            if model_name.startswith(self._AUX_GGUF_PREFIXES):
+                logger.debug(f"   Skipping auxiliary weights: {model_name}")
+                continue
+            try:
+                resolved = gguf_path.resolve()
+            except (OSError, ValueError):
+                resolved = gguf_path
+            if resolved in claimed_ggufs:
+                logger.debug(f"   Already covered by an existing script: {model_name}")
                 continue
             script_path = config_models_dir / f"{model_name}.sh"
             if not script_path.exists():
@@ -1014,6 +1022,194 @@ class ConfigManager:
     def get_script_text(self, model_name: str) -> str:
         return self.get_script_path(model_name).read_text()
 
+    # --- Deleting scripts -----------------------------------------------------
+
+    def delete_script(self, model_name: str) -> dict:
+        """Move a model's launch script to config/models/.trash/. Weights are
+        never touched, so if this was the model's only script a rescan (or the
+        next startup) regenerates a fresh skeleton for it.
+
+        Returns {trashed, remaining, target}. Raises FileNotFoundError if there
+        is no such script.
+        """
+        path = self.get_script_path(model_name)
+        if not path.exists():
+            raise FileNotFoundError(f"No script for model: {model_name}")
+
+        mc = self.models.get(model_name)
+        target = None
+        if mc and mc.model_path:
+            try:
+                target = Path(mc.model_path).resolve()
+            except (OSError, ValueError):
+                target = None
+
+        remaining = self.sibling_script_count(model_name)
+
+        dest = self._trash_script(path)
+        self.models.pop(model_name, None)
+        logger.info(
+            f"🗑 Deleted script {path.name} → {dest.name} (remaining refs: {remaining})"
+        )
+        return {"trashed": str(dest), "remaining": remaining,
+                "target": str(target) if target else None}
+
+    @staticmethod
+    def _trash_script(path: Path) -> Path:
+        trash = path.parent / ".trash"
+        trash.mkdir(exist_ok=True)
+        dest = trash / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}"
+        path.rename(dest)
+        return dest
+
+    def _referencing_scripts(self, config_dir: Path, target: Path, exclude: str) -> list:
+        """Names of OTHER scripts whose text mentions this resolved path anywhere
+        (primary -m/serve, --model-draft, or --mmproj). A substring match on the
+        absolute path, so it catches drafter/projector reuse across engines."""
+        try:
+            needle = str(target.resolve())
+        except (OSError, ValueError):
+            needle = str(target)
+        out = []
+        for script in config_dir.glob("*.sh*"):
+            if script.name.endswith(".sh"):
+                name = script.name[:-3]
+            elif script.name.endswith(".sh.old"):
+                name = script.name[:-7]
+            else:
+                continue
+            if name == exclude:
+                continue
+            try:
+                if needle in script.read_text(errors="replace"):
+                    out.append(name)
+            except OSError:
+                continue
+        return out
+
+    def _weight_files(self, target: Path):
+        """(files to delete, total bytes). Split GGUF → all shards; single GGUF →
+        itself; directory → everything under it. A shared mmproj-* projector is
+        never included for a GGUF model (it belongs to the folder, not this config)."""
+        files = []
+        if target.is_dir():
+            files = [f for f in target.rglob("*") if f.is_file()]
+        else:
+            split = parse_split_gguf(target)
+            if split is not None:
+                base, _idx, total = split
+                for i in range(1, total + 1):
+                    part = target.with_name(f"{base}-{i:05d}-of-{total:05d}.gguf")
+                    if part.exists():
+                        files.append(part)
+            elif target.exists():
+                files.append(target)
+        total_bytes = 0
+        for f in files:
+            try:
+                total_bytes += f.stat().st_size
+            except OSError:
+                continue
+        return files, total_bytes
+
+    def model_weight_info(self, model_name: str) -> dict:
+        """Everything the delete-model confirmation needs: the resolved weight
+        path, whether it is a directory / symlink, its size, the shard/file count,
+        and any OTHER scripts referencing it (which block deletion)."""
+        config_dir = self.project_root / "config" / "models"
+        mc = self.models.get(model_name)
+        info = {"has_target": False, "path": None, "exists": False,
+                "is_dir": False, "is_symlink": False, "size_gb": 0.0,
+                "file_count": 0, "referenced_by": []}
+        if not (mc and mc.model_path):
+            return info
+        p = Path(mc.model_path)
+        info.update(has_target=True, path=str(p))
+        if not p.exists():
+            return info
+        info["exists"] = True
+        info["is_symlink"] = p.is_symlink()
+        info["is_dir"] = p.is_dir()
+        info["referenced_by"] = self._referencing_scripts(config_dir, p, model_name)
+        files, total = self._weight_files(p)
+        info["file_count"] = len(files)
+        info["size_gb"] = round(total / (1024 ** 3), 2)
+        return info
+
+    def delete_model(self, model_name: str) -> dict:
+        """Delete a model's launch script AND its weights from disk. Guards:
+        refuses if another script references the weights (primary or drafter),
+        if another script still serves the same model path, or if the path is a
+        symlink (its real target may be shared). The script is trashed; the
+        weights are unlinked (they are the point of this operation).
+        """
+        config_dir = self.project_root / "config" / "models"
+        path = self.get_script_path(model_name)
+        if not path.exists():
+            raise FileNotFoundError(f"No script for model: {model_name}")
+
+        info = self.model_weight_info(model_name)
+        if info["referenced_by"]:
+            raise ValueError(
+                "weights are referenced by other script(s): "
+                + ", ".join(info["referenced_by"])
+            )
+        if self.sibling_script_count(model_name) > 0:
+            raise ValueError("another script still serves this model")
+        if info["exists"] and info["is_symlink"]:
+            raise ValueError(
+                "the model path is a symlink; delete its real target manually "
+                "to avoid removing shared data"
+            )
+
+        target = Path(info["path"]) if info["path"] else None
+
+        # Trash the script; the weights are being removed below.
+        self._trash_script(path)
+        self.models.pop(model_name, None)
+
+        removed_files, removed_bytes = 0, 0
+        if target and target.exists():
+            files, _ = self._weight_files(target)
+            for f in files:
+                try:
+                    b = f.stat().st_size
+                    f.unlink()
+                    removed_files += 1
+                    removed_bytes += b
+                except OSError as e:
+                    logger.warning(f"⚠ Could not remove {f}: {e}")
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+
+        gb = round(removed_bytes / (1024 ** 3), 2)
+        logger.info(
+            f"🗑💥 Deleted model {model_name}: removed {removed_files} file(s), "
+            f"{gb} GB from {target}"
+        )
+        return {"removed_files": removed_files, "gb": gb,
+                "target": str(target) if target else None}
+
+    def sibling_script_count(self, model_name: str) -> int:
+        """How many OTHER loaded scripts serve the same model path as this one."""
+        mc = self.models.get(model_name)
+        if not mc or not mc.model_path:
+            return 0
+        try:
+            target = Path(mc.model_path).resolve()
+        except (OSError, ValueError):
+            return 0
+        count = 0
+        for name, other in self.models.items():
+            if name == model_name or not other.model_path:
+                continue
+            try:
+                if Path(other.model_path).resolve() == target:
+                    count += 1
+            except (OSError, ValueError):
+                continue
+        return count
+
     def save_script_text(self, model_name: str, text: str) -> ModelConfig:
         """Overwrite a model's script with raw text (used by the 'raw script' editor tab)."""
         path = self.get_script_path(model_name)
@@ -1059,6 +1255,33 @@ class ConfigManager:
             str(cache_type_k), str(cache_type_v),
         )
         return round(mc.size_gb + kv, 2)
+
+    # GGUF stems that are never a servable model on their own: multimodal
+    # projectors and MTP/speculative drafter weights, which exist only to be
+    # referenced by another script (--mmproj / --model-draft).
+    _AUX_GGUF_PREFIXES = ("mmproj", "mtp")
+
+    def _claimed_gguf_paths(self, config_dir: Path) -> set:
+        """Resolved paths of every GGUF already referenced by an existing script.
+
+        A script's filename is user-owned and routinely diverges from the GGUF
+        stem — a vendor prefix dropped, a variant suffix added — and drafter
+        GGUFs are only ever named on a --model-draft line. Claiming by the
+        referenced path rather than by filename keeps the scanner from dropping
+        a duplicate skeleton next to the curated script that already covers it.
+        """
+        claimed = set()
+        for script in config_dir.glob("*.sh*"):  # .sh plus disabled .sh.old
+            try:
+                text = script.read_text(errors="replace")
+            except OSError:
+                continue
+            for ref in re.findall(r"""[^\s"'=]+\.gguf""", text):
+                try:
+                    claimed.add(Path(ref).resolve())
+                except (OSError, ValueError):
+                    continue
+        return claimed
 
     def _format_display_name(self, filename: str) -> str:
         name = filename.replace('.gguf', '')

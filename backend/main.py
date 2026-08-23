@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import json
+import re
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Dict, Optional
@@ -15,7 +16,7 @@ import socket
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.3.0"
 
 from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -320,10 +321,13 @@ async def model_list():
         logger.warning("⚠ No models in config_manager")
         return '<div class="text-center py-8 text-gray-400"><p>No models found</p></div>'
 
-    # Sort: configured first (alphabetically), then unconfigured (alphabetically)
+    # Sort: configured first, then unconfigured; within each group alphabetical
+    # by the *display name* the table actually shows, case-insensitively (so
+    # e.g. "gemma" and "GLM" interleave the way a human reads them).
     sorted_models = sorted(
         models.items(),
-        key=lambda x: (not x[1].is_configured, x[0])
+        key=lambda x: (not x[1].is_configured,
+                       (x[1].display_name or x[0]).lower())
     )
 
     html = '<div class="models-table">'
@@ -993,7 +997,7 @@ async def config_modal_new(model: str):
         port = launch_args.get("--port", model_config.port or "")
 
         # Render template
-        template = jinja_env.get_template("modals/config_modal_new.html")
+        template = jinja_env.get_template("modals/config_modal_llama.html")
         html = template.render(
             model_name=model,
             display_name=model_config.display_name or model,
@@ -1026,15 +1030,30 @@ async def save_model_config_new(
     model_name: str = Form(...),
     core_json: str = Form(...),
     advanced_json: str = Form(...),
+    source_model: str = Form(""),
 ):
-    """Save config with validation at each step."""
-    logger.info(f"💾 Saving config (v2) for model: {model_name}")
+    """Save config with validation at each step.
+
+    'Save As': when source_model is set and differs from model_name, the current
+    edits are written to a new <model_name>.sh serving the same weights as the
+    source, leaving the source untouched.
+    """
+    src = source_model.strip() or model_name
+    is_save_as = bool(source_model.strip() and source_model.strip() != model_name)
+    logger.info(
+        f"💾 {'Save-As' if is_save_as else 'Saving'} config (v2) for model: "
+        f"{src + ' → ' + model_name if is_save_as else model_name}"
+    )
     try:
+        if is_save_as:
+            name_error = _validate_new_script_name(model_name)
+            if name_error:
+                return name_error
         # Defense: the structured save rewrites the script body, which would
         # destroy a vLLM script's env-var preamble. vLLM edits go through the
         # raw-script editor until Phase 2's body-preserving save lands.
         try:
-            if config_manager.get_model_config(model_name).engine == "vllm":
+            if config_manager.get_model_config(src).engine == "vllm":
                 return _error_modal(
                     "vLLM models are edited via the raw-script editor — "
                     "the structured save would overwrite the script's env-var preamble."
@@ -1140,8 +1159,9 @@ async def save_model_config_new(
             and str(sm_raw).strip().lower() in ("layer", "row")
         )
 
-        # Get existing model config to preserve model_path and (if still valid) CVD
-        existing_config = config_manager.get_model_config(model_name)
+        # Get the source config to preserve model_path and (if still valid) CVD.
+        # For a normal save src == model_name; for Save-As it's the original.
+        existing_config = config_manager.get_model_config(src)
         prior_cvd = existing_config.cuda_visible_devices  # captured before save_model_script clobbers it
 
         # Resolve llama_bin: "default" -> use app config's binary
@@ -1180,6 +1200,7 @@ async def save_model_config_new(
                 )
 
         logger.info(f"✓ Script saved for {model_name}")
+        # Save-As and normal save both end on the confirmation popup.
         return _save_success_modal(model_config, invalid_keys=invalid_keys)
     except Exception as e:
         logger.error(f"✗ Error in save_model_config_new: {type(e).__name__}: {e}", exc_info=True)
@@ -1295,6 +1316,23 @@ def _error_modal(message: str) -> str:
         </div>
     </div>
     """
+
+
+# --- Save As helpers (shared by both structured-save endpoints) -------------
+
+def _validate_new_script_name(name: str) -> Optional[str]:
+    """Validate a Save-As target name. Returns an error-modal HTML string if the
+    name is unusable as a new script filename, else None. The name becomes the
+    <name>.sh filename, so it is restricted to filename-safe characters and must
+    not collide with an existing script."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        return _error_modal(
+            "New name may contain only letters, numbers, dot, dash and "
+            "underscore (it becomes the script filename)."
+        )
+    if config_manager.get_script_path(name).exists():
+        return _error_modal(f"A script named '{name}' already exists. Pick another name.")
+    return None
 
 
 # ============================================================================
@@ -1622,6 +1660,104 @@ async def clear_error(model_name: str = Form(...)):
         return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
 
 
+@app.get("/api/delete-script-confirm", response_class=HTMLResponse)
+async def delete_script_confirm(model: str):
+    """Confirmation modal for deleting a model's launch script."""
+    try:
+        model_config = config_manager.get_model_config(model)
+    except FileNotFoundError:
+        return HTMLResponse('<div class="text-red-500 p-4">Model not found</div>', status_code=404)
+    state = gpu_manager.get_model_state(model)
+    running = state in (ModelState.RUNNING, ModelState.LOADING)
+    siblings = config_manager.sibling_script_count(model)
+    winfo = config_manager.model_weight_info(model)
+    # Deleting the weights is offered only when this is the sole script for them,
+    # nothing else references them (drafter/projector), and they aren't a symlink.
+    can_delete_weights = (
+        siblings == 0 and winfo["exists"]
+        and not winfo["referenced_by"] and not winfo["is_symlink"]
+    )
+    template = jinja_env.get_template("modals/delete_script_confirm.html")
+    return HTMLResponse(template.render(
+        model_name=model,
+        display_name=model_config.display_name or model,
+        running=running,
+        siblings=siblings,
+        sole=(siblings == 0),
+        weights_exist=winfo["exists"],
+        weight_size_gb=winfo["size_gb"],
+        weight_is_dir=winfo["is_dir"],
+        weight_is_symlink=winfo["is_symlink"],
+        weight_referenced_by=winfo["referenced_by"],
+        weight_path=winfo["path"] or "",
+        can_delete_weights=can_delete_weights,
+    ))
+
+
+@app.post("/api/delete-script", response_class=HTMLResponse)
+async def delete_script(model_name: str = Form(...)):
+    """Delete a model's launch script (weights untouched). Refuses while the
+    model is loaded. If it was the only script for an on-disk model, the model
+    is gone, so a rescan will not bring it back."""
+    logger.info(f"🗑 Delete script requested: {model_name}")
+    state = gpu_manager.get_model_state(model_name)
+    if state in (ModelState.RUNNING, ModelState.LOADING):
+        return _error_modal(
+            f"'{model_name}' is currently loaded. Unload it before deleting its script."
+        )
+    try:
+        result = config_manager.delete_script(model_name)
+    except FileNotFoundError:
+        return _error_modal(f"No script found for '{model_name}'.")
+    except Exception as e:
+        logger.error(f"✗ Delete failed for {model_name}: {e}", exc_info=True)
+        return _error_modal(f"Failed to delete script: {e}")
+    # Reflect the deletion in the loaded set.
+    await config_manager.load_all_models()
+    # Close the modal and refresh the table from the server.
+    return HTMLResponse(
+        '<script>'
+        'document.getElementById("modal")?.remove();'
+        'htmx.ajax("GET", "/api/model-list", {target: "#models-container", swap: "innerHTML"});'
+        '</script>'
+    )
+
+
+@app.post("/api/delete-model", response_class=HTMLResponse)
+async def delete_model(model_name: str = Form(...), confirm_name: str = Form("")):
+    """Delete a model's script AND its weights from disk. Irreversible for the
+    weights. Requires YES typed back, refuses while loaded, and refuses if
+    another script references the weights."""
+    logger.info(f"🗑💥 Delete MODEL (weights) requested: {model_name}")
+    if confirm_name.strip().upper() != "YES":
+        return _error_modal(
+            "Deletion not confirmed, so nothing was deleted. "
+            "To delete the weights, type YES in the confirmation box."
+        )
+    state = gpu_manager.get_model_state(model_name)
+    if state in (ModelState.RUNNING, ModelState.LOADING):
+        return _error_modal(
+            f"'{model_name}' is currently loaded. Unload it before deleting it."
+        )
+    try:
+        result = config_manager.delete_model(model_name)
+    except FileNotFoundError:
+        return _error_modal(f"No script found for '{model_name}'.")
+    except ValueError as e:
+        return _error_modal(f"Cannot delete: {e}.")
+    except Exception as e:
+        logger.error(f"✗ Delete model failed for {model_name}: {e}", exc_info=True)
+        return _error_modal(f"Failed to delete model: {e}")
+    await config_manager.load_all_models()
+    logger.info(f"✓ Deleted {model_name}: {result['gb']} GB freed")
+    return HTMLResponse(
+        '<script>'
+        'document.getElementById("modal")?.remove();'
+        'htmx.ajax("GET", "/api/model-list", {target: "#models-container", swap: "innerHTML"});'
+        '</script>'
+    )
+
+
 # ============================================================================
 # API Routes - Configuration
 # ============================================================================
@@ -1656,6 +1792,7 @@ async def save_vllm_config(
     health_timeout: str = Form(""),
     args_json: str = Form(...),
     env_json: str = Form("{}"),
+    source_model: str = Form(""),
 ):
     """Structured save for a vLLM model — rewrites only the exec line (§2.2).
 
@@ -1664,16 +1801,29 @@ async def save_vllm_config(
     exports, tuning comments, variable defaults) is preserved byte-for-byte,
     and arguments the user didn't change keep their original spelling, so
     `$VAR` indirection survives.
+
+    'Save As': when source_model is set and differs from model_name, the current
+    (unsaved) form edits are applied to the SOURCE script's preamble and written
+    to a brand-new <model_name>.sh, leaving the source untouched.
     """
     from launch_script import patch_env_assignment, patch_exec_invocation
 
-    logger.info(f"💾 Saving vLLM config for: {model_name}")
+    src = source_model.strip() or model_name
+    is_save_as = bool(source_model.strip() and source_model.strip() != model_name)
+    if is_save_as:
+        logger.info(f"💾 Save-As vLLM: {src} → {model_name}")
+        name_error = _validate_new_script_name(model_name)
+        if name_error:
+            return name_error
+    else:
+        logger.info(f"💾 Saving vLLM config for: {model_name}")
+
     try:
-        mc = config_manager.get_model_config(model_name)
+        mc = config_manager.get_model_config(src)
     except FileNotFoundError:
-        return _error_modal(f"Model not found: {model_name}")
+        return _error_modal(f"Model not found: {src}")
     if mc.engine != "vllm":
-        return _error_modal(f"{model_name} is not a vLLM model")
+        return _error_modal(f"{src} is not a vLLM model")
 
     try:
         args = json.loads(args_json)
@@ -1728,8 +1878,10 @@ async def save_vllm_config(
             )
 
     try:
-        script_path = config_manager.get_script_path(model_name)
-        text = script_path.read_text()
+        # Read the SOURCE preamble; for a normal save src == model_name so this
+        # is the script's own text. For Save-As it's the original being forked.
+        text = config_manager.get_script_path(src).read_text()
+        dest_path = config_manager.get_script_path(model_name)
         text = patch_exec_invocation(text, args=args, parsed=mc.parsed)
         # Environment assignments carry launch config with no CLI flag; drop
         # any the user removed, then set the rest.
@@ -1749,7 +1901,9 @@ async def save_vllm_config(
             health_timeout=ht,
         )
         from config_manager import write_script_atomic
-        write_script_atomic(script_path, text)
+        write_script_atomic(dest_path, text)
+        if is_save_as:
+            dest_path.chmod(0o755)
         updated = config_manager.rescan_model(model_name)
     except Exception as e:
         logger.error(f"✗ vLLM save failed for {model_name}: {e}", exc_info=True)
@@ -1757,6 +1911,8 @@ async def save_vllm_config(
 
     if not updated:
         return _error_modal(f"{model_name} could not be re-read after saving")
+    # Save-As and normal save both end on the confirmation popup; its OK button
+    # refreshes the table, which surfaces the new fork.
     return _save_success_modal(updated)
 
 

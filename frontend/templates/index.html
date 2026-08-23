@@ -159,6 +159,19 @@
             cursor: not-allowed;
         }
 
+        /* Failed-load state: a clickable dismiss that clears the error and
+           returns the row to the green LOAD button. Distinct from the green
+           LOAD so a failure never reads as "ready to go". */
+        .btn-dismiss {
+            background: #6b7280;
+            color: white;
+        }
+
+        .btn-dismiss:hover:not(:disabled) {
+            background: #4b5563;
+            box-shadow: 0 0 8px rgba(107, 114, 128, 0.4);
+        }
+
         /* Icon Buttons */
         .btn-icon {
             background: none;

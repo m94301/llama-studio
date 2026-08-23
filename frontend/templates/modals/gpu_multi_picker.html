@@ -96,16 +96,13 @@
     window.submitMultiGpuPick = function() {
         const selects = form.querySelectorAll('select');
         const ids = Array.from(selects).map(s => s.value);
-        const fd = new FormData();
-        fd.append('model_name', '{{ model_name }}');
-        ids.forEach(id => fd.append('gpu_ids', id));
-        // FormData supports repeated keys natively; trigger-load reads them as List[int].
-        fetch('/api/trigger-load', { method: 'POST', body: fd })
-            .then(r => r.text())
-            .then(html => {
-                document.getElementById('modal-container').innerHTML = html;
-                if (window.htmx) htmx.process(document.getElementById('modal-container'));
-            });
+        // htmx.ajax (not a raw fetch + innerHTML) so <script> tags in the
+        // swapped-in modal actually execute. An array value is serialized as
+        // repeated gpu_ids keys, which trigger-load reads as List[int].
+        htmx.ajax('POST', '/api/trigger-load', {
+            target: '#modal-container', swap: 'innerHTML',
+            values: { model_name: '{{ model_name }}', gpu_ids: ids },
+        });
     };
 })();
 </script>

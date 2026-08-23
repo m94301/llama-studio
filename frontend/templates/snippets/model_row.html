@@ -31,11 +31,11 @@
                         hx-target="#modal-container" hx-swap="innerHTML"
                         data-model-name="{{ model_name }}">UNLOAD</button>
             {% elif status == "failed" %}
-                <button class="btn-action btn-load"
+                <button class="btn-action btn-dismiss"
                         hx-post="/api/clear-error"
                         hx-vals='{"model_name": "{{ model_name }}"}'
                         hx-target="[data-model-name='{{ model_name }}']"
-                        hx-swap="outerHTML">CANCEL</button>
+                        hx-swap="outerHTML">DISMISS</button>
             {% elif model_config.is_configured %}
                 <button class="btn-action btn-load"
                         hx-get="/api/gpu-selector?model={{ model_name }}"

@@ -1,0 +1,54 @@
+<!-- Shared shell for the engine config modals (llama.cpp + vLLM).
+     Owns the frame, header, scroll region, footer actions, and the Save-As
+     dialog. Engine templates extend this and provide:
+       * set  form_id      – the primary form's id (footer Save submits it)
+       * block badge       – engine tag beside the title (optional)
+       * block fields      – the form + all fields; MUST contain the identity
+                             input id=modal-model-name name=model_name, kept
+                             inside the form so htmx serializes it
+       * block overlays    – engine-specific nested overlays (optional)
+       * block engine_js   – engine JS; MUST define window.SAVEAS (see
+                             _saveas_dialog.html) and modalSerialize() -->
+
+<div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
+     id="modal"
+     onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
+    <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-3xl max-h-[90vh] flex flex-col"
+         onclick="event.stopPropagation()">
+
+        <div class="flex justify-between items-center mb-3">
+            <h2 class="text-xl font-bold">
+                Edit Model Configuration{% block badge %}{% endblock %}
+            </h2>
+            <button onclick="document.getElementById('modal').remove();"
+                    class="text-gray-400 hover:text-white text-2xl">×</button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto pr-2 min-h-0">
+            {% block fields %}{% endblock %}
+        </div>
+
+        <div class="flex gap-3 mt-3 border-t border-gray-700 pt-3 items-center">
+            <button type="button"
+                    hx-get="/api/delete-script-confirm?model={{ model_name }}"
+                    hx-target="#modal-container" hx-swap="innerHTML"
+                    class="px-3 py-2 rounded border border-gray-700 text-gray-500 hover:text-red-400 hover:border-red-600 text-sm font-bold transition-colors">
+                DELETE
+            </button>
+            <div class="flex-1"></div>
+            <button type="button" onclick="document.getElementById('modal').remove();"
+                    class="px-6 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">Cancel</button>
+            <button type="button" onclick="modalShowSaveAs()"
+                    class="px-6 py-2 rounded bg-blue-700 hover:bg-blue-600 text-white font-bold">Save As…</button>
+            <button type="submit" form="{{ form_id }}" onclick="modalSerialize()"
+                    class="px-6 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">Save Configuration</button>
+        </div>
+    </div>
+</div>
+
+{% include "modals/_saveas_dialog.html" %}
+{% block overlays %}{% endblock %}
+
+<script>
+{% block engine_js %}{% endblock %}
+</script>

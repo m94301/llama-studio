@@ -1,0 +1,91 @@
+<!-- Shared Save-As overlay + behaviour. Included by both config modals.
+     Nested overlay, so the config modal and its unsaved edits stay intact.
+
+     The including modal must define, before the user can click Save As:
+       window.SAVEAS = {
+         saveUrl:       "/api/save-...-config",        // POST target
+         sourceName:    () => "<current model_name>",  // from the modal's hidden input
+         currentPort:   () => <int>,                   // the modal's port field
+         currentDisplay:() => "<display name>",        // the modal's display field
+         collect: ({port, displayName}) => ({ ...form values to POST... }),
+       }
+     collect() returns the engine-specific payload (args_json, or core_json +
+     advanced_json), with the chosen port and display already applied. The shared
+     code adds model_name (the new name) and source_model. -->
+
+<div id="saveas" class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-[70] hidden"
+     onclick="if(event.target.id === 'saveas') this.classList.add('hidden');">
+    <div class="bg-gray-800 border border-blue-700 rounded-lg p-6 w-full max-w-md"
+         onclick="event.stopPropagation()">
+        <div class="flex justify-between items-center mb-3">
+            <h2 class="text-xl font-bold">Save As New Script</h2>
+            <button onclick="document.getElementById('saveas').classList.add('hidden');"
+                    class="text-gray-400 hover:text-white text-2xl">×</button>
+        </div>
+        <p class="text-xs text-gray-400 mb-4">
+            Forks the current edits into a new script pointing at the same model.
+            The original is left unchanged.
+        </p>
+        <label class="text-xs font-bold text-gray-400">New name (becomes the filename)</label>
+        <input type="text" id="saveas-name" autocomplete="off" spellcheck="false"
+               oninput="modalSaveAsValidate()"
+               class="w-full px-3 py-2 mb-1 bg-gray-900 border border-gray-700 rounded text-sm text-gray-200">
+        <p id="saveas-hint" class="text-xs text-gray-600 mb-3">letters, numbers, dot, dash, underscore</p>
+        <div class="flex gap-3 mb-3">
+            <div class="flex-1">
+                <label class="text-xs font-bold text-gray-400">Display name</label>
+                <input type="text" id="saveas-display"
+                       class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-200">
+            </div>
+            <div class="w-28">
+                <label class="text-xs font-bold text-gray-400">Port</label>
+                <input type="number" id="saveas-port"
+                       class="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-200">
+            </div>
+        </div>
+        <div id="saveas-error" class="text-xs text-red-400 mb-2"></div>
+        <div class="flex gap-3">
+            <button type="button" onclick="document.getElementById('saveas').classList.add('hidden');"
+                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">Cancel</button>
+            <button type="button" id="saveas-btn" onclick="modalSaveAsSubmit()"
+                    class="flex-1 px-4 py-2 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold">Create</button>
+        </div>
+    </div>
+</div>
+
+<script>
+// Shared Save-As behaviour. Reads engine specifics only through window.SAVEAS.
+function modalShowSaveAs() {
+    const src = window.SAVEAS.sourceName();
+    document.getElementById('saveas-name').value = src + '-copy';
+    document.getElementById('saveas-display').value =
+        (window.SAVEAS.currentDisplay() || src) + ' (copy)';
+    document.getElementById('saveas-port').value = window.SAVEAS.currentPort() + 1;
+    document.getElementById('saveas-error').textContent = '';
+    document.getElementById('saveas').classList.remove('hidden');
+    modalSaveAsValidate();
+    document.getElementById('saveas-name').focus();
+}
+
+function modalSaveAsValidate() {
+    const name = document.getElementById('saveas-name').value.trim();
+    const ok = /^[A-Za-z0-9._-]+$/.test(name) && name !== window.SAVEAS.sourceName();
+    document.getElementById('saveas-btn').disabled = !ok;
+    document.getElementById('saveas-hint').textContent =
+        (name === window.SAVEAS.sourceName()) ? 'must differ from the current name'
+                                              : 'letters, numbers, dot, dash, underscore';
+    return ok;
+}
+
+function modalSaveAsSubmit() {
+    if (!modalSaveAsValidate()) return;
+    const port = document.getElementById('saveas-port').value.trim();
+    const displayName = document.getElementById('saveas-display').value;
+    const values = window.SAVEAS.collect({ port, displayName });
+    values.model_name = document.getElementById('saveas-name').value.trim();
+    values.source_model = window.SAVEAS.sourceName();
+    htmx.ajax('POST', window.SAVEAS.saveUrl, {
+        target: '#modal-container', swap: 'innerHTML', values,
+    });
+}
+</script>
