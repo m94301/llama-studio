@@ -462,7 +462,8 @@ class ConfigManager:
 
         # Step 1: find GGUFs to generate skeletons for if missing
         logger.info(f"🔍 Searching for GGUF files in: {models_root}")
-        gguf_files = list(models_root.rglob("*.gguf")) if models_root.exists() else []
+        gguf_files = ([p for p in models_root.rglob("*.gguf") if not self._in_hidden_dir(p, models_root)]
+                      if models_root.exists() else [])
         logger.info(f"   Found {len(gguf_files)} GGUF file(s)")
         claimed_ggufs = self._claimed_gguf_paths(config_models_dir)
 
@@ -496,11 +497,24 @@ class ConfigManager:
         # safetensors). Only when a vllm executable is configured (doc 21 §1.4).
         if self.app_config.vllm_binary and models_root.exists():
             vllm_flags = None  # captured lazily, only if a skeleton is needed
+            claimed_dirs = self._claimed_model_dirs(config_models_dir)
             for cfg_file in models_root.rglob("config.json"):
+                if self._in_hidden_dir(cfg_file, models_root):
+                    continue
                 model_dir = cfg_file.parent
                 if not any(model_dir.glob("*.safetensors")):
                     continue
                 model_name = model_dir.name
+                try:
+                    resolved_dir = model_dir.resolve()
+                except (OSError, ValueError):
+                    resolved_dir = model_dir
+                if resolved_dir in claimed_dirs:
+                    logger.debug(f"   Already covered by an existing script: {model_name}")
+                    continue
+                if self._is_draft_model_dir(cfg_file):
+                    logger.debug(f"   Skipping draft-model weights: {model_name}")
+                    continue
                 script_path = config_models_dir / f"{model_name}.sh"
                 if script_path.exists() or (config_models_dir / f"{model_name}.sh.old").exists():
                     continue
@@ -1288,6 +1302,65 @@ class ConfigManager:
                 except (OSError, ValueError):
                     continue
         return claimed
+
+    def _claimed_model_dirs(self, config_dir: Path) -> set:
+        """Resolved model directories already served by, or drafting for, a script.
+
+        The vLLM counterpart of `_claimed_gguf_paths`. Claiming by filename alone
+        (`<dir name>.sh`) regenerated a duplicate skeleton whenever a script's
+        name stopped matching its weights directory: Save As + deleting the
+        original, a rename, or a script written by hand under a better name.
+        The parsed model path is used rather than a regex over the text because
+        vLLM scripts commonly name the model through a variable
+        (`MODEL="${X:-/path}"`, `serve "$MODEL"`). A speculative-config drafter
+        directory counts too, so it never gets a skeleton of its own.
+        """
+        claimed = set()
+        for script in config_dir.glob("*.sh*"):  # .sh plus disabled .sh.old
+            try:
+                ps = parse_script(script.read_text(errors="replace"))
+            except Exception:
+                continue
+            refs = [ps.model_path]
+            spec = ps.args.get("--speculative-config")
+            if spec:
+                try:
+                    refs.append((json.loads(spec) or {}).get("model"))
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+            for ref in refs:
+                if not ref:
+                    continue
+                try:
+                    claimed.add(Path(ref).resolve())
+                except (OSError, ValueError):
+                    continue
+        return claimed
+
+    # Architectures that only exist to propose tokens for a target model
+    # (DFlash2DraftModel, EagleLlamaForCausalLM, ...): never servable alone.
+    _DRAFT_ARCH_RE = re.compile(r"Draft|Eagle|Medusa|DFlash", re.IGNORECASE)
+
+    def _is_draft_model_dir(self, cfg_file: Path) -> bool:
+        try:
+            cfg = json.loads(cfg_file.read_text())
+        except Exception:
+            return False
+        archs = cfg.get("architectures") or []
+        return any(self._DRAFT_ARCH_RE.search(str(a)) for a in archs)
+
+    @staticmethod
+    def _in_hidden_dir(path: Path, root: Path) -> bool:
+        """True under a dot-directory: desktop trash (.Trash-1000), HF .cache, etc.
+
+        Weights moved to the trash are still on disk, and a skeleton for them
+        would resurrect a model the user deliberately threw away.
+        """
+        try:
+            parts = path.relative_to(root).parts[:-1]
+        except ValueError:
+            return False
+        return any(part.startswith(".") for part in parts)
 
     def _format_display_name(self, filename: str) -> str:
         name = filename.replace('.gguf', '')
