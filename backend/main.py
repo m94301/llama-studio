@@ -12,15 +12,17 @@ import sys
 import argparse
 import socket
 
+import httpx
+
 # Add backend directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
 APP_VERSION = "0.3.0"
 
-from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from config_manager import ConfigManager, ModelConfig, calculate_kv_cache_gb
@@ -31,6 +33,7 @@ from launch_script import (
     patch_meta_fence,
     set_vllm_manifest,
 )
+import chat_proxy
 import migrate_configs
 from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
@@ -2351,6 +2354,69 @@ async def model_log_tail(model: str, lines: int = 30):
     except Exception as e:
         logger.error(f"✗ Error reading log for {model}: {e}")
         return f"(error reading log: {str(e)})"
+
+
+# ============================================================================
+# Chat page - a minimal test chat for any OpenAI-compatible server (vLLM has no web UI)
+# ============================================================================
+
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page(model: Optional[str] = None, endpoint: Optional[str] = None):
+    """Standalone test chat for any OpenAI-compatible server.
+
+    Opened from a model row as /chat?model=<name>, it starts pointed at that
+    model's port; /chat?endpoint=host:port targets anything else. The server
+    box on the page can be changed and reconnected either way.
+    """
+    title = None
+    if model and model in config_manager.get_all_models():
+        mc = config_manager.get_model_config(model)
+        title = mc.display_name or model
+        if not endpoint and mc.port:
+            endpoint = f"localhost:{mc.port}"
+    template = jinja_env.get_template("chat.html")
+    return template.render(endpoint=endpoint or "", studio_title=title, app_version=APP_VERSION)
+
+
+@app.get("/api/chat/probe", response_class=JSONResponse)
+async def chat_probe(endpoint: str):
+    """Resolve a typed server:port and report the models it serves + its engine."""
+    try:
+        base_url, label = await chat_proxy.resolve_endpoint(endpoint)
+    except chat_proxy.EndpointError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    try:
+        info = await chat_proxy.probe(base_url)
+    except httpx.HTTPStatusError as e:
+        return JSONResponse({"ok": False, "endpoint": label,
+                             "error": f"{label}/v1/models returned HTTP {e.response.status_code}"}, status_code=502)
+    except httpx.HTTPError as e:
+        return JSONResponse({"ok": False, "endpoint": label,
+                             "error": f"No OpenAI-compatible server answering at {label} ({type(e).__name__})"}, status_code=502)
+    if not info["models"]:
+        return JSONResponse({"ok": False, "endpoint": label, "error": f"{label} reports no models"}, status_code=502)
+    return {"ok": True, "endpoint": label, **info}
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: Request):
+    """Forward one chat turn to the connected server and stream normalized NDJSON events."""
+    body = await request.json()
+    try:
+        base_url, _ = await chat_proxy.resolve_endpoint(body.get("endpoint", ""))
+    except chat_proxy.EndpointError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    messages = body.get("messages") or []
+    if not messages:
+        return JSONResponse({"error": "No messages"}, status_code=400)
+    payload = chat_proxy.build_payload(body.get("engine") or "openai", body.get("model"),
+                                       messages, body.get("sampling") or {})
+    return StreamingResponse(
+        chat_proxy.stream_chat(base_url, payload),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ============================================================================

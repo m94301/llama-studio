@@ -60,7 +60,7 @@
 
         .table-header {
             display: grid;
-            grid-template-columns: 100px 100px 2fr 100px 120px 80px 50px;
+            grid-template-columns: 100px 100px 2fr 100px 120px 80px 90px;
             gap: 1rem;
             padding: 0.75rem 1rem;
             font-weight: bold;
@@ -75,7 +75,7 @@
 
         .model-row {
             display: grid;
-            grid-template-columns: 100px 100px 2fr 100px 120px 80px 50px;
+            grid-template-columns: 100px 100px 2fr 100px 120px 80px 90px;
             gap: 1rem;
             padding: 0.75rem 1rem;
             align-items: center;
@@ -189,6 +189,11 @@
             color: #e5e7eb;
             border-color: #4b5563;
         }
+
+        /* Chat button only while the model is running. data-status is kept
+           current by the row's status polling, so no re-render is needed. */
+        .column-actions { display: flex; gap: 0.35rem; justify-content: flex-end; }
+        .model-row:not([data-status="running"]) .btn-chat { display: none; }
 
         /* Status Badges */
         .status-badge {
@@ -602,9 +607,12 @@
                     const data = JSON.parse(event.data);
                     if (data.type === 'model_state_change' && data.html_id) {
                         const selector = `#model-status-${data.html_id}`;
+                        // source = the polling wrapper, so its hx-on::after-request
+                        // runs and copies the new state into the row's data-status
+                        // (without it htmx issues the request from <body>).
                         htmx.ajax('GET',
                             `/api/get-model-status-inner?model=${encodeURIComponent(data.model_name)}`,
-                            { target: selector, swap: 'innerHTML' }
+                            { source: selector, target: selector, swap: 'innerHTML' }
                         );
                         // Auto-open log viewer when model starts loading
                         if (data.state === 'loading') {
