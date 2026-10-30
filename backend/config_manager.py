@@ -367,6 +367,10 @@ class AppConfig(BaseModel):
     # (not stored here — the script is the source of truth).
     startup_models: list = Field(default_factory=list, description="Model names to auto-load on startup")
     auto_load_on_startup: bool = Field(default=False, description="If True, load startup_models when the app starts")
+    # Leave engine processes running when Llama Studio stops (Ctrl+C, a
+    # --reload code change), and re-attach to them on the next start. Big
+    # vLLM models take many minutes to load; a restart shouldn't cost that.
+    keep_sessions_on_shutdown: bool = Field(default=True, description="Keep model servers running across Llama Studio restarts")
 
     @field_validator("webui_port")
     def webui_port_must_be_valid(cls, v):

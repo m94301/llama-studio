@@ -176,8 +176,7 @@ async def lifespan(app: FastAPI):
     logger.info("🦙 Llama Studio Shutting Down")
     logger.info("=" * 60)
     try:
-        await gpu_manager.cleanup()
-        logger.info("✓ All sessions terminated")
+        await gpu_manager.cleanup(keep_alive=config_manager.app_config.keep_sessions_on_shutdown)
     except Exception as e:
         logger.error(f"✗ Error during cleanup: {e}")
 
@@ -399,6 +398,7 @@ async def get_model_status_inner(model: str):
         status=status,
         model_config=model_config,
         error_msg=error_msg,
+        session_note=gpu_manager.session_notes.get(model),
     ))
 
 
@@ -519,6 +519,7 @@ async def index():
         app_version=APP_VERSION,
         store_button_html=_render_store_button(),
         auto_load_on_startup=config_manager.app_config.auto_load_on_startup,
+        keep_sessions_on_shutdown=config_manager.app_config.keep_sessions_on_shutdown,
     )
 
 
@@ -619,6 +620,12 @@ async def _auto_load_startup_models() -> None:
                     mc = config_manager.get_model_config(name)
                 except FileNotFoundError:
                     logger.warning(f"   ⏭  {name}: skipped — script no longer exists")
+                    skipped += 1
+                    continue
+
+                if name in gpu_manager.sessions:
+                    # Kept running across the restart and re-attached already.
+                    logger.info(f"   ⏭  {name}: already running (re-attached)")
                     skipped += 1
                     continue
 
@@ -763,6 +770,19 @@ async def toggle_auto_load(enabled: bool = Form(...)):
         return JSONResponse({"auto_load": bool(enabled)})
     except Exception as e:
         logger.error(f"✗ Error toggling auto-load: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/toggle-keep-alive", response_class=JSONResponse)
+async def toggle_keep_alive(enabled: bool = Form(...)):
+    """Update keep_sessions_on_shutdown."""
+    try:
+        config_manager.app_config.keep_sessions_on_shutdown = bool(enabled)
+        await config_manager.save_app_config()
+        logger.info(f"💾 keep_sessions_on_shutdown = {enabled}")
+        return JSONResponse({"keep_alive": bool(enabled)})
+    except Exception as e:
+        logger.error(f"✗ Error toggling keep-alive: {e}", exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

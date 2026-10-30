@@ -20,7 +20,10 @@ except ImportError:
     PYNVML_AVAILABLE = False
 
 from config_manager import ConfigManager, ModelConfig
-from llama_session import ENGINE_PROC_RE, LlamaSession, process_group_members
+from llama_session import (
+    ENGINE_PROC_RE, LlamaSession, launch_fingerprint, port_owned_by_group, proc_start_time,
+    process_group_members,
+)
 from port_manager import is_port_available
 from event_bus import event_bus
 
@@ -144,14 +147,19 @@ class GpuManager:
         # Process groups that survived their session's stop(), kept so they
         # stay in the on-disk registry and get reaped at the next start.
         self._orphans: Dict[str, dict] = {}
+        # Per-model notes for the row (e.g. "kept running across a restart").
+        self.session_notes: Dict[str, str] = {}
+        # Registry entries the startup triage judged safe to re-attach to.
+        self._adoptable: Dict[str, dict] = {}
 
     # ---- session registry: crash-proof cleanup across app restarts ----
     #
     # Every live session is recorded in sessions/active.json the moment it has
-    # a PID. On startup, before anything else, stale entries from a previous
-    # run (hard kill, --reload restart, crash) are reaped by killing their
-    # process groups — this is what guarantees no engine process ever outlives
-    # the app unnoticed.
+    # a PID. On startup, before anything else, each entry from the previous run
+    # is triaged (see _triage_registry): with "keep servers alive" on, a
+    # process that is provably the one we launched is re-attached; everything
+    # else of ours is reaped — so no engine process ever outlives the app
+    # unnoticed — and anything that is no longer ours is left alone.
 
     def _registry_path(self) -> Path:
         return self.config.project_root / "sessions" / "active.json"
@@ -160,7 +168,7 @@ class GpuManager:
         """Rewrite the registry from live sessions plus any known orphans."""
         try:
             data = {
-                name: {"pid": s.pid, "port": s.model_config.port}
+                name: s.registry_record()
                 for name, s in self.sessions.items()
                 if s.pid
             }
@@ -175,13 +183,47 @@ class GpuManager:
         except Exception as e:
             logger.warning(f"⚠ Could not write session registry: {e}")
 
-    def _reap_stale_sessions(self) -> None:
-        """Kill process groups recorded by a previous run that are still alive.
+    def _reap_group(self, name: str, pgid: int) -> bool:
+        """SIGTERM, wait up to 10s, SIGKILL a process group. True once it's empty."""
+        logger.warning(f"♻ Reaping stale session from previous run: {name} (pgid {pgid})")
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + 10
+        while time.time() < deadline and process_group_members(pgid):
+            time.sleep(0.5)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(0.2)
+        if process_group_members(pgid):
+            logger.error(
+                f"✗ Could not fully reap pgid {pgid} for {name} — it may still hold VRAM. "
+                f"Keeping it in the registry to retry next start."
+            )
+            return False
+        logger.info(f"✓ Reaped {name}")
+        return True
 
-        Entries that could not be killed are kept in the registry so a later
-        run tries again — forgetting them would strand VRAM with no record that
-        anything was left behind. Blocking: call via asyncio.to_thread.
+    def _triage_registry(self, keep_alive: bool) -> None:
+        """Decide, per entry left by the previous run, whether to adopt, reap, or leave it.
+
+        - Adopt (keep_alive on): the group's leader has the same PID *and* kernel
+          start time we recorded, so it is provably the process we launched,
+          and its model still has a script. Queued in self._adoptable; the
+          actual re-attach happens in initialize() once models are registered.
+        - Reap: ours, but not adoptable (keep_alive off, script gone, a
+          survivor of a failed unload, or the leader died leaving workers).
+        - Leave alone: the PID now belongs to a process with a different start
+          time, i.e. it was recycled for something that isn't ours, possibly a
+          server the user started by hand.
+
+        Entries from before start times were recorded are reaped as before.
+        Blocking: call via asyncio.to_thread.
         """
+        self._adoptable = {}
         path = self._registry_path()
         if not path.exists() or os.name == "nt":
             return
@@ -190,7 +232,8 @@ class GpuManager:
         except Exception:
             data = {}
 
-        unreaped: Dict[str, dict] = {}
+        keep: Dict[str, dict] = {}
+        models = self.config.get_all_models()
         for name, info in data.items():
             pgid = info.get("pid")
             if not pgid:
@@ -198,45 +241,150 @@ class GpuManager:
             members = process_group_members(pgid)
             if not members:
                 continue  # already gone
-            # PID-reuse guard: only kill groups that still look like ours.
+            recorded = info.get("start_time")
+            leader_now = proc_start_time(pgid)
+            if recorded is not None and leader_now is not None and leader_now != recorded:
+                logger.warning(
+                    f"⚠ Stale session {name}: PID {pgid} now belongs to a different process; not touching it"
+                )
+                continue
+            # PID-reuse guard for entries we can't identify by start time.
             if not ENGINE_PROC_RE.search(members):
                 logger.warning(
                     f"⚠ Stale session {name}: pgid {pgid} now holds unrelated processes; not touching it"
                 )
                 continue
-            logger.warning(f"♻ Reaping stale session from previous run: {name} (pgid {pgid})")
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except OSError:
-                pass
-            deadline = time.time() + 10
-            while time.time() < deadline and process_group_members(pgid):
-                time.sleep(0.5)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except OSError:
-                pass
-            time.sleep(0.2)
-            if process_group_members(pgid):
-                logger.error(
-                    f"✗ Could not fully reap pgid {pgid} for {name} — it may still hold VRAM. "
-                    f"Keeping it in the registry to retry next start."
-                )
-                unreaped[name] = info
-            else:
-                logger.info(f"✓ Reaped {name}")
+
+            is_orphan = name.endswith(":orphan")
+            adoptable = (
+                keep_alive and not is_orphan
+                and recorded is not None and leader_now == recorded
+                and name in models
+            )
+            if adoptable:
+                logger.info(f"↻ Found {name} still running from the previous run (pgid {pgid})")
+                self._adoptable[name] = info
+                keep[name] = info  # stays recorded until the re-attach replaces it
+                continue
+            if not self._reap_group(name, pgid):
+                keep[name] = info
 
         try:
-            path.write_text(json.dumps(unreaped, indent=1))
+            path.write_text(json.dumps(keep, indent=1))
         except Exception as e:
             logger.warning(f"⚠ Could not rewrite session registry: {e}")
+
+    def _attach_allocation(self, model_name: str, model_config: ModelConfig,
+                           gpu_ids: List[int], per_gpu_need: List[float]) -> None:
+        """Record a model as resident on its GPUs (app-tracked allocation + panel entry)."""
+        model = self.models[model_name]
+        model.gpu_ids = list(gpu_ids)
+        model.vram_per_gpu = list(per_gpu_need)
+        if not self.gpus:
+            return
+        for gid, need in zip(gpu_ids, per_gpu_need):
+            if gid in self.gpus:
+                self.gpus[gid].allocated += need
+                loaded_model_dict = model.to_dict()
+                loaded_model_dict['port'] = model_config.port
+                loaded_model_dict['engine'] = model_config.engine
+                # Surface per-GPU share for UI clarity
+                loaded_model_dict['vram_share'] = need
+                self.gpus[gid].loaded_models.append(loaded_model_dict)
+
+    def _release_allocation(self, model_name: str) -> None:
+        """Undo _attach_allocation."""
+        model = self.models.get(model_name)
+        if not model:
+            return
+        for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
+            if gid in self.gpus:
+                gpu = self.gpus[gid]
+                gpu.allocated = max(0.0, gpu.allocated - need)
+                gpu.loaded_models = [m for m in gpu.loaded_models if m["name"] != model_name]
+        model.gpu_ids = []
+        model.vram_per_gpu = []
+        model.pid = None
+
+    async def _adopt_sessions(self) -> None:
+        """Re-attach every session the startup triage found adoptable."""
+        for name, record in list(self._adoptable.items()):
+            try:
+                await self._adopt(name, record)
+            except Exception as e:
+                # Never leave a process of ours running untracked: reap it.
+                logger.error(f"✗ Could not re-attach {name}: {e}", exc_info=True)
+                self.sessions.pop(name, None)
+                self._release_allocation(name)
+                self.session_notes.pop(name, None)
+                await asyncio.to_thread(self._reap_group, name, record["pid"])
+        self._adoptable = {}
+        self._registry_sync()
+
+    async def _adopt(self, name: str, record: dict) -> None:
+        model_config = self.config.get_model_config(name)
+        session = LlamaSession.adopt(
+            model_config=model_config,
+            log_file=self.config.get_log_path(name),
+            record=record,
+            term_grace=30.0 if model_config.engine == "vllm" else 5.0,
+        )
+        self.sessions[name] = session
+        self.models[name].pid = session.pid
+        self._attach_allocation(name, model_config, session.gpu_ids, session.vram_per_gpu)
+
+        note = "Kept running across a Llama Studio restart"
+        recorded = record.get("script_fingerprint")
+        if recorded and launch_fingerprint(model_config.script_path) != recorded:
+            note += " — its script was edited since it was launched, so it's running the old settings"
+
+        self.session_notes[name] = note
+
+        owned = await asyncio.to_thread(port_owned_by_group, model_config.port, session.pid)
+        if owned is not False and await session.is_healthy():
+            await self._set_model_state(name, ModelState.RUNNING, LoadingPhase.RUNNING)
+            logger.info(f"✓ Re-attached {name} (pgid {session.pid}, port {model_config.port}): running")
+            return
+
+        # Still loading when the previous run went away (or not answering yet):
+        # wait for the remainder of its health timeout, as the original load would have.
+        elapsed = time.time() - (record.get("launched_at") or time.time())
+        remaining = max(60, int(session.health_timeout - elapsed))
+        await self._set_model_state(name, ModelState.LOADING, LoadingPhase.HEALTH_CHECKING)
+        logger.info(f"↻ Re-attached {name} mid-load; waiting up to {remaining}s for it to become ready")
+        asyncio.create_task(self._finish_adopted_load(name, session, remaining))
+
+    async def _finish_adopted_load(self, name: str, session: LlamaSession, timeout: int) -> None:
+        try:
+            await session.wait_ready(timeout=timeout)
+        except asyncio.CancelledError:
+            return  # cancel_load already cleaned up
+        except Exception as e:
+            if self.sessions.get(name) is not session:
+                return  # the crash watchdog (or a cancel) got there first
+            logger.error(f"✗ Re-attached {name} never became ready: {e}")
+            await session.stop()
+            self.sessions.pop(name, None)
+            self._release_allocation(name)
+            self.session_notes.pop(name, None)
+            self._registry_sync()
+            await self._set_model_state(name, ModelState.FAILED, LoadingPhase.ERROR,
+                                        f"re-attached after restart but never became ready: {e}")
+            asyncio.create_task(event_bus.broadcast({"type": "gpu_update"}))
+            return
+        if self.sessions.get(name) is session:
+            await self._set_model_state(name, ModelState.RUNNING, LoadingPhase.RUNNING)
+            logger.info(f"✓ Re-attached {name} is now ready")
+            asyncio.create_task(event_bus.broadcast({"type": "gpu_update"}))
 
     async def initialize(self) -> None:
         """Detect available GPUs on startup."""
         # Before anything else: clean up engine processes a previous run left
         # behind. Runs in a thread — it polls with blocking sleeps for up to
         # ~10s per stale group and must not stall the event loop.
-        await asyncio.to_thread(self._reap_stale_sessions)
+        await asyncio.to_thread(
+            self._triage_registry, bool(getattr(self.config.app_config, "keep_sessions_on_shutdown", True))
+        )
 
         if PYNVML_AVAILABLE:
             try:
@@ -299,12 +447,30 @@ class GpuManager:
                 phase=LoadingPhase.IDLE,
             )
 
+        # Re-attach servers the previous run left running (keep-alive on).
+        # After model registration (needs self.models) and before the monitor
+        # starts, so the watchdog sees them as sessions from its first tick.
+        await self._adopt_sessions()
+
         # Start the monitor task: GPU power/temp/VRAM refresh + the session
         # crash watchdog. Runs even without NVML so crash detection still works.
         asyncio.create_task(self._monitor_gpu_stats())
 
-    async def cleanup(self) -> None:
-        """Terminate all running llama-server sessions."""
+    async def cleanup(self, keep_alive: bool = False) -> None:
+        """Terminate all running sessions — or, with keep_alive, leave them for the next start.
+
+        Engines run in their own session (start_new_session=True) and log to a
+        file, so nothing ties their lifetime to this process: with keep_alive
+        the registry is simply left describing them, and the next start's
+        triage re-attaches whatever is provably still ours.
+        """
+        if keep_alive and self.sessions:
+            self._registry_sync()
+            logger.info(
+                f"↻ Leaving {len(self.sessions)} server(s) running (Keep servers alive is on): "
+                + ", ".join(self.sessions)
+            )
+            return
         logger.info("⏳ Cleaning up sessions...")
 
         names = list(self.sessions.keys())
@@ -513,6 +679,7 @@ class GpuManager:
                     if gid in self.gpus:
                         baseline[gid] = self.gpus[gid].mem_used_gb
 
+            session.vram_per_gpu = list(per_gpu_need)  # persisted in the registry for re-attach
             # Store session BEFORE start() so cancel_load can find it
             self.sessions[model_name] = session
 
@@ -523,20 +690,8 @@ class GpuManager:
             # Health check phase
             await self._set_model_state(model_name, ModelState.LOADING, LoadingPhase.HEALTH_CHECKING)
             self.models[model_name].pid = pid
-            self.models[model_name].gpu_ids = list(gpu_ids)
-            self.models[model_name].vram_per_gpu = list(per_gpu_need)
-
             # Update GPU allocation across all chosen GPUs
-            if self.gpus:
-                for gid, need in zip(gpu_ids, per_gpu_need):
-                    if gid in self.gpus:
-                        self.gpus[gid].allocated += need
-                        loaded_model_dict = self.models[model_name].to_dict()
-                        loaded_model_dict['port'] = model_config.port
-                        loaded_model_dict['engine'] = model_config.engine
-                        # Surface per-GPU share for UI clarity
-                        loaded_model_dict['vram_share'] = need
-                        self.gpus[gid].loaded_models.append(loaded_model_dict)
+            self._attach_allocation(model_name, model_config, gpu_ids, per_gpu_need)
 
             # A successful vLLM load reports its exact KV bytes/token; capture
             # it so the calculator stops relying on the config.json estimate.
@@ -615,6 +770,7 @@ class GpuManager:
             if session:
                 session.cancelled = True
                 await session.stop()
+            self.session_notes.pop(model_name, None)
             self._registry_sync()
 
             # Reset GPU allocation if it was partially updated
@@ -694,6 +850,7 @@ class GpuManager:
 
             # Clean up
             del self.sessions[model_name]
+            self.session_notes.pop(model_name, None)
             self._registry_sync()
             model.gpu_ids = []
             model.vram_per_gpu = []
@@ -773,12 +930,13 @@ class GpuManager:
                 # request left the row stuck) would otherwise never be cleaned
                 # up, leaving a stale registry entry and a frozen row.
                 for name, session in list(self.sessions.items()):
-                    if (
-                        self.get_model_state(name) in (ModelState.RUNNING, ModelState.LOADING)
-                        and session.process is not None
-                        and session.process.poll() is not None
-                    ):
+                    if self.get_model_state(name) not in (ModelState.RUNNING, ModelState.LOADING):
+                        continue
+                    if session.process is not None and session.process.poll() is not None:
                         await self._handle_crashed_session(name, session.process.returncode)
+                    elif session.adopted and session.process is None and session.pid and not session.leader_alive():
+                        # Re-attached sessions have no exit code to read.
+                        await self._handle_crashed_session(name, None)
 
                 # Wait before next update
                 await asyncio.sleep(1.0)
@@ -792,6 +950,7 @@ class GpuManager:
         """Clean up after a session whose process died out from under us."""
         logger.error(f"✗ {model_name} process exited unexpectedly (code {returncode})")
         crashed = self.sessions.pop(model_name, None)
+        self.session_notes.pop(model_name, None)
         if crashed is not None:
             # A dead leader can leave engine workers holding VRAM — sweep the group.
             crashed.kill_process_group(signal.SIGKILL)

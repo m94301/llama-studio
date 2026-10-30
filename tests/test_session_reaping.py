@@ -127,7 +127,7 @@ class TestReaper:
     def test_reaps_a_stale_group(self, tmp_path, fake_engine):
         p = fake_engine()
         reg = self._registry(tmp_path, {"m": {"pid": p.pid, "port": 9999}})
-        self._manager(tmp_path)._reap_stale_sessions()
+        self._manager(tmp_path)._triage_registry(keep_alive=False)
         time.sleep(0.3)
         assert process_group_members(p.pid) == ""
         assert json.loads(reg.read_text()) == {}
@@ -135,13 +135,13 @@ class TestReaper:
     def test_spares_a_recycled_pid(self, tmp_path, fake_engine):
         p = fake_engine(name="firefox")
         self._registry(tmp_path, {"m": {"pid": p.pid, "port": 9999}})
-        self._manager(tmp_path)._reap_stale_sessions()
+        self._manager(tmp_path)._triage_registry(keep_alive=False)
         time.sleep(0.3)
         assert process_group_members(p.pid) != ""
 
     def test_forgets_entries_whose_group_is_already_gone(self, tmp_path):
         reg = self._registry(tmp_path, {"m": {"pid": 999999, "port": 9999}})
-        self._manager(tmp_path)._reap_stale_sessions()
+        self._manager(tmp_path)._triage_registry(keep_alive=False)
         assert json.loads(reg.read_text()) == {}
 
     def test_keeps_entries_it_could_not_kill(self, tmp_path, fake_engine, monkeypatch):
@@ -151,7 +151,7 @@ class TestReaper:
         p = fake_engine()
         reg = self._registry(tmp_path, {"m": {"pid": p.pid, "port": 9999}})
         monkeypatch.setattr(gpu_manager.os, "killpg", lambda *a: None)  # kills fail silently
-        self._manager(tmp_path)._reap_stale_sessions()
+        self._manager(tmp_path)._triage_registry(keep_alive=False)
         assert "m" in json.loads(reg.read_text())
 
 

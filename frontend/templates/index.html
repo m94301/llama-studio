@@ -463,6 +463,16 @@
                     <span>Load on startup</span>
                 </label>
 
+                <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
+                       title="When Llama Studio stops or restarts (Ctrl+C, a code reload), leave loaded model servers running and re-attach to them on the next start. Unload from the table to stop a server.">
+                    <input type="checkbox"
+                           id="keep-alive-checkbox"
+                           {% if keep_sessions_on_shutdown %}checked{% endif %}
+                           onchange="toggleKeepAlive(this.checked)"
+                           class="w-3.5 h-3.5 rounded cursor-pointer">
+                    <span>Keep servers alive on shutdown</span>
+                </label>
+
                 <button type="button"
                         onclick="openSettingsModal()"
                         class="px-4 py-2 rounded font-bold text-sm transition-colors {% if config_incomplete %}bg-red-600 hover:bg-red-500 animate-pulse{% else %}bg-gray-700 hover:bg-gray-600{% endif %}"
@@ -567,6 +577,20 @@
                 // Revert UI state on failure
                 document.getElementById('auto-load-checkbox').checked = !enabled;
                 alert('Could not save auto-load setting: ' + e);
+            }
+        }
+
+        // Persist the "Keep servers alive on shutdown" checkbox to app.json
+        async function toggleKeepAlive(enabled) {
+            const fd = new FormData();
+            fd.append('enabled', enabled ? 'true' : 'false');
+            try {
+                const r = await fetch('/api/toggle-keep-alive', { method: 'POST', body: fd });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+            } catch (e) {
+                console.error('toggle keep-alive failed:', e);
+                document.getElementById('keep-alive-checkbox').checked = !enabled;
+                alert('Could not save keep-alive setting: ' + e);
             }
         }
 

@@ -6,11 +6,15 @@ import logging
 import os
 import re
 import signal
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 import httpx
 
+import hashlib
+
 from config_manager import ModelConfig
+from launch_script import META_BEGIN, META_END
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,101 @@ def process_group_members(pgid: Optional[int]) -> str:
     return "\n".join(members)
 
 
+def proc_start_time(pid: Optional[int]) -> Optional[int]:
+    """Kernel start time of `pid` (clock ticks since boot), or None if it's gone.
+
+    Together with the PID this identifies a process uniquely: a recycled PID
+    has a different start time. That is what lets a restarted Llama Studio tell
+    "the server I launched" from "some other process that got the same PID".
+    Zombies count as gone.
+    """
+    if not pid or os.name == "nt":
+        return None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    # comm (field 2) is parenthesised and may contain spaces; split after it.
+    fields = stat[stat.rfind(")") + 2:].split()
+    if not fields or fields[0] == "Z":
+        return None
+    try:
+        return int(fields[19])  # field 22 overall: starttime
+    except (IndexError, ValueError):
+        return None
+
+
+def _listen_inodes(port: int) -> set:
+    """Socket inodes LISTENing on `port` (IPv4 and IPv6)."""
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                next(f, None)
+                for line in f:
+                    cols = line.split()
+                    if len(cols) < 10 or cols[3] != "0A":  # 0A = LISTEN
+                        continue
+                    if int(cols[1].rsplit(":", 1)[1], 16) == port:
+                        inodes.add(cols[9])
+        except OSError:
+            continue
+    return inodes
+
+
+def port_owned_by_group(port: Optional[int], pgid: Optional[int]) -> Optional[bool]:
+    """Is the process LISTENing on `port` a member of process group `pgid`?
+
+    True / False when it can be determined, None when it can't (no /proc).
+    False also covers "nobody is listening yet", the normal state while an
+    engine is still loading. This is the identity check for adopted sessions:
+    /health alone can't tell our server from a different one on the same port.
+    """
+    if not port or not pgid or not os.path.isdir("/proc/net"):
+        return None
+    inodes = _listen_inodes(int(port))
+    if not inodes:
+        return False
+    wanted = {f"socket:[{i}]" for i in inodes}
+    for line in process_group_members(pgid).splitlines():
+        pid = line.split(None, 1)[0]
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    if os.readlink(f"/proc/{pid}/fd/{fd}") in wanted:
+                        return True
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return False
+
+
+def launch_fingerprint(script_path: Path) -> Optional[str]:
+    """Hash of everything in a script that affects how the server launches.
+
+    The meta fence is excluded: Llama Studio itself rewrites it after a
+    successful load (KV/weights calibration) and on display-name edits, so a
+    raw mtime or full-text comparison would report every calibrated model as
+    "edited since launch".
+    """
+    try:
+        text = script_path.read_text(errors="replace")
+    except OSError:
+        return None
+    kept, inside = [], False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == META_BEGIN:
+            inside = True
+        elif stripped == META_END:
+            inside = False
+        elif not inside:
+            kept.append(line)
+    return hashlib.sha256("\n".join(kept).encode()).hexdigest()[:16]
+
+
 class LlamaSession:
     """Manages a single llama-server process."""
 
@@ -86,6 +185,58 @@ class LlamaSession:
         self.process: Optional[subprocess.Popen] = None
         self.pid: Optional[int] = None
         self.cancelled: bool = False
+        # Identity + bookkeeping persisted in the session registry so a
+        # restarted Llama Studio can re-attach to this process (see adopt()).
+        self.start_time: Optional[int] = None   # proc_start_time(pid) at spawn
+        self.launched_at: Optional[float] = None  # wall clock, for the remaining health timeout
+        self.script_fingerprint: Optional[str] = None  # launch_fingerprint() at spawn
+        self.vram_per_gpu: list = []
+        # True when this session was re-attached after a restart: there is no
+        # Popen handle, so liveness and termination go through the PID/pgid.
+        self.adopted: bool = False
+
+    @classmethod
+    def adopt(cls, *, model_config: ModelConfig, log_file: Path, record: Dict[str, Any],
+              term_grace: float = 5.0) -> "LlamaSession":
+        """Re-attach to a process a previous Llama Studio run launched."""
+        session = cls(
+            model_config=model_config,
+            llama_server_binary="",
+            log_file=log_file,
+            gpu_ids=record.get("gpu_ids") or [],
+            health_timeout=int(record.get("health_timeout") or 120),
+            term_grace=term_grace,
+        )
+        session.pid = record["pid"]
+        session.start_time = record.get("start_time")
+        session.launched_at = record.get("launched_at")
+        session.script_fingerprint = record.get("script_fingerprint")
+        session.vram_per_gpu = list(record.get("vram_per_gpu") or [])
+        session.adopted = True
+        return session
+
+    def registry_record(self) -> Dict[str, Any]:
+        """What the session registry stores to recognise and re-attach this process."""
+        return {
+            "pid": self.pid,
+            "start_time": self.start_time,
+            "port": self.model_config.port,
+            "engine": self.model_config.engine,
+            "gpu_ids": list(self.gpu_ids),
+            "vram_per_gpu": list(self.vram_per_gpu),
+            "launched_at": self.launched_at,
+            "script_fingerprint": self.script_fingerprint,
+            "health_timeout": self.health_timeout,
+        }
+
+    def leader_alive(self) -> bool:
+        """The process we launched (or adopted) is still that same process."""
+        if self.process is not None:
+            return self.process.poll() is None
+        if not self.pid:
+            return False
+        now = proc_start_time(self.pid)
+        return now is not None and (self.start_time is None or now == self.start_time)
 
     def _build_env(self) -> Dict[str, str]:
         """Environment for the engine process.
@@ -147,6 +298,9 @@ class LlamaSession:
             )
 
             self.pid = self.process.pid
+            self.start_time = proc_start_time(self.pid)
+            self.launched_at = time.time()
+            self.script_fingerprint = launch_fingerprint(script_path)
             logger.info(f"✓ Process spawned with PID {self.pid}")
             if self.on_spawn:
                 try:
@@ -212,6 +366,9 @@ class LlamaSession:
         sweep runs unconditionally for the same reason.
         """
         self.cancelled = True
+        if self.adopted and self.process is None:
+            await self._stop_adopted()
+            return
         if not self.process:
             return
 
@@ -246,8 +403,34 @@ class LlamaSession:
         except Exception as e:
             logger.error(f"✗ Error stopping {self.model_config.name}: {e}")
 
+    async def _stop_adopted(self) -> None:
+        """stop() for a re-attached session: no Popen handle, so go by the group."""
+        if not self.pid:
+            return
+        try:
+            logger.info(f"⏳ Stopping adopted {self.model_config.name} (pgid {self.pid})")
+            # The leader is still the process we launched (start time matches),
+            # so the PID can't have been recycled; signal the whole group.
+            if self.leader_alive():
+                self.kill_process_group(signal.SIGTERM)
+            deadline = time.time() + self.term_grace
+            while time.time() < deadline and self.group_is_alive():
+                await asyncio.sleep(0.5)
+            if self.group_is_alive():
+                logger.warning(f"⚠ Force-killing adopted {self.model_config.name} process group")
+            # Verified sweep: once the leader is gone its PID may be reused.
+            self.kill_process_group(signal.SIGKILL, verify=True)
+            await asyncio.sleep(0.2)
+            if not self.group_is_alive():
+                logger.info(f"✓ {self.model_config.name} terminated")
+                self.pid = None
+        except Exception as e:
+            logger.error(f"✗ Error stopping adopted {self.model_config.name}: {e}")
+
     async def is_running(self) -> bool:
         """Check if process is still running."""
+        if self.adopted and self.process is None:
+            return self.leader_alive()
         if not self.process:
             return False
         return self.process.poll() is None
@@ -289,9 +472,14 @@ class LlamaSession:
             if not await self.is_running():
                 raise RuntimeError(f"Process exited before becoming ready")
 
-            # Check health endpoint
+            # Check health endpoint. An adopted session must also own the
+            # port: during its load nothing of ours is listening yet, and a
+            # different server answering /health there is not our model.
             if await self.is_healthy():
-                return
+                if not self.adopted:
+                    return
+                if await asyncio.to_thread(port_owned_by_group, self.model_config.port, self.pid) is not False:
+                    return
 
             # Check timeout
             elapsed = asyncio.get_event_loop().time() - start_time
@@ -309,5 +497,6 @@ class LlamaSession:
             "model_name": self.model_config.name,
             "pid": self.pid,
             "port": self.model_config.port,
-            "running": self.process is not None and self.process.poll() is None,
+            "running": self.leader_alive(),
+            "adopted": self.adopted,
         }
