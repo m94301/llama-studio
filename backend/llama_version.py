@@ -8,15 +8,26 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Two formats have been seen in the wild:
+#   old: "version: 9030 (17df5830e)"
+#   new: "version: 0.4.1-dev (build 11067, commit fe93f196b)"
+# Try new first (current upstream), fall back to old (older/forked binaries).
+_VERSION_RE_NEW = re.compile(r'build\s+(\d+),\s+commit\s+([a-f0-9]+)')
+_VERSION_RE_OLD = re.compile(r'version:\s+(\d+)\s+\(([a-f0-9]+)\)')
+
+
 def get_version(binary_path: str) -> Optional[str]:
     """
     Run llama-server --version and parse the version string.
 
-    Expected format:
-        version: 9030 (17df5830e)
+    Handles both the current upstream format ("version: 0.4.1-dev (build
+    11067, commit fe93f196b)") and the older one ("version: 9030
+    (17df5830e)"). Either way the identifier stays "<build>_<commit>" so
+    existing cache files and app.json's stored llama_schema_version keep
+    working across the format change.
 
     Returns:
-        "9030_17df5830e" or None if detection fails
+        "11067_fe93f196b" or None if detection fails
     """
     try:
         binary_path = Path(binary_path)
@@ -31,9 +42,8 @@ def get_version(binary_path: str) -> Optional[str]:
             timeout=5,
         )
 
-        # Parse "version: 9030 (17df5830e)" - check both stdout and stderr
         combined_output = result.stdout + result.stderr
-        match = re.search(r'version:\s+(\d+)\s+\(([a-f0-9]+)\)', combined_output)
+        match = _VERSION_RE_NEW.search(combined_output) or _VERSION_RE_OLD.search(combined_output)
         if match:
             version_num, commit = match.groups()
             version_str = f"{version_num}_{commit}"

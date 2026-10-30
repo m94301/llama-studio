@@ -55,6 +55,7 @@ ARGS_END = "# === llama-studio:launch-args END ==="
 # Aliases: short form -> long form (normalize on parse, preserve user's choice when possible)
 FLAG_ALIASES: Dict[str, str] = {
     "-m": "--model",
+    "-a": "--alias",
     "-c": "--ctx-size",
     "-ctk": "--cache-type-k",
     "-ctv": "--cache-type-v",
@@ -897,13 +898,15 @@ def parse_pasted_script(text: str) -> ParsedScript:
 
     # Resolved decision #1: paste-import always overwrites display_name from --alias
     alias = ps.args.get("--alias")
-    if alias:
+    if alias and alias != _DISPLAY_NAME_VAR_REF:
         ps.display_name = alias
 
     return ps
 
 
 _CVD_KEY = "CUDA_VISIBLE_DEVICES"
+_DISPLAY_NAME_KEY = "DISPLAY_NAME"
+_DISPLAY_NAME_VAR_REF = f"${_DISPLAY_NAME_KEY}"
 
 
 def _parse_cvd_value(raw: str) -> Optional[List[int]]:
@@ -1015,9 +1018,31 @@ def render_script(
         if "LLAMA_BIN" not in body:
             body = body + f'\nLLAMA_BIN={shlex.quote(llama_bin)}\n'
 
-    invocation = _render_invocation(llama_bin, model_path, args)
+    # Default the API-visible model name (-a/--alias) to a $DISPLAY_NAME
+    # reference so it tracks display_name forever without ever needing the
+    # args themselves patched again. Never overrides an alias the user
+    # already set explicitly (literal or otherwise).
+    if engine == "llamacpp" and display_name and not any(k in args for k in ("-a", "--alias")):
+        args = dict(args)
+        args["--alias"] = _DISPLAY_NAME_VAR_REF
 
-    return f"#!/usr/bin/env bash\n{meta_block}\n{body}\n{invocation}\n"
+    invocation = _render_invocation(llama_bin, model_path, args)
+    out = f"#!/usr/bin/env bash\n{meta_block}\n{body}\n{invocation}\n"
+
+    # Keep the DISPLAY_NAME= body variable in sync whenever anything in the
+    # script references it (fresh injection above, or preserved from before).
+    if display_name and _DISPLAY_NAME_VAR_REF in out:
+        out = patch_display_name_var(out, display_name)
+
+    return out
+
+
+_SHELL_VAR_REF_RE = re.compile(r'^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$')
+
+
+def _is_shell_var_ref(value: str) -> bool:
+    """True for a bare $NAME or ${NAME} reference and nothing else around it."""
+    return bool(_SHELL_VAR_REF_RE.match(value))
 
 
 def _render_invocation(llama_bin: str, model_path: Optional[str], args: Dict[str, Optional[str]]) -> str:
@@ -1031,6 +1056,10 @@ def _render_invocation(llama_bin: str, model_path: Optional[str], args: Dict[str
             continue  # already emitted
         if value is None or str(value).strip() == "":
             arg_lines.append(f"  {key}")
+        elif _is_shell_var_ref(str(value)):
+            # A bare $NAME / ${NAME} reference: emit double-quoted so the shell
+            # expands it, instead of shlex.quote turning it into a dead literal.
+            arg_lines.append(f'  {key} "{value}"')
         else:
             arg_lines.append(f"  {key} {shlex.quote(str(value))}")
     if arg_lines:
@@ -1176,7 +1205,7 @@ def patch_launch_args_fence(
 
 # Shell variables the app manages itself; the user edits these through their own
 # controls, not as free-form environment rows.
-MANAGED_ASSIGNMENTS = {_CVD_KEY}
+MANAGED_ASSIGNMENTS = {_CVD_KEY, _DISPLAY_NAME_KEY}
 
 _ASSIGN_LINE_RE = re.compile(
     r'^[ \t]*(?P<export>export[ \t]+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)='
@@ -1371,6 +1400,55 @@ def patch_exec_invocation(
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+def patch_display_name_var(text: str, display_name: Optional[str]) -> str:
+    """Insert, replace, or remove the canonical DISPLAY_NAME= line.
+
+    Keeps a `DISPLAY_NAME='...'` shell assignment in the body in sync with the
+    meta fence's display_name, so `-a "$DISPLAY_NAME"` in the invocation always
+    reflects the current name without any patching of the args themselves —
+    same idea as `patch_cuda_visible_devices` for CUDA_VISIBLE_DEVICES.
+    Idempotent: no-ops if the script already has the canonical line.
+    """
+    lines = text.splitlines()
+    trailing_newline = "\n" if text.endswith("\n") else ""
+
+    standalone_re = re.compile(
+        rf'^[ \t]*{_DISPLAY_NAME_KEY}=(?:"[^"]*"|\'[^\']*\'|\S*)[ \t]*(?:#.*)?$'
+    )
+
+    if display_name is None:
+        cleaned = [ln for ln in lines if not standalone_re.match(ln)]
+        return "\n".join(cleaned) + trailing_newline
+
+    # single-quoted: the value is free text and must not itself be expanded
+    escaped = display_name.replace("'", "'\\''")
+    new_line = f"{_DISPLAY_NAME_KEY}='{escaped}'"
+
+    existing_idx = next((i for i, ln in enumerate(lines) if standalone_re.match(ln)), None)
+    if existing_idx is not None:
+        if lines[existing_idx] == new_line:
+            return text  # already canonical, no-op
+        lines[existing_idx] = new_line
+        return "\n".join(lines) + trailing_newline
+
+    # Insert after LLAMA_BIN= if present, else after the meta fence, else at top.
+    insert_at: Optional[int] = None
+    for i, line in enumerate(lines):
+        if re.match(r"^[ \t]*LLAMA_BIN[ \t]*=", line):
+            insert_at = i + 1
+            break
+    if insert_at is None:
+        for i, line in enumerate(lines):
+            if line.strip() == META_END:
+                insert_at = i + 1
+                break
+    if insert_at is None:
+        insert_at = 1 if lines and lines[0].startswith("#!") else 0
+
+    lines[insert_at:insert_at] = [new_line]
+    return "\n".join(lines) + trailing_newline
+
+
 def patch_cuda_visible_devices(text: str, ids: Optional[List[int]]) -> str:
     """Insert, replace, or remove the canonical CUDA_VISIBLE_DEVICES line.
 
@@ -1470,7 +1548,10 @@ def render_skeleton_script(
     """Render a skeleton script for a newly-discovered GGUF.
 
     --port is intentionally omitted so the model shows as unconfigured (resolved
-    decision #2). Defaults match the previous JSON skeleton.
+    decision #2). --batch-size was raised from the original JSON skeleton's 512
+    after a real config using it measured ~4x worse prompt-processing throughput
+    than the llama-server upstream default (2048). KV stays f16 (faster than
+    q8_0 - the dequant cost per token isn't worth the memory savings here).
     """
     args: Dict[str, Optional[str]] = {
         "--host": "0.0.0.0",
@@ -1478,8 +1559,10 @@ def render_skeleton_script(
         "--ctx-size": "4096",
         "--cache-type-k": "f16",
         "--cache-type-v": "f16",
-        "--batch-size": "512",
+        "--batch-size": "2048",
+        "--ubatch-size": "512",
         "--threads": "12",
+        "-fa": "on",
     }
     return render_script(
         display_name=display_name,

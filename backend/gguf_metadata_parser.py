@@ -191,7 +191,20 @@ def parse_gguf_metadata(
             if isinstance(num_heads, list):
                 num_heads = num_heads[0] if num_heads else None
             if isinstance(num_heads_kv, list):
-                num_heads_kv = num_heads_kv[0] if num_heads_kv else None
+                # Some hybrid MoE archs (e.g. bailingmoe3 / Ling, glm5next) declare a
+                # per-layer KV-head count: 0 on linear-attention (KDA) layers, >0 on the
+                # few full-attention (MLA) layers. Detect that pattern so only the real
+                # attention layers drive the KV estimate. Element 0 may be a linear layer
+                # with 0 KV heads, which would otherwise (a) break GQA detection and
+                # (b) leave kv_active_layers at the full block_count — massively
+                # over-estimating KV (Ling: 903 GB vs ~3 GB actual).
+                _nz = [h for h in num_heads_kv if h]
+                if _nz and len(_nz) < len(num_heads_kv):
+                    kv_active_layers = len(_nz)
+                    num_heads_kv = max(_nz)
+                    logger.debug(f"   [GGUF] Hybrid per-layer KV heads: {kv_active_layers} attention layers (of {block_count}), kv_heads={num_heads_kv}")
+                else:
+                    num_heads_kv = num_heads_kv[0] if num_heads_kv else None
 
             # Use key_length when present for non-hybrid architectures (matches
             # llama.cpp's KV cache sizing). Skip when:

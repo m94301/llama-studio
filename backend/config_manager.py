@@ -26,6 +26,7 @@ from launch_script import (
     patch_meta_fence,
     patch_launch_args_fence,
     patch_cuda_visible_devices,
+    patch_display_name_var,
     DEFAULT_HEALTH_TIMEOUT,
 )
 
@@ -975,6 +976,11 @@ class ConfigManager:
                 model_path=model_path,
                 args=args,
             )
+            # Keep DISPLAY_NAME= in sync if the script's -a references it
+            # (patch_launch_args_fence rewrites the body wholesale, so this
+            # runs after it, every save - matches the render_script guard).
+            if display_name and "$DISPLAY_NAME" in text:
+                text = patch_display_name_var(text, display_name)
         else:
             from launch_script import render_script
             text = render_script(

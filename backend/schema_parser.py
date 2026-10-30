@@ -83,6 +83,9 @@ def _parse_help_text(help_text: str) -> Dict:
 
         # Parse all option aliases from the comma-separated list
         options = [opt.strip() for opt in options_str.split(',') if opt.strip()]
+        # Drop non-flag matches like "-----" section dividers (help text uses
+        # them as headers, e.g. "----- speculative params -----").
+        options = [opt for opt in options if re.match(r'^-{1,2}[A-Za-z]', opt)]
         if not options:
             continue
 
