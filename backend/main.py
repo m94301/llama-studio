@@ -393,8 +393,8 @@ async def _auto_load_startup_models() -> None:
     port collision, insufficient VRAM, or any load_model exception. Never aborts
     the loop.
 
-    Updates AUTO_LOAD_PROGRESS and AUTO_LOAD_CURRENT_NAME so the banner endpoint
-    can surface progress to the UI.
+    Updates AUTO_LOAD_PROGRESS and AUTO_LOAD_CURRENT_NAME and announces each
+    step over the WebSocket, so open pages refresh the banner.
     """
     global AUTO_LOAD_CURRENT_NAME
     names = sorted(config_manager.app_config.startup_models or [])
@@ -410,12 +410,16 @@ async def _auto_load_startup_models() -> None:
     AUTO_LOAD_PROGRESS["current_index"] = 0
     AUTO_LOAD_CURRENT_NAME = ""
 
+    def announce() -> None:
+        asyncio.create_task(event_bus.broadcast({"type": "auto_load"}))
+
     loaded = 0
     skipped = 0
     try:
         for idx, name in enumerate(names, start=1):
             AUTO_LOAD_PROGRESS["current_index"] = idx
             AUTO_LOAD_CURRENT_NAME = name
+            announce()
             try:
                 try:
                     mc = config_manager.get_model_config(name)
@@ -439,7 +443,7 @@ async def _auto_load_startup_models() -> None:
                     skipped += 1
                     continue
 
-                if not mc.is_flexible_split and len(cvd) != mc.gpu_count:
+                if not mc.cvd_matches_split:
                     logger.warning(
                         f"   ⏭  {name}: skipped — CVD has {len(cvd)} GPU(s) but "
                         f"--tensor-split declares {mc.gpu_count}"
@@ -456,6 +460,7 @@ async def _auto_load_startup_models() -> None:
     finally:
         AUTO_LOAD_PROGRESS["active"] = 0
         AUTO_LOAD_CURRENT_NAME = ""
+        announce()
 
     logger.info("=" * 60)
     logger.info(f"🚀 Auto-load complete: {loaded} loaded, {skipped} skipped")
@@ -466,10 +471,11 @@ async def _auto_load_startup_models() -> None:
 async def auto_load_banner():
     """Return banner HTML when startup auto-load is in progress, empty otherwise.
 
-    Polled by the index page. When loading finishes the swap clears the banner.
+    Fetched on page load and on each `auto_load` WebSocket event. When nothing
+    is loading it answers 286, htmx's "stop polling", so the page stops asking.
     """
     if not AUTO_LOAD_PROGRESS.get("active"):
-        return HTMLResponse("")
+        return HTMLResponse("", status_code=286)
     return HTMLResponse(_render(
         "snippets/auto_load_banner.html",
         current=AUTO_LOAD_PROGRESS.get("current_index", 0),
