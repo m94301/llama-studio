@@ -66,3 +66,6 @@ config/models/*.sh.off
 # OS
 *.pid
 .pid
+
+# Local behavior snapshot (holds local paths)
+tests/.snapshot/
