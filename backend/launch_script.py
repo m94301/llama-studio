@@ -31,8 +31,8 @@ is `exec ".../vllm" serve <model-dir> --flags...` with the model as a
 positional argument. vLLM scripts commonly carry an env-var preamble
 (`export VLLM_*=...`, `MODEL=...` variable defaults); the parser resolves
 `$VAR` / `${VAR}` / `${VAR:-default}` references against assignments found in
-the script body, and the structured-save paths must never rewrite the body
-(raw-editor only until doc 21 Phase 2).
+the script body, and the vLLM save patches only the exec line, env
+assignments and meta fence (patch_exec_invocation), never the rest of the body.
 
 The `engine` field is mandatory going forward. Scripts missing it parse as
 llamacpp with `engine_declared=False`; the scanner backfills the tag.

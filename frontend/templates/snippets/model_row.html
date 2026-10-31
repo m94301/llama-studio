@@ -73,7 +73,7 @@
         <button class="btn-icon btn-chat" title="Open a test chat in a new tab"
                 onclick="window.open('/chat?model=' + encodeURIComponent(this.closest('.model-row').dataset.modelName), '_blank')">💬</button>
         <button class="btn-icon btn-edit-config"
-                hx-get="/api/config-modal-new?model={{ model_name }}"
+                hx-get="/api/config-modal?model={{ model_name }}"
                 hx-target="#modal-container" hx-swap="innerHTML">⚙</button>
     </div>
 

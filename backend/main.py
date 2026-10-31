@@ -316,7 +316,7 @@ async def model_list():
     models = config_manager.get_all_models()
     logger.info(f"📋 model_list called: {len(models)} models found")
 
-    # === NEW: Check if llama-server is configured ===
+    # Check if llama-server is configured
     llama_binary = config_manager.app_config.llama_server_binary
     if not Path(llama_binary).exists():
         return f"""
@@ -894,16 +894,15 @@ async def save_raw_script(
 
 
 
-@app.get("/api/config-modal-new", response_class=HTMLResponse)
-async def config_modal_new(model: str):
+@app.get("/api/config-modal", response_class=HTMLResponse)
+async def config_modal(model: str):
     """Return improved config modal with form + advanced table + VRAM calculator."""
-    logger.info(f"📝 Edit config (v2) requested for model: {model}")
+    logger.info(f"📝 Edit config requested for model: {model}")
     try:
         model_config = config_manager.get_model_config(model)
 
-        # vLLM models get the reduced raw-script modal: their scripts are
-        # env-var-heavy and the structured save path rewrites the script body,
-        # which would destroy the preamble (doc 21 decision 2 — Phase 2 lifts this).
+        # vLLM models get their own modal, saved by /api/save-vllm-config,
+        # which patches the exec line and leaves the env-var preamble intact.
         if model_config.engine == "vllm":
             from kv_calc import (
                 DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, bytes_per_token_from_config,
@@ -1051,12 +1050,12 @@ async def config_modal_new(model: str):
         )
         return HTMLResponse(html)
     except Exception as e:
-        logger.error(f"✗ Error in config_modal_new: {type(e).__name__}: {e}", exc_info=True)
+        logger.error(f"✗ Error in config_modal: {type(e).__name__}: {e}", exc_info=True)
         return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
 
 
-@app.post("/api/save-model-config-new", response_class=HTMLResponse)
-async def save_model_config_new(
+@app.post("/api/save-llama-config", response_class=HTMLResponse)
+async def save_llama_config(
     model_name: str = Form(...),
     core_json: str = Form(...),
     advanced_json: str = Form(...),
@@ -1071,7 +1070,7 @@ async def save_model_config_new(
     src = source_model.strip() or model_name
     is_save_as = bool(source_model.strip() and source_model.strip() != model_name)
     logger.info(
-        f"💾 {'Save-As' if is_save_as else 'Saving'} config (v2) for model: "
+        f"💾 {'Save-As' if is_save_as else 'Saving'} llama.cpp config for model: "
         f"{src + ' → ' + model_name if is_save_as else model_name}"
     )
     try:
@@ -1079,14 +1078,13 @@ async def save_model_config_new(
             name_error = _validate_new_script_name(model_name)
             if name_error:
                 return name_error
-        # Defense: the structured save rewrites the script body, which would
-        # destroy a vLLM script's env-var preamble. vLLM edits go through the
-        # raw-script editor until Phase 2's body-preserving save lands.
+        # This save rewrites the script body, which would destroy a vLLM
+        # script's env-var preamble; vLLM saves go through /api/save-vllm-config.
         try:
             if config_manager.get_model_config(src).engine == "vllm":
                 return _error_modal(
-                    "vLLM models are edited via the raw-script editor — "
-                    "the structured save would overwrite the script's env-var preamble."
+                    "vLLM models are saved by the vLLM config editor — "
+                    "this save would overwrite the script's env-var preamble."
                 )
         except FileNotFoundError:
             pass
@@ -1233,7 +1231,7 @@ async def save_model_config_new(
         # Save-As and normal save both end on the confirmation popup.
         return _save_success_modal(model_config, invalid_keys=invalid_keys)
     except Exception as e:
-        logger.error(f"✗ Error in save_model_config_new: {type(e).__name__}: {e}", exc_info=True)
+        logger.error(f"✗ Error in save_llama_config: {type(e).__name__}: {e}", exc_info=True)
         return _error_modal(f"Error saving configuration: {str(e)}")
 
 

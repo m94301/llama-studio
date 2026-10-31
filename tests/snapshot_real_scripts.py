@@ -120,7 +120,7 @@ async def _noop_save(mc, main) -> dict:
             "llama_path": mc.llama_path or "default",
             "health_timeout": mc.health_timeout,
         }
-        resp = await (getattr(main, "save_model_config_new", None) or main.save_model_config)(
+        resp = await main.save_llama_config(
             model_name=mc.name,
             core_json=json.dumps(core),
             advanced_json=json.dumps(advanced),

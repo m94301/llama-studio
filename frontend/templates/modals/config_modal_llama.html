@@ -3,7 +3,7 @@
 
 {% block fields %}
         <form id="llama-config-form"
-              hx-post="/api/save-model-config-new"
+              hx-post="/api/save-llama-config"
               hx-target="#modal-container"
               hx-swap="innerHTML"
               class="flex flex-col gap-6">
@@ -386,7 +386,7 @@ function modalSerialize() { serializeFormData(); }
 
 // Save-As hooks consumed by the shared dialog (_saveas_dialog.html).
 window.SAVEAS = {
-    saveUrl: '/api/save-model-config-new',
+    saveUrl: '/api/save-llama-config',
     sourceName: () => document.getElementById('modal-model-name').value,
     currentPort: () => parseInt(document.querySelector('input[name="port"]').value) || 8000,
     currentDisplay: () => document.querySelector('input[name="display_name"]').value,
@@ -578,7 +578,7 @@ function serializeFormData() {
     document.getElementById('core-json-field').value = JSON.stringify(core);
     document.getElementById('advanced-json-field').value = JSON.stringify(advanced);
 
-    // === NEW: Validate fields and highlight invalid ones ===
+    // Validate fields and highlight invalid ones ===
     validateAndHighlightFields(advanced);
 }
 
