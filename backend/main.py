@@ -27,14 +27,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config_manager import ConfigManager, ModelConfig
 from kv_calc import llama_kv_gb
-from engine_flags import get_vllm_manifest
+from engine_flags import flag_manifest, install_vllm_parse_manifests, validate_llama_option
 from launch_script import (
-    get_vllm_manifest as get_vllm_manifest_runtime,
     canonical_args,
     parse_pasted_script,
     patch_meta_fence,
-    set_vllm_manifest,
-    set_vllm_manifest_resolver,
     manifest_for_binary,
 )
 import chat_proxy
@@ -42,9 +39,7 @@ import migrate_configs
 from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
 from event_bus import event_bus
-from llama_options import get_option_schema, validate_option, set_runtime_schema
-from llama_version import get_version, get_vllm_version
-from schema_parser import parse_help, load_schema, save_schema
+from llama_version import get_vllm_version
 
 # Get project root (one level up from backend directory)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -122,28 +117,10 @@ async def lifespan(app: FastAPI):
 
     try:
         await config_manager.load_app_config()
-        # Load or detect llama-server schema BEFORE model scanning
-        await ensure_schema_for_binary(config_manager.app_config.llama_server_binary, config_manager, update_global=True)
-
-        # Install the vllm flag manifest before scanning too: it decides which
-        # `vllm serve` flags take values and how -tp/-pp normalize, so parsing
-        # is wrong without it. Cached after first capture, so this is cheap.
-        # Per-engine manifests: scripts that name their own vllm build are parsed
-        # against THAT build's flags (captured + cached on first sight).
-        set_vllm_manifest_resolver(
-            lambda b: get_vllm_manifest(b, PROJECT_ROOT / "config")
-        )
-        if config_manager.app_config.vllm_binary:
-            manifest = await asyncio.to_thread(
-                get_vllm_manifest,
-                config_manager.app_config.vllm_binary,
-                PROJECT_ROOT / "config",
-            )
-            set_vllm_manifest(manifest)
-            if manifest:
-                logger.info(f"✓ vLLM manifest: {len(manifest['flags'])} flags for v{manifest['version']}")
-            else:
-                logger.warning("⚠ No vLLM flag manifest — vllm scripts will parse heuristically")
+        # Before scanning: a vLLM script's flags decide which tokens are values
+        # and how -tp/-pp normalize, so each is parsed against its own engine's
+        # manifest (captured + cached on first sight), else the default engine's.
+        install_vllm_parse_manifests(_config_dir(), lambda: config_manager.app_config.vllm_binary)
 
         # Hard-block on legacy JSON configs — they must be migrated to shell scripts.
         if migrate_configs.has_legacy_configs(PROJECT_ROOT):
@@ -195,62 +172,22 @@ async def lifespan(app: FastAPI):
     logger.info("✓ Shutdown complete")
 
 
-async def ensure_schema_for_binary(binary_path: str, config_mgr, update_global: bool = False) -> str | None:
-    """
-    Validate binary, get version, load or generate+cache schema.
-    Returns version_str on success, None on failure.
-    If update_global=True, updates app_config.llama_schema_version and saves app.json.
-    """
-    config_dir = config_mgr.project_root / "config"
+def _config_dir() -> Path:
+    return config_manager.project_root / "config"
 
-    # Step 1: Always detect binary version
-    version_str = get_version(binary_path)
-    if not version_str:
-        logger.warning(f"⚠ Could not detect llama-server version for {binary_path}")
-        if update_global:
-            set_runtime_schema({})
-        return None
 
-    # Step 2: For global binary, check if version changed
-    if update_global:
-        config = config_mgr.app_config
-        if config.llama_schema_version and config.llama_schema_version == version_str:
-            schema = load_schema(config.llama_schema_version, config_dir)
-            if schema:
-                set_runtime_schema(schema)
-                logger.info(f"✓ Using cached schema: {config.llama_schema_version}")
-                return version_str
-        else:
-            if config.llama_schema_version:
-                logger.info(f"⚠ Binary version changed: {config.llama_schema_version} → {version_str}")
+def _flags(engine: str, binary: Optional[str]) -> Optional[dict]:
+    """The one flag lookup (engine_flags.flag_manifest) against this app's config dir."""
+    return flag_manifest(engine, binary, _config_dir())
 
-    # Step 3: Try to load cached schema for this version
-    schema = load_schema(version_str, config_dir)
-    if schema:
-        if update_global:
-            config_mgr.app_config.llama_schema_version = version_str
-            await config_mgr.save_app_config()
-            set_runtime_schema(schema)
-        logger.info(f"✓ Loaded cached schema for version: {version_str}")
-        return version_str
 
-    # Step 4: Parse help text and generate new schema
-    logger.info(f"⏳ Parsing help text for version: {version_str}")
-    schema = parse_help(binary_path)
-    if not schema:
-        logger.warning(f"⚠ Could not parse llama-server help for {binary_path}")
-        if update_global:
-            set_runtime_schema({})
-        return None
-
-    # Step 5: Save schema
-    save_schema(schema, version_str, config_dir)
-    if update_global:
-        config_mgr.app_config.llama_schema_version = version_str
-        await config_mgr.save_app_config()
-        set_runtime_schema(schema)
-    logger.info(f"✓ Generated and cached schema for version: {version_str}")
-    return version_str
+def _llama_version_label(manifest: Optional[dict]) -> str:
+    """'11067_fe93f196b' -> '11067 (fe93f196b)'; 'unknown' when it couldn't be probed."""
+    version = (manifest or {}).get("version")
+    if not version:
+        return "unknown"
+    parts = version.split("_")
+    return f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version
 
 
 app = FastAPI(title="Llama Studio", lifespan=lifespan)
@@ -941,29 +878,13 @@ async def config_modal(model: str):
                 initial_tokens=initial_tokens,
             ))
 
-        # Determine which schema to use based on model's llama_path
-        version_raw = None
-        if model_config.llama_path and model_config.llama_path != "default":
-            # Use custom binary's schema if available
-            custom_version = get_version(model_config.llama_path)
-            if custom_version:
-                version_raw = custom_version
-                option_schema = load_schema(custom_version, config_manager.project_root / "config")
-                if not option_schema:
-                    logger.warning(f"⚠ Schema not found for custom binary version {custom_version}, using global schema")
-                    option_schema = get_option_schema()
-
-        # Fall back to global schema if not using custom binary
-        if not version_raw:
-            version_raw = config_manager.app_config.llama_schema_version
-            option_schema = get_option_schema()
-
-        # Format the version string
-        if version_raw:
-            parts = version_raw.split("_")
-            version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
-        else:
-            version_str = "unknown"
+        # Options and version of the binary this script actually runs.
+        manifest = await asyncio.to_thread(
+            _flags, "llamacpp",
+            model_config.llama_bin_absolute or config_manager.app_config.llama_server_binary,
+        )
+        option_schema = (manifest or {}).get("flags", {})
+        version_str = _llama_version_label(manifest)
 
         # Split launch_args into individual options
         launch_args = model_config.launch_args or {}
@@ -1059,6 +980,7 @@ async def save_llama_config(
         llama_path = core_data.get("llama_path", "default")
         if not llama_path or llama_path.strip() == "":
             llama_path = "default"
+        llama_bin = config_manager.app_config.llama_server_binary if llama_path == "default" else llama_path
 
         if not port:
             return _error_modal("Port is required")
@@ -1099,11 +1021,12 @@ async def save_llama_config(
         # advanced for the launch_args dict. Running them through the schema
         # validator on top would re-flag any schema-type drift.
         CORE_FIELDS_SKIP = {"--host", "-h", "--port", "-p"}
+        flags = ((await asyncio.to_thread(_flags, "llamacpp", llama_bin)) or {}).get("flags")
         invalid_keys = []
         for key, value in advanced_data.items():
             if key in CORE_FIELDS_SKIP:
                 continue
-            is_valid, error_msg = validate_option(key, str(value))
+            is_valid, error_msg = validate_llama_option(key, str(value), flags)
             if not is_valid:
                 invalid_keys.append(key)
                 logger.warning(f"⚠ Invalid option in config: {key} ({error_msg})")
@@ -1148,12 +1071,6 @@ async def save_llama_config(
         # For a normal save src == model_name; for Save-As it's the original.
         existing_config = config_manager.get_model_config(src)
         prior_cvd = existing_config.cuda_visible_devices  # captured before save_model_script clobbers it
-
-        # Resolve llama_bin: "default" -> use app config's binary
-        if llama_path == "default":
-            llama_bin = config_manager.app_config.llama_server_binary
-        else:
-            llama_bin = llama_path
 
         try:
             model_config = config_manager.save_model_script(
@@ -1890,14 +1807,10 @@ async def calculate_vllm_vram(
 @app.get("/api/get-current-settings", response_class=JSONResponse)
 async def get_current_settings():
     """Return current settings for settings modal population."""
-    # Format the schema-detected llama-server version like the per-model modal
-    # ("9244 (b28a2f372)"). Falls back to "unknown" if no schema is cached.
-    version_raw = config_manager.app_config.llama_schema_version
-    if version_raw:
-        parts = version_raw.split("_")
-        version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
-    else:
-        version_str = "unknown"
+    # Same label as the per-model modal ("9244 (b28a2f372)"); cached after first probe.
+    version_str = _llama_version_label(
+        await asyncio.to_thread(_flags, "llamacpp", config_manager.app_config.llama_server_binary)
+    )
     # `vllm --version` imports torch on a cold cache (tens of seconds), so it
     # runs in a thread — never inline, or opening Settings freezes the app.
     vllm_bin = config_manager.app_config.vllm_binary
@@ -1977,10 +1890,10 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
                     raise ValueError(f"No 'llama-server' binary found in {new_path}")
             if not new_path_obj.is_file():
                 raise ValueError(f"Path is not a file: {new_path_obj}")
+            # Probe (and cache) its options now; refuse a binary that can't be read.
+            if not await asyncio.to_thread(_flags, "llamacpp", str(new_path_obj)):
+                raise ValueError(f"Not a working llama-server (version/help could not be read): {new_path_obj}")
             config_manager.app_config.llama_server_binary = str(new_path_obj)
-
-            # Re-detect schema when llama_server path changes
-            await ensure_schema_for_binary(str(new_path_obj), config_manager, update_global=True)
         elif path_type == "vllm_binary":
             # Accept the executable directly, or a directory (venv root or its
             # bin/) from which we locate `vllm`.
@@ -1993,23 +1906,17 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
                     raise ValueError(f"No 'vllm' executable found in {new_path}")
             if not new_path_obj.is_file():
                 raise ValueError(f"Path is not a file: {new_path_obj}")
-            version = get_vllm_version(str(new_path_obj))
-            if version is None:
-                raise ValueError(f"Not a working vllm executable (--version failed): {new_path_obj}")
             # Capture the engine's flag manifest now (its own `serve --help`) —
-            # both generated args and arg parsing are drawn only from this.
-            manifest = await asyncio.to_thread(
-                get_vllm_manifest, str(new_path_obj), config_manager.project_root / "config"
-            )
+            # generated args and arg parsing are drawn only from this.
+            manifest = await asyncio.to_thread(_flags, "vllm", str(new_path_obj))
             if not manifest:
                 raise ValueError(
-                    f"Could not capture the flag manifest from `vllm serve --help` for {new_path_obj}"
+                    f"Not a working vllm executable (--version or `serve --help` failed): {new_path_obj}"
                 )
-            set_vllm_manifest(manifest)
             config_manager.app_config.vllm_binary = str(new_path_obj)
             logger.info(
                 f"✓ vLLM executable set: {new_path_obj} "
-                f"(version {version}, {len(manifest['flags'])} flags)"
+                f"(version {manifest['version']}, {len(manifest['flags'])} flags)"
             )
         elif path_type == "models_directory":
             if not new_path_obj.is_dir():
@@ -2075,9 +1982,9 @@ async def validate_binary_path(path: str = Form(...)):
         if not path_obj.is_file():
             return {"version": None, "error": f"Path is not a file: {path_obj}"}
 
-        # Validate binary and ensure schema is cached
+        # Validate binary and cache its option schema
         resolved_path = str(path_obj)
-        version_str = await ensure_schema_for_binary(resolved_path, config_manager, update_global=False)
+        version_str = ((await asyncio.to_thread(_flags, "llamacpp", resolved_path)) or {}).get("version")
 
         if version_str is None:
             return {"version": None, "error": f"Invalid llama-server binary or unable to detect version: {resolved_path}"}

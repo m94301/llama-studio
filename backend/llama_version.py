@@ -23,7 +23,7 @@ def get_version(binary_path: str) -> Optional[str]:
     Handles both the current upstream format ("version: 0.4.1-dev (build
     11067, commit fe93f196b)") and the older one ("version: 9030
     (17df5830e)"). Either way the identifier stays "<build>_<commit>" so
-    existing cache files and app.json's stored llama_schema_version keep
+    existing schema cache files (config/llama-server/<version>.json) keep
     working across the format change.
 
     Returns:

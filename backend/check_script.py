@@ -14,8 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from engine_flags import get_vllm_manifest  # noqa: E402
-from launch_script import parse_script, set_vllm_manifest, set_vllm_manifest_resolver  # noqa: E402
+from engine_flags import install_vllm_parse_manifests  # noqa: E402
+from launch_script import parse_script  # noqa: E402
 
 CONFIG_DIR = Path(__file__).parent.parent / "config"
 
@@ -43,10 +43,8 @@ def main(argv) -> int:
         print(__doc__.strip())
         return 2
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
-    set_vllm_manifest_resolver(lambda b: get_vllm_manifest(b, CONFIG_DIR))
     default_vllm = json.loads((CONFIG_DIR / "app.json").read_text()).get("vllm_binary")
-    if default_vllm:
-        set_vllm_manifest(get_vllm_manifest(default_vllm, CONFIG_DIR))
+    install_vllm_parse_manifests(CONFIG_DIR, lambda: default_vllm)
     results = [check(Path(a)) for a in argv]
     return 0 if all(results) else 1
 

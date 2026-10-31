@@ -361,10 +361,6 @@ class AppConfig(BaseModel):
         default=None,
         description="Path to a vllm executable (typically <venv>/bin/vllm)"
     )
-    llama_schema_version: Optional[str] = Field(
-        default=None,
-        description="Detected llama-server version (e.g., 9030_17df5830e)"
-    )
     # Startup auto-load: list of model names to load at app startup.
     # gpu_ids are read from each model's CUDA_VISIBLE_DEVICES at load time
     # (not stored here — the script is the source of truth).

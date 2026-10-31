@@ -93,14 +93,16 @@ KNOWN_FLAG_ONLY = {
 }
 
 # What `vllm serve` accepts is read from the engine's own --help (see
-# engine_flags.py) and installed here at startup — never hardcoded, because
-# flag sets differ per build. Unset means "no manifest available": the parser
-# then falls back to the next-token heuristic instead of guessing from a list.
+# engine_flags.py) — never hardcoded, because flag sets differ per build. The
+# app installs a resolver (engine_flags.install_vllm_parse_manifests) so each
+# script is parsed against its own engine; a fixed manifest set here is the
+# fallback (tests use it). With neither, the parser falls back to the
+# next-token heuristic instead of guessing from a list.
 _VLLM_MANIFEST: Optional[Dict[str, dict]] = None
 
 
 def set_vllm_manifest(manifest: Optional[Dict[str, dict]]) -> None:
-    """Install the captured `vllm serve` flag manifest for parsing."""
+    """Install a fixed `vllm serve` flag manifest for parsing."""
     global _VLLM_MANIFEST
     _VLLM_MANIFEST = manifest
     if manifest:
@@ -108,10 +110,6 @@ def set_vllm_manifest(manifest: Optional[Dict[str, dict]]) -> None:
             f"✓ vllm manifest active: {len(manifest.get('flags', {}))} flags, "
             f"{len(manifest.get('aliases', {}))} aliases"
         )
-
-
-def get_vllm_manifest() -> Optional[Dict[str, dict]]:
-    return _VLLM_MANIFEST
 
 
 _VLLM_MANIFEST_RESOLVER = None
@@ -122,8 +120,8 @@ def set_vllm_manifest_resolver(fn) -> None:
 
     Each vLLM script runs the engine named in its own `exec` line, which may be
     a custom build whose flags differ from the default engine's. With a resolver
-    installed, a script is parsed against that engine's own manifest; the
-    default manifest (set_vllm_manifest) is only the fallback.
+    installed, a script is parsed against that engine's own manifest; a fixed
+    manifest (set_vllm_manifest) is only the fallback.
     """
     global _VLLM_MANIFEST_RESOLVER
     _VLLM_MANIFEST_RESOLVER = fn
@@ -131,7 +129,7 @@ def set_vllm_manifest_resolver(fn) -> None:
 
 def manifest_for_binary(binary: Optional[str]) -> Optional[Dict[str, dict]]:
     """Flag manifest of the engine at `binary`, else the default engine's."""
-    if binary and _VLLM_MANIFEST_RESOLVER:
+    if _VLLM_MANIFEST_RESOLVER:
         try:
             found = _VLLM_MANIFEST_RESOLVER(binary)
             if found:

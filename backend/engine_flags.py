@@ -1,13 +1,18 @@
-"""Capture and cache what an engine binary's CLI actually accepts.
+"""Capture and cache what an engine binary's CLI actually accepts — both engines.
 
-Generated args and arg parsing must only ever use flags the engine itself
-reports — never a list written from memory. A hardcoded `--disable-log-requests`
-in a generated skeleton is what made a real launch fail: that flag does not
-exist in every vLLM build.
+Generated args, arg parsing and option validation must only ever use flags the
+engine itself reports — never a list written from memory. A hardcoded
+`--disable-log-requests` in a generated skeleton is what made a real launch
+fail: that flag does not exist in every vLLM build.
 
-The manifest is captured from `vllm serve --help=all` and records, per flag,
-whether it takes a value and which long form a short alias maps to. Cached per
-detected version under config/vllm/.
+`flag_manifest(engine, binary, config_dir)` is the one lookup. It returns
+`{"version": ..., "flags": {...}}` for that exact binary:
+
+- llama.cpp: `flags` is the option schema parsed from `llama-server -h`
+  (schema_parser), cached as config/llama-server/<version>.json.
+- vLLM: the manifest captured from `vllm serve --help=all`, recording per flag
+  whether it takes a value, plus `aliases` (short → long). Cached as
+  config/vllm/manifest-<version>-<pathhash>.json.
 
 `vllm serve --help=all` renders options as::
 
@@ -32,9 +37,10 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from llama_version import get_vllm_version
+from llama_version import get_version, get_vllm_version
+from schema_parser import load_schema, parse_help, save_schema
 
 logger = logging.getLogger(__name__)
 
@@ -170,34 +176,90 @@ def _cache_path(config_dir: Path, version: str, binary_path: Optional[str] = Non
     return config_dir / "vllm" / f"manifest-{safe}{suffix}.json"
 
 
-# Per-process memo so parsing many scripts that share an engine captures it once.
-# Failures are remembered briefly so a broken binary is not re-probed (a 5 min
-# timeout each) for every script, but a fixed binary is picked up without a restart.
-_MANIFEST_MEM: Dict[str, tuple] = {}
-_MANIFEST_LOCK = threading.Lock()
+# Per-process memo, so parsing many scripts that share an engine probes it once.
+# Keyed by the binary's resolved path *and* mtime: a binary rebuilt in place is
+# re-read without a restart. Failures are remembered briefly so a broken binary
+# is not re-probed (up to a 5 min timeout for vLLM) for every script.
+_MEM: Dict[tuple, tuple] = {}
+_LOCK = threading.Lock()
 _FAILURE_RETRY_SECONDS = 60
 
 
-def get_vllm_manifest(binary_path: str, config_dir: Path) -> Optional[dict]:
-    """Return this vllm build's flag manifest, capturing + caching on first use.
+def flag_manifest(engine: str, binary_path: Optional[str], config_dir: Path) -> Optional[dict]:
+    """What this engine binary accepts: {"version": ..., "flags": {...}, ...}.
 
-    Keyed per binary (version + path id), so every engine gets its own flag list.
-    Returns None when it cannot be determined — callers must then emit no
-    optional flags and fall back to heuristics rather than guessing.
+    Captured on first use per binary, then cached on disk and in memory.
+    Returns None when the binary can't be probed — callers must then validate
+    nothing and emit no optional flags rather than guessing.
     """
+    if not binary_path:
+        return None
     try:
-        key = os.path.realpath(binary_path)
-    except Exception:
-        key = str(binary_path)
-    with _MANIFEST_LOCK:
-        hit = _MANIFEST_MEM.get(key)
+        real = os.path.realpath(binary_path)
+        key = (engine, real, os.stat(real).st_mtime)
+    except OSError:
+        logger.warning(f"⚠ {engine} binary not found: {binary_path}")
+        return None
+    loader = _load_or_capture_manifest if engine == "vllm" else _load_or_capture_llama
+    with _LOCK:
+        hit = _MEM.get(key)
         if hit is not None:
             data, ts = hit
             if data is not None or time.time() - ts < _FAILURE_RETRY_SECONDS:
                 return data
-        data = _load_or_capture_manifest(binary_path, config_dir)
-        _MANIFEST_MEM[key] = (data, time.time())
+        data = loader(binary_path, config_dir)
+        _MEM[key] = (data, time.time())
         return data
+
+
+def _load_or_capture_llama(binary_path: str, config_dir: Path) -> Optional[dict]:
+    version = get_version(binary_path)
+    if not version:
+        return None
+    schema = load_schema(version, config_dir)
+    if not schema:
+        logger.info(f"⏳ Parsing llama-server help for version: {version}")
+        schema = parse_help(binary_path)
+        if not schema:
+            return None
+        try:
+            save_schema(schema, version, config_dir)
+        except Exception as e:
+            logger.warning(f"⚠ Could not cache llama-server schema: {e}")
+    return {"version": version, "flags": schema}
+
+
+def install_vllm_parse_manifests(config_dir: Path, default_binary: Callable[[], Optional[str]]) -> None:
+    """Parse each vLLM script against its own engine's flags, else the default engine's.
+
+    `default_binary` is read at call time, so changing app.json's vllm_binary
+    takes effect without reinstalling.
+    """
+    from launch_script import set_vllm_manifest_resolver
+
+    def resolve(binary: Optional[str]) -> Optional[dict]:
+        return flag_manifest("vllm", binary, config_dir) or flag_manifest("vllm", default_binary(), config_dir)
+
+    set_vllm_manifest_resolver(resolve)
+
+
+def validate_llama_option(key: str, value: str, flags: Optional[dict]) -> Tuple[bool, str]:
+    """Check one llama-server option's value against its schema entry.
+
+    Unknown options, or no schema at all, are accepted: the schema may lag a
+    newer llama-server, and refusing a real flag is worse than passing it on.
+    """
+    spec = (flags or {}).get(key)
+    if spec is None:
+        return True, ""
+    try:
+        if spec.get("type") == "int":
+            int(value)
+        elif spec.get("type") != "str":
+            return False, f"Unknown type: {spec.get('type')}"
+        return True, ""
+    except (ValueError, TypeError) as e:
+        return False, f"Invalid {spec.get('type', 'value')}: {e}"
 
 
 def _load_or_capture_manifest(binary_path: str, config_dir: Path) -> Optional[dict]:
@@ -250,5 +312,5 @@ def _load_or_capture_manifest(binary_path: str, config_dir: Path) -> Optional[di
 
 def get_vllm_serve_flags(binary_path: str, config_dir: Path) -> Optional[Set[str]]:
     """Just the set of accepted flag names (used to filter generated skeletons)."""
-    manifest = get_vllm_manifest(binary_path, config_dir)
+    manifest = flag_manifest("vllm", binary_path, config_dir)
     return set(manifest["flags"]) if manifest else None

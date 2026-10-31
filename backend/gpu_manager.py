@@ -24,6 +24,7 @@ from llama_session import (
     ENGINE_PROC_RE, LlamaSession, launch_fingerprint, port_owned_by_group, proc_start_time,
     process_group_members,
 )
+from engine_flags import flag_manifest
 from port_manager import is_port_available
 from event_bus import event_bus
 
@@ -630,13 +631,13 @@ class GpuManager:
                 custom_path = model_config.llama_path
                 if not Path(custom_path).is_file():
                     raise ValueError(f"Custom llama-server binary not found: {custom_path}")
-                # Import here to avoid circular imports
-                from main import ensure_schema_for_binary
-                version_str = await ensure_schema_for_binary(custom_path, self.config, update_global=False)
-                if version_str is None:
+                manifest = await asyncio.to_thread(
+                    flag_manifest, "llamacpp", custom_path, self.config.project_root / "config"
+                )
+                if manifest is None:
                     raise ValueError(f"Custom llama-server binary failed version check: {custom_path}")
                 effective_binary = custom_path
-                logger.info(f"   Using custom binary for {model_name}: {custom_path} (version {version_str})")
+                logger.info(f"   Using custom binary for {model_name}: {custom_path} (version {manifest['version']})")
 
             # Create session
             log_path = self.config.get_log_path(model_name)

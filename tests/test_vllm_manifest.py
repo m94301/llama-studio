@@ -157,8 +157,8 @@ class TestAgainstTheRealBuild:
 
     @pytest.fixture(scope="class")
     def real(self, tmp_path_factory):
-        from engine_flags import get_vllm_manifest
-        m = get_vllm_manifest(str(VLLM_BIN), tmp_path_factory.mktemp("cfg"))
+        from engine_flags import flag_manifest
+        m = flag_manifest("vllm", str(VLLM_BIN), tmp_path_factory.mktemp("cfg"))
         if not m:
             pytest.skip("could not capture manifest from the local build")
         return m

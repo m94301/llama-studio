@@ -138,8 +138,7 @@ async def build_snapshot() -> dict:
     import main
     from config_manager import ConfigManager
     from gpu_manager import GpuManager
-    from engine_flags import get_vllm_manifest
-    from launch_script import set_vllm_manifest, set_vllm_manifest_resolver
+    from engine_flags import install_vllm_parse_manifests
 
     tmp = Path(tempfile.mkdtemp(prefix="ls-snapshot-"))
     try:
@@ -150,10 +149,7 @@ async def build_snapshot() -> dict:
         main.config_manager = cm
         main.gpu_manager = GpuManager(cm)
         await cm.load_app_config()
-        await main.ensure_schema_for_binary(cm.app_config.llama_server_binary, cm, update_global=True)
-        set_vllm_manifest_resolver(lambda b: get_vllm_manifest(b, tmp / "config"))
-        if cm.app_config.vllm_binary:
-            set_vllm_manifest(get_vllm_manifest(cm.app_config.vllm_binary, tmp / "config"))
+        install_vllm_parse_manifests(tmp / "config", lambda: cm.app_config.vllm_binary)
         await cm.load_all_models()
 
         out = {}
