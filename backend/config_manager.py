@@ -625,19 +625,19 @@ class ConfigManager:
         # Determine the ctx + batch + cache types the multiplier should be baked
         # against, for both backfill and the forced-recompute path. Falls back to
         # max_context when no ctx is set.
-        script_ctx = parsed.args.get("--ctx-size") or parsed.args.get("-c")
+        script_ctx = parsed.args.get("--ctx-size")
         try:
             script_ctx_int = int(script_ctx) if script_ctx else None
         except (ValueError, TypeError):
             script_ctx_int = None
         reference_ctx = script_ctx_int or parsed.max_context
-        script_batch = parsed.args.get("--batch-size") or parsed.args.get("-b")
+        script_batch = parsed.args.get("--batch-size")
         try:
             script_batch_int = int(script_batch) if script_batch else None
         except (ValueError, TypeError):
             script_batch_int = None
-        ctk = parsed.args.get("--cache-type-k") or parsed.args.get("-ctk") or "f16"
-        ctv = parsed.args.get("--cache-type-v") or parsed.args.get("-ctv") or "f16"
+        ctk = parsed.args.get("--cache-type-k") or "f16"
+        ctv = parsed.args.get("--cache-type-v") or "f16"
         k_bytes = KV_BYTES.get(str(ctk), 2.0)
         v_bytes = KV_BYTES.get(str(ctv), 2.0)
 
@@ -946,18 +946,18 @@ class ConfigManager:
         # SWA models get an accurate multiplier AND the compute-buffer overhead
         # is baked for the user's actual config. Falls back to cached values if
         # the file is missing or parsing fails.
-        new_ctx = args.get("--ctx-size") or args.get("-c")
+        new_ctx = args.get("--ctx-size")
         try:
             new_ctx_int = int(new_ctx) if new_ctx not in (None, "") else None
         except (ValueError, TypeError):
             new_ctx_int = None
-        new_batch = args.get("--batch-size") or args.get("-b")
+        new_batch = args.get("--batch-size")
         try:
             new_batch_int = int(new_batch) if new_batch not in (None, "") else None
         except (ValueError, TypeError):
             new_batch_int = None
-        ctk = args.get("--cache-type-k") or args.get("-ctk") or "f16"
-        ctv = args.get("--cache-type-v") or args.get("-ctv") or "f16"
+        ctk = args.get("--cache-type-k") or "f16"
+        ctv = args.get("--cache-type-v") or "f16"
         k_bytes = KV_BYTES.get(str(ctk), 2.0)
         v_bytes = KV_BYTES.get(str(ctv), 2.0)
         if model_path and Path(model_path).exists():
@@ -1267,9 +1267,9 @@ class ConfigManager:
         args = mc.launch_args
         if not args:
             return None
-        ctx_size = args.get("--ctx-size") or args.get("-c") or 4096
-        cache_type_k = args.get("--cache-type-k") or args.get("-ctk") or "f16"
-        cache_type_v = args.get("--cache-type-v") or args.get("-ctv") or "f16"
+        ctx_size = args.get("--ctx-size") or 4096
+        cache_type_k = args.get("--cache-type-k") or "f16"
+        cache_type_v = args.get("--cache-type-v") or "f16"
         try:
             ctx_size = int(ctx_size)
         except (ValueError, TypeError):

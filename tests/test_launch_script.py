@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from launch_script import (  # noqa: E402
+    canonical_args,
     parse_script,
     parse_pasted_script,
     render_script,
@@ -747,3 +748,10 @@ def test_tensor_split_short_alias():
     ps = parse_script(_script_with_args("  -ts 2,1 \\\n"))
     assert ps.gpu_count == 2
     assert ps.tensor_split_weights == [2.0, 1.0]
+
+
+def test_canonical_args_matches_parser_spelling():
+    # Form rows may use short aliases; they must end up in the same long form
+    # the parser produces, keeping order, with a later duplicate winning.
+    args = canonical_args({"--ctx-size": "4096", "-ts": "1,1", "--no-mmap": None, "-c": "8192"})
+    assert args == {"--ctx-size": "8192", "--tensor-split": "1,1", "--no-mmap": None}

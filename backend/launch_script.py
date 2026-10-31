@@ -70,6 +70,11 @@ FLAG_ALIASES: Dict[str, str] = {
     "-no-kvu": "--no-kv-unified",
 }
 
+
+def canonical_args(args: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    """Rewrite short aliases to their long form, as the parser does (a later key wins)."""
+    return {FLAG_ALIASES.get(k, k): v for k, v in args.items()}
+
 # Known flag-only (boolean) options for llama-server. Used as a hint when
 # heuristics ambiguous. Heuristic: a token starting with "-" after a flag is
 # treated as a new flag, so these usually parse correctly without the list.
@@ -237,7 +242,7 @@ class ParsedScript:
     @property
     def tensor_split_weights(self) -> Optional[List[float]]:
         """Parse --tensor-split a,b,c into floats. None if absent or malformed."""
-        raw = self.args.get("--tensor-split") or self.args.get("-ts")
+        raw = self.args.get("--tensor-split")
         if raw is None:
             return None
         try:

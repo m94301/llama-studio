@@ -29,6 +29,7 @@ from config_manager import ConfigManager, ModelConfig, calculate_kv_cache_gb
 from engine_flags import get_vllm_manifest
 from launch_script import (
     get_vllm_manifest as get_vllm_manifest_runtime,
+    canonical_args,
     parse_pasted_script,
     patch_meta_fence,
     set_vllm_manifest,
@@ -1013,15 +1014,15 @@ async def config_modal(model: str):
         # Split launch_args into individual options
         launch_args = model_config.launch_args or {}
 
-        # Extract context and KV quantization settings for VRAM calculator
-        # Long form first — matches the lookup order in _calculate_total_vram()
-        current_ctx = launch_args.get("--ctx-size") or launch_args.get("-c") or "4096"
-        current_ctk = launch_args.get("--cache-type-k") or launch_args.get("-ctk") or "f16"
-        current_ctv = launch_args.get("--cache-type-v") or launch_args.get("-ctv") or "f16"
+        # Context and KV quantization for the VRAM calculator (parsed args are
+        # always long-form).
+        current_ctx = launch_args.get("--ctx-size") or "4096"
+        current_ctk = launch_args.get("--cache-type-k") or "f16"
+        current_ctv = launch_args.get("--cache-type-v") or "f16"
 
-        # Remove -c, -ctk, -ctv from advanced_options to prevent duplication
+        # These have their own rows in the modal; keep them out of the free-form table.
         advanced_options = {k: v for k, v in launch_args.items()
-                           if k not in ["--host", "--port", "-c", "--ctx-size", "-ctk", "--cache-type-k", "-ctv", "--cache-type-v"]}
+                           if k not in ("--host", "--port", "--ctx-size", "--cache-type-k", "--cache-type-v")}
         host = launch_args.get("--host", "0.0.0.0")
         port = launch_args.get("--port", model_config.port or "")
 
@@ -1158,11 +1159,13 @@ async def save_llama_config(
         if invalid_keys:
             logger.info(f"⚠ Model {model_name} has invalid options: {invalid_keys}")
 
-        # Build launch_args from core + advanced
-        launch_args = {"--host": host, "--port": str(port), **advanced_data}
+        # Build launch_args from core + advanced. Rows the user typed may use
+        # short aliases (-c); canonicalize as the parser does so everything
+        # downstream sees one spelling.
+        launch_args = canonical_args({"--host": host, "--port": str(port), **advanced_data})
 
         # Validate --tensor-split if present: must be a comma-separated list of positive numbers.
-        ts_raw = launch_args.get("--tensor-split") or launch_args.get("-ts")
+        ts_raw = launch_args.get("--tensor-split")
         new_split_count = 1
         if ts_raw is not None and str(ts_raw).strip() != "":
             parts = [p.strip() for p in str(ts_raw).split(",") if p.strip()]
@@ -1180,7 +1183,7 @@ async def save_llama_config(
 
         # A flexible-split model (--split-mode layer/row, no --tensor-split) can
         # keep a CVD of any length, so its prior GPU assignment survives a save.
-        sm_raw = launch_args.get("--split-mode") or launch_args.get("-sm")
+        sm_raw = launch_args.get("--split-mode")
         new_is_flexible_split = (
             new_split_count == 1
             and sm_raw is not None
