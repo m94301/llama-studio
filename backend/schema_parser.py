@@ -56,55 +56,71 @@ def parse_help(binary_path: str) -> Optional[Dict]:
         return None
 
 
+# Bumped whenever parsing changes, so caches written by an older parser are
+# regenerated instead of being trusted (the cache file name carries it).
+SCHEMA_FORMAT = 2
+
+# llama-server aligns descriptions at column 40; a line indented this far is a
+# wrapped description, even when it begins with "--". Option lines start near
+# column 0 (or a little further, under a short-option column).
+_DESCRIPTION_INDENT = 30
+
+# The option list at the start of a help line: one or more spellings separated
+# by commas ("-c,    --ctx-size", "--spec-draft-ngl, -ngld, --gpu-layers-draft"),
+# then whatever follows (metavar, description, or nothing).
+_OPTION_LIST_RE = re.compile(r"\s*(-{1,2}[A-Za-z][\w-]*(?:,\s*-{1,2}[A-Za-z][\w-]*)*)(.*)$")
+
+
 def _parse_help_text(help_text: str) -> Dict:
     """
     Parse help text output. Extract options and descriptions.
 
     Help format (typical llama.cpp):
-      -c, --ctx-size N            context size (default: 512)
-      -ngl, --gpu-layers, --n-gpu-layers N      number of layers to offload to GPU
-      ...
+      -c,    --ctx-size N                     size of the prompt context (default: 512)
+      --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N
+                                              max. number of draft model layers ...
 
-    Returns dict keyed by primary option name (prefer long form). All aliases
-    point to the same entry.
+    When the option list fills the line, the description starts on the next
+    (indented) line. Returns a dict keyed by primary option name (prefer long
+    form); every other spelling points to the same entry.
     """
     schema = {}
     lines = help_text.split('\n')
 
-    for line in lines:
-        # Match lines with option flags (handle multiple comma-separated aliases)
-        # Pattern: whitespace + option(s) + non-letter content (param indicator, spacing) + description
-        match = re.match(r'\s*((?:-[\w-]+(?:,\s+)*)+)\s+([^\s].+)', line)
+    for idx, line in enumerate(lines):
+        # A previous option's wrapped description, e.g. "... use
+        # --spec-draft-n-min or\n<40 spaces>--spec-ngram-mod-n-min".
+        if len(line) - len(line.lstrip()) >= _DESCRIPTION_INDENT:
+            continue
+        match = _OPTION_LIST_RE.match(line)
         if not match:
             continue
-
-        options_str = match.group(1)
-        desc_and_default = match.group(2)
-
-        # Parse all option aliases from the comma-separated list
-        options = [opt.strip() for opt in options_str.split(',') if opt.strip()]
-        # Drop non-flag matches like "-----" section dividers (help text uses
-        # them as headers, e.g. "----- speculative params -----").
-        options = [opt for opt in options if re.match(r'^-{1,2}[A-Za-z]', opt)]
-        if not options:
-            continue
+        rest = match.group(2)
+        if rest and not rest[0].isspace():
+            continue  # e.g. prose like "-1)" that only looks like an option
+        options = [opt.strip() for opt in match.group(1).split(',')]
 
         # Separate short and long forms
-        shorts = [o for o in options if o.startswith('-') and not o.startswith('--')]
+        shorts = [o for o in options if not o.startswith('--')]
         longs = [o for o in options if o.startswith('--')]
 
         # Prefer long form for key; fall back to first short
         primary_key = longs[0] if longs else shorts[0]
         secondary_keys = (shorts + longs[1:]) if longs else shorts[1:]
 
-        # Extract description (before any "default:" marker or param indicator)
-        # Remove leading "N", "INDEX", etc.
-        desc = re.sub(r'^[A-Z_0-9{}\[\],.\s]+\s+', '', desc_and_default).strip()
+        # Extract description (before any "default:" marker), dropping a
+        # leading parameter indicator ("N", "INDEX", ...).
+        inline = rest.strip()
+        if len(inline.split()) <= 1:  # nothing, or a lone metavar ("N", "FNAME")
+            following = lines[idx + 1] if idx + 1 < len(lines) else ""
+            desc = following.strip() if following[:1].isspace() and not following.strip().startswith('-') else ""
+        else:
+            desc = re.sub(r'^[A-Z_0-9{}\[\],.\s]+\s+', '', inline).strip()
         desc = desc.split('(default:')[0].strip()
         desc = desc.split('(env:')[0].strip()
 
-        # Infer type: if description mentions "N", "number", "count", it's int
-        option_type = _infer_type(desc, desc_and_default)
+        # Infer type from the parameter indicator, else the description
+        option_type = _infer_type(desc, inline)
 
         entry = {
             "type": option_type,
@@ -171,14 +187,14 @@ def _infer_category(option_key: str) -> str:
 
 def save_schema(schema: Dict, version_str: str, config_dir: Path) -> Path:
     """
-    Save schema to config/llama-server/{version_str}.json.
+    Save schema to config/llama-server/{version_str}.f{SCHEMA_FORMAT}.json.
 
     Returns the path to the saved file.
     """
     schema_dir = config_dir / "llama-server"
     schema_dir.mkdir(parents=True, exist_ok=True)
 
-    schema_file = schema_dir / f"{version_str}.json"
+    schema_file = schema_dir / f"{version_str}.f{SCHEMA_FORMAT}.json"
 
     try:
         with open(schema_file, "w") as f:
@@ -196,7 +212,7 @@ def load_schema(version_str: str, config_dir: Path) -> Optional[Dict]:
 
     Returns the schema dict, or None if not found.
     """
-    schema_file = config_dir / "llama-server" / f"{version_str}.json"
+    schema_file = config_dir / "llama-server" / f"{version_str}.f{SCHEMA_FORMAT}.json"
 
     if not schema_file.exists():
         return None

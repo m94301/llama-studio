@@ -57,7 +57,8 @@ class TestLlamaCpp:
         assert m["version"] == "11067_abc1234"
         assert m["flags"]["--ctx-size"]["type"] == "int"
         assert "-c" in m["flags"] and "--no-mmap" in m["flags"]
-        assert (tmp_path / "config" / "llama-server" / "11067_abc1234.json").exists()
+        from schema_parser import SCHEMA_FORMAT
+        assert (tmp_path / "config" / "llama-server" / f"11067_abc1234.f{SCHEMA_FORMAT}.json").exists()
 
     def test_second_lookup_does_not_rerun_the_binary(self, tmp_path):
         binary, calls = _fake_llama(tmp_path)
@@ -107,3 +108,43 @@ class TestVllmParseResolver:
             assert lookups == ["/custom/vllm", "/default/vllm"]
         finally:
             L.set_vllm_manifest_resolver(None)
+
+
+class TestLlamaHelpParsing:
+    """schema_parser._parse_help_text on help layouts the first parser mishandled."""
+
+    HELP = (
+        "-c,    --ctx-size N                     size of the prompt context (default: 4096)\n"
+        "                                        (env: LLAMA_ARG_CTX_SIZE)\n"
+        "-kvo,  --kv-offload, -nkvo, --no-kv-offload\n"
+        "                                        whether to enable KV cache offloading (default: enabled)\n"
+        "--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N\n"
+        "                                        max. number of draft model layers to store in VRAM\n"
+        "-hf,   -hfr, --hf-repo <user>/<model>[:quant]\n"
+        "                                        Hugging Face model repository\n"
+        "--spec-ngram-mod-n-min N                minimum number of ngram tokens to use\n"
+        "--draft-min, --draft-n-min N            the argument has been removed. use --spec-draft-n-min or\n"
+        "                                        --spec-ngram-mod-n-min\n"
+    )
+
+    @pytest.fixture
+    def schema(self):
+        from schema_parser import _parse_help_text
+        return _parse_help_text(self.HELP)
+
+    def test_inline_description_unchanged(self, schema):
+        assert schema["--ctx-size"] == {"type": "int", "description": "size of the prompt context", "category": "context"}
+        assert schema["-c"] is schema["--ctx-size"]
+
+    def test_every_spelling_on_a_line_is_kept(self, schema):
+        for key in ("--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"):
+            assert schema[key]["type"] == "int", key
+        for key in ("-kvo", "--kv-offload", "-nkvo", "--no-kv-offload"):
+            assert key in schema, key
+
+    def test_description_on_the_next_line(self, schema):
+        assert schema["--kv-offload"]["description"] == "whether to enable KV cache offloading"
+        assert schema["--hf-repo"]["description"] == "Hugging Face model repository"
+
+    def test_wrapped_description_mentioning_a_flag_is_not_an_option(self, schema):
+        assert schema["--spec-ngram-mod-n-min"]["description"] == "minimum number of ngram tokens to use"
