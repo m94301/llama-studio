@@ -337,7 +337,7 @@ class GpuManager:
             model_config=model_config,
             log_file=self.config.get_log_path(name),
             record=record,
-            term_grace=30.0 if model_config.engine == "vllm" else 5.0,
+            term_grace=model_config.term_grace,
         )
         self.sessions[name] = session
         self.models[name].pid = session.pid
@@ -649,7 +649,7 @@ class GpuManager:
                 log_file=log_path,
                 gpu_ids=gpu_ids,
                 health_timeout=model_config.effective_health_timeout(),
-                term_grace=30.0 if model_config.engine == "vllm" else 5.0,
+                term_grace=model_config.term_grace,
                 on_spawn=self._registry_sync,
             )
 

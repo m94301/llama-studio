@@ -86,6 +86,7 @@ class _StubModelConfig:
         self.name = name
         self.port = port
         self.engine = "vllm"
+        self.term_grace = 30.0
         self.script_path = script_path
         self.html_id = name
 

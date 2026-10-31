@@ -264,6 +264,12 @@ class ModelConfig:
         """Raw per-model timeout override from the meta fence, or None if absent."""
         return self.parsed.health_timeout
 
+    @property
+    def term_grace(self) -> float:
+        """Seconds a stop waits after SIGTERM before SIGKILL. vLLM's workers
+        need longer to release their GPUs cleanly."""
+        return 30.0 if self.engine == "vllm" else 5.0
+
     def effective_health_timeout(self) -> int:
         """Per-model timeout if set, else the global default. Always returns an int."""
         return self.parsed.health_timeout if self.parsed.health_timeout is not None else DEFAULT_HEALTH_TIMEOUT
