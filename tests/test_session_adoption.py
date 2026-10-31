@@ -192,6 +192,36 @@ def test_recycled_pid_is_left_alone_even_if_it_looks_like_an_engine(tmp_path, en
         assert process_group_members(p.pid), f"foreign process was killed (keep_alive={keep})"
 
 
+def _failing_adoption(tmp_path, engine, monkeypatch, reap_ok):
+    port = _free_port()
+    p = engine(port)
+    gm, script = _manager(tmp_path, port)
+    _write_registry(tmp_path, {"big-model": _record(p, port, script)})
+    gm._triage_registry(keep_alive=True)
+
+    async def broken(name, record):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(gm, "_adopt", broken)
+    if not reap_ok:
+        monkeypatch.setattr(gm, "_reap_group", lambda name, pgid: False)
+    asyncio.run(gm._adopt_sessions())
+    reg = json.loads((tmp_path / "sessions" / "active.json").read_text())
+    return gm, p, reg
+
+
+def test_failed_adoption_reaps_and_forgets(tmp_path, engine, monkeypatch):
+    gm, p, reg = _failing_adoption(tmp_path, engine, monkeypatch, reap_ok=True)
+    assert not process_group_members(p.pid)
+    assert "big-model" not in gm.sessions and gm.models["big-model"].gpu_ids == []
+    assert reg == {}
+
+
+def test_failed_adoption_that_cannot_be_reaped_stays_in_registry(tmp_path, engine, monkeypatch):
+    gm, p, reg = _failing_adoption(tmp_path, engine, monkeypatch, reap_ok=False)
+    assert "big-model" not in gm.sessions
+    assert reg["big-model:orphan"]["pid"] == p.pid, "next start must retry the reap"
+
+
 def test_reaped_when_keep_alive_is_off(tmp_path, engine):
     port = _free_port()
     p = engine(port)

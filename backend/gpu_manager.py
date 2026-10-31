@@ -306,6 +306,18 @@ class GpuManager:
         model.vram_per_gpu = []
         model.pid = None
 
+    def _drop_session(self, model_name: str) -> None:
+        """Forget a session: its GPU allocation, notes and registry entry.
+
+        Stopping or reaping the process is the caller's job (it differs per
+        path) and must happen first, so the registry keeps a record of the
+        process until it is gone.
+        """
+        self.sessions.pop(model_name, None)
+        self.session_notes.pop(model_name, None)
+        self._release_allocation(model_name)
+        self._registry_sync()
+
     async def _adopt_sessions(self) -> None:
         """Re-attach every session the startup triage found adoptable."""
         for name, record in list(self._adoptable.items()):
@@ -314,10 +326,9 @@ class GpuManager:
             except Exception as e:
                 # Never leave a process of ours running untracked: reap it.
                 logger.error(f"✗ Could not re-attach {name}: {e}", exc_info=True)
-                self.sessions.pop(name, None)
-                self._release_allocation(name)
-                self.session_notes.pop(name, None)
-                await asyncio.to_thread(self._reap_group, name, record["pid"])
+                if not await asyncio.to_thread(self._reap_group, name, record["pid"]):
+                    self._orphans[name] = {"pid": record["pid"], "port": record.get("port")}
+                self._drop_session(name)
         self._adoptable = {}
         self._registry_sync()
 
@@ -364,10 +375,7 @@ class GpuManager:
                 return  # the crash watchdog (or a cancel) got there first
             logger.error(f"✗ Re-attached {name} never became ready: {e}")
             await session.stop()
-            self.sessions.pop(name, None)
-            self._release_allocation(name)
-            self.session_notes.pop(name, None)
-            self._registry_sync()
+            self._drop_session(name)
             await self._set_model_state(name, ModelState.FAILED, LoadingPhase.ERROR,
                                         f"re-attached after restart but never became ready: {e}")
             asyncio.create_task(event_bus.broadcast({"type": "gpu_update"}))
@@ -533,16 +541,6 @@ class GpuManager:
             # this the row stays LOADING forever with a CANCEL button.
             logger.error(f"✗ Load rejected for {model_name}: {e}")
             await self._set_model_state(model_name, ModelState.FAILED, LoadingPhase.ERROR, str(e))
-            try:
-                model_config = self.config.get_model_config(model_name)
-                asyncio.create_task(event_bus.broadcast({
-                    "type": "model_state_change",
-                    "model_name": model_name,
-                    "state": ModelState.FAILED.value,
-                    "html_id": model_config.html_id,
-                }))
-            except Exception:
-                pass
 
     async def _load_model_inner(self, model_name: str, gpu_ids: List[int]) -> None:
         """Validation + spawn. See load_model for the error contract."""
@@ -716,38 +714,19 @@ class GpuManager:
             # Mark as running
             await self._set_model_state(model_name, ModelState.RUNNING, LoadingPhase.RUNNING)
             logger.info(f"✓ {model_name} loaded on GPU(s) {gpu_ids}, PID {pid}")
-
-            # Broadcast state change for immediate UI update
-            asyncio.create_task(event_bus.broadcast({
-                "type": "model_state_change",
-                "model_name": model_name,
-                "state": ModelState.RUNNING.value,
-                "html_id": model_config.html_id,
-            }))
             asyncio.create_task(event_bus.broadcast({"type": "gpu_update"}))
 
         except asyncio.CancelledError:
             logger.info(f"✓ {model_name} load cancelled (background task exiting)")
             # Don't set FAILED — cancel_load already set IDLE
-            if model_name in self.sessions:
-                del self.sessions[model_name]
-            self._registry_sync()
+            self._drop_session(model_name)
             # Don't re-raise — FastAPI background tasks expect clean exit
         except Exception as e:
             logger.error(f"✗ Failed to load {model_name}: {e}")
+            # session.start() stops its own process on failure; forget it so a
+            # retry works, then report.
+            self._drop_session(model_name)
             await self._set_model_state(model_name, ModelState.FAILED, LoadingPhase.ERROR, str(e))
-            # Clean up session if it was partially created (so retries will work)
-            if model_name in self.sessions:
-                del self.sessions[model_name]
-            self._registry_sync()
-            # Broadcast failure event for immediate UI update
-            model_config = self.config.get_model_config(model_name)
-            asyncio.create_task(event_bus.broadcast({
-                "type": "model_state_change",
-                "model_name": model_name,
-                "state": ModelState.FAILED.value,
-                "html_id": model_config.html_id,
-            }))
             # Don't re-raise — FastAPI background tasks should exit cleanly
 
     async def cancel_load(self, model_name: str) -> None:
@@ -765,40 +744,16 @@ class GpuManager:
             raise ValueError(f"Cannot cancel: model is currently {current_state.value}")
 
         try:
-            # Kill the process if a session was created during loading
+            # Kill the process if a session was created during loading. Popped
+            # first so the load task, on waking, sees it is no longer current.
             session = self.sessions.pop(model_name, None)
             if session:
                 session.cancelled = True
                 await session.stop()
-            self.session_notes.pop(model_name, None)
-            self._registry_sync()
+            self._drop_session(model_name)
 
-            # Reset GPU allocation if it was partially updated
-            model = self.models.get(model_name)
-            if model and model.gpu_ids:
-                for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
-                    if gid in self.gpus:
-                        gpu = self.gpus[gid]
-                        gpu.allocated = max(0.0, gpu.allocated - need)
-                        gpu.loaded_models = [
-                            m for m in gpu.loaded_models if m["name"] != model_name
-                        ]
-                model.gpu_ids = []
-                model.vram_per_gpu = []
-                model.pid = None
-
-            # Reset to idle
             await self._set_model_state(model_name, ModelState.IDLE, LoadingPhase.IDLE)
             logger.info(f"✓ {model_name} load cancelled")
-
-            # Broadcast cancellation for immediate UI update
-            model_config = self.config.get_model_config(model_name)
-            asyncio.create_task(event_bus.broadcast({
-                "type": "model_state_change",
-                "model_name": model_name,
-                "state": ModelState.IDLE.value,
-                "html_id": model_config.html_id,
-            }))
 
         except Exception as e:
             logger.error(f"✗ Error cancelling {model_name}: {e}")
@@ -837,37 +792,9 @@ class GpuManager:
                     "port": session.model_config.port,
                 }
 
-            # Update GPU allocation across all GPUs the model was using
-            model = self.models[model_name]
-            if model.gpu_ids:
-                for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
-                    if gid in self.gpus:
-                        gpu = self.gpus[gid]
-                        gpu.allocated = max(0.0, gpu.allocated - need)
-                        gpu.loaded_models = [
-                            m for m in gpu.loaded_models if m["name"] != model_name
-                        ]
-
-            # Clean up
-            del self.sessions[model_name]
-            self.session_notes.pop(model_name, None)
-            self._registry_sync()
-            model.gpu_ids = []
-            model.vram_per_gpu = []
-            model.pid = None
-
-            # Mark as idle
+            self._drop_session(model_name)
             await self._set_model_state(model_name, ModelState.IDLE, LoadingPhase.IDLE)
             logger.info(f"✓ {model_name} unloaded")
-
-            # Broadcast state change for immediate UI update
-            model_config = self.config.get_model_config(model_name)
-            asyncio.create_task(event_bus.broadcast({
-                "type": "model_state_change",
-                "model_name": model_name,
-                "state": ModelState.IDLE.value,
-                "html_id": model_config.html_id,
-            }))
             asyncio.create_task(event_bus.broadcast({"type": "gpu_update"}))
 
         except Exception as e:
@@ -949,24 +876,11 @@ class GpuManager:
     async def _handle_crashed_session(self, model_name: str, returncode) -> None:
         """Clean up after a session whose process died out from under us."""
         logger.error(f"✗ {model_name} process exited unexpectedly (code {returncode})")
-        crashed = self.sessions.pop(model_name, None)
-        self.session_notes.pop(model_name, None)
+        crashed = self.sessions.get(model_name)
         if crashed is not None:
             # A dead leader can leave engine workers holding VRAM — sweep the group.
             crashed.kill_process_group(signal.SIGKILL)
-        self._registry_sync()
-        model = self.models.get(model_name)
-        if model and model.gpu_ids:
-            for gid, need in zip(model.gpu_ids, model.vram_per_gpu):
-                if gid in self.gpus:
-                    gpu = self.gpus[gid]
-                    gpu.allocated = max(0.0, gpu.allocated - need)
-                    gpu.loaded_models = [
-                        m for m in gpu.loaded_models if m["name"] != model_name
-                    ]
-            model.gpu_ids = []
-            model.vram_per_gpu = []
-            model.pid = None
+        self._drop_session(model_name)
         await self._set_model_state(
             model_name, ModelState.FAILED, LoadingPhase.ERROR,
             f"process exited unexpectedly (code {returncode}) — see log",
