@@ -72,6 +72,9 @@ if verbose_mode:
 # Suppress verbose HTTP access logs to reduce noise and keep app logs visible
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("starlette.middleware.base").setLevel(logging.WARNING)
+# httpx logs every request at INFO: the chat page heartbeat (/v1/models every
+# 5s per open tab) and load health checks would flood the log.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Initialize managers
 config_manager = ConfigManager(PROJECT_ROOT / "config" / "app.json", project_root=PROJECT_ROOT)
