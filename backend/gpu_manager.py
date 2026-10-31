@@ -148,7 +148,6 @@ class GpuManager:
         # stay in the on-disk registry and get reaped at the next start.
         self._orphans: Dict[str, dict] = {}
         # Per-model notes for the row (e.g. "kept running across a restart").
-        self.session_notes: Dict[str, str] = {}
         # Registry entries the startup triage judged safe to re-attach to.
         self._adoptable: Dict[str, dict] = {}
 
@@ -307,14 +306,13 @@ class GpuManager:
         model.pid = None
 
     def _drop_session(self, model_name: str) -> None:
-        """Forget a session: its GPU allocation, notes and registry entry.
+        """Forget a session: its GPU allocation and registry entry.
 
         Stopping or reaping the process is the caller's job (it differs per
         path) and must happen first, so the registry keeps a record of the
         process until it is gone.
         """
         self.sessions.pop(model_name, None)
-        self.session_notes.pop(model_name, None)
         self._release_allocation(model_name)
         self._registry_sync()
 
@@ -344,12 +342,9 @@ class GpuManager:
         self.models[name].pid = session.pid
         self._attach_allocation(name, model_config, session.gpu_ids, session.vram_per_gpu)
 
-        note = "Kept running across a Llama Studio restart"
         recorded = record.get("script_fingerprint")
         if recorded and launch_fingerprint(model_config.script_path) != recorded:
-            note += " — its script was edited since it was launched, so it's running the old settings"
-
-        self.session_notes[name] = note
+            logger.warning(f"⚠ {name}: script edited since launch — it keeps running the old settings until reloaded")
 
         owned = await asyncio.to_thread(port_owned_by_group, model_config.port, session.pid)
         if owned is not False and await session.is_healthy():

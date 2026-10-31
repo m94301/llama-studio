@@ -39,8 +39,4 @@
     {% else %}
         {{ status | status_badge | safe }}
     {% endif %}
-    {% if session_note %}
-        <span class="ml-1 text-xs {{ 'text-amber-400' if 'edited' in session_note else 'text-teal-300' }}"
-              title="{{ session_note }}" style="cursor: help">↻</span>
-    {% endif %}
 </div>

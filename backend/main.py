@@ -377,7 +377,6 @@ async def get_model_status_inner(model: str):
         status=status,
         model_config=model_config,
         error_msg=error_msg,
-        session_note=gpu_manager.session_notes.get(model),
     ))
 
 

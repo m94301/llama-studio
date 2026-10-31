@@ -172,7 +172,6 @@ def test_adopts_a_server_it_launched(tmp_path, engine):
     assert s.adopted and s.pid == p.pid
     assert gm.get_model_state("big-model") == ModelState.RUNNING
     assert gm.models["big-model"].gpu_ids == [0, 1]
-    assert "restart" in gm.session_notes["big-model"]
     assert process_group_members(p.pid), "adoption must not touch the process"
     reg = json.loads((tmp_path / "sessions" / "active.json").read_text())
     assert reg["big-model"]["pid"] == p.pid and reg["big-model"]["start_time"]
@@ -315,7 +314,7 @@ def test_adopted_leader_death_is_detected(tmp_path, engine):
     assert not s.leader_alive()
 
 
-def _note_after(tmp_path, engine, edit):
+def _log_after(tmp_path, engine, caplog, edit):
     port = _free_port()
     p = engine(port)
     gm, script = _manager(tmp_path, port)
@@ -324,19 +323,21 @@ def _note_after(tmp_path, engine, edit):
     _write_registry(tmp_path, {"big-model": _record(p, port, script)})
     script.write_text(edit(script.read_text()))
     gm._triage_registry(keep_alive=True)
-    asyncio.run(gm._adopt_sessions())
-    return gm.session_notes["big-model"]
+    with caplog.at_level("WARNING", logger="gpu_manager"):
+        asyncio.run(gm._adopt_sessions())
+    assert gm.get_model_state("big-model") == ModelState.RUNNING
+    return caplog.text
 
 
-def test_edited_launch_args_are_flagged(tmp_path, engine):
-    assert "edited" in _note_after(tmp_path, engine, lambda t: t.replace("--port 1", "--port 2"))
+def test_edited_launch_args_are_flagged(tmp_path, engine, caplog):
+    assert "edited" in _log_after(tmp_path, engine, caplog, lambda t: t.replace("--port 1", "--port 2"))
 
 
-def test_meta_fence_rewrite_is_not_an_edit(tmp_path, engine):
+def test_meta_fence_rewrite_is_not_an_edit(tmp_path, engine, caplog):
     """Studio's own post-load calibration rewrites the meta fence; that's not 'edited'."""
-    note = _note_after(tmp_path, engine,
-                       lambda t: t.replace("# display_name: A", "# display_name: B\n# kv_bytes_per_token: 22094"))
-    assert "edited" not in note and "restart" in note
+    log = _log_after(tmp_path, engine, caplog,
+                     lambda t: t.replace("# display_name: A", "# display_name: B\n# kv_bytes_per_token: 22094"))
+    assert "edited" not in log
 
 
 # ---------- shutdown ----------
