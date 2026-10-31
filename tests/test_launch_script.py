@@ -17,8 +17,6 @@ from launch_script import (  # noqa: E402
     patch_cuda_visible_devices,
     META_BEGIN,
     META_END,
-    ARGS_BEGIN,
-    ARGS_END,
 )
 
 
@@ -34,7 +32,6 @@ CANONICAL = """#!/usr/bin/env bash
 
 LLAMA_BIN=/home/servers/llamacpp/bin/llama-server
 
-# === llama-studio:launch-args BEGIN ===
 exec "$LLAMA_BIN" \\
   -m /home/models/Qwen3.6-27B-Q4_K_M.gguf \\
   --host 0.0.0.0 \\
@@ -43,7 +40,6 @@ exec "$LLAMA_BIN" \\
   --cache-type-k q8_0 \\
   --cache-type-v q8_0 \\
   --no-mmap
-# === llama-studio:launch-args END ===
 """
 
 
@@ -65,11 +61,11 @@ def test_meta_fence_missing_warns():
     assert any("meta fence missing" in w for w in ps.warnings)
 
 
-# ---------- launch-args fence ----------
+# ---------- launch invocation ----------
 
-def test_args_fence_parses_canonical():
+def test_invocation_parses_canonical():
     ps = parse_script(CANONICAL)
-    assert ps.has_args_fence is True
+    assert ps.has_invocation is True
     assert ps.llama_bin == "/home/servers/llamacpp/bin/llama-server"
     assert ps.model_path == "/home/models/Qwen3.6-27B-Q4_K_M.gguf"
     assert ps.host == "0.0.0.0"
@@ -201,9 +197,6 @@ def test_render_basic():
     assert "#!/usr/bin/env bash" in text
     assert META_BEGIN in text
     assert META_END in text
-    # New format: no launch-args fence markers
-    assert ARGS_BEGIN not in text
-    assert ARGS_END not in text
     assert "display_name: Test" in text
     assert "-m /m.gguf" in text
     assert "--port 8100" in text

@@ -1,8 +1,8 @@
 """Configuration management for app and models.
 
 Models are stored as executable shell scripts at config/models/<name>.sh.
-Each script has a meta fence (display_name + GGUF-derived cache) and a
-launch-args fence (the llama-server invocation). See backend/launch_script.py.
+Each script has a meta fence (display_name + cached measurements) followed by
+the engine invocation. See backend/launch_script.py.
 """
 
 import asyncio

@@ -35,7 +35,6 @@ from launch_script import (
     manifest_for_binary,
 )
 import chat_proxy
-import migrate_configs
 from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
 from event_bus import event_bus
@@ -75,9 +74,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Initialize managers
 config_manager = ConfigManager(PROJECT_ROOT / "config" / "app.json", project_root=PROJECT_ROOT)
 gpu_manager = GpuManager(config_manager)
-
-# Set by lifespan if legacy JSON configs are present at startup; cleared after migration.
-LEGACY_CONFIGS_DETECTED = False
 
 # Progress state for the startup auto-load background task. Cleared when complete.
 AUTO_LOAD_PROGRESS: Dict[str, int] = {"active": 0, "current_index": 0, "total": 0}
@@ -122,14 +118,7 @@ async def lifespan(app: FastAPI):
         # manifest (captured + cached on first sight), else the default engine's.
         install_vllm_parse_manifests(_config_dir(), lambda: config_manager.app_config.vllm_binary)
 
-        # Hard-block on legacy JSON configs — they must be migrated to shell scripts.
-        if migrate_configs.has_legacy_configs(PROJECT_ROOT):
-            global LEGACY_CONFIGS_DETECTED
-            LEGACY_CONFIGS_DETECTED = True
-            logger.warning("⚠ Legacy JSON model configs detected — model loading is blocked until migration completes.")
-            logger.warning("   Visit the WebUI and click 'Migrate now', or run: python backend/migrate_configs.py")
-        else:
-            await config_manager.load_all_models()
+        await config_manager.load_all_models()
 
         await gpu_manager.initialize()
 
@@ -141,11 +130,7 @@ async def lifespan(app: FastAPI):
         # Auto-load stored models as a background task so the WebUI is reachable
         # immediately. Each load is async (health-check polling, etc.) and can
         # take 30-120s; the banner endpoint surfaces progress to the UI.
-        if (
-            not LEGACY_CONFIGS_DETECTED
-            and config_manager.app_config.auto_load_on_startup
-            and config_manager.app_config.startup_models
-        ):
+        if config_manager.app_config.auto_load_on_startup and config_manager.app_config.startup_models:
             asyncio.create_task(_auto_load_startup_models())
 
         # Warm the vllm version cache in the background so the first Settings
@@ -322,106 +307,9 @@ async def get_model_status_inner(model: str):
 # ============================================================================
 
 
-def _legacy_migration_page() -> HTMLResponse:
-    """Render a one-page migration UI shown when legacy JSON configs are present."""
-    legacy_files = migrate_configs.find_legacy_configs(PROJECT_ROOT / "config" / "models")
-    file_list_html = "".join(
-        f'<li class="font-mono text-xs text-gray-300 py-1">{p.name}</li>' for p in legacy_files
-    )
-    html = f"""<!DOCTYPE html>
-<html><head><title>Llama Studio — Migration Required</title>
-<script src="https://unpkg.com/htmx.org@1.9.10"></script>
-<script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-900 text-gray-100 min-h-screen flex items-center justify-center p-6">
-  <div class="bg-gray-800 border border-yellow-600 rounded-lg p-6 max-w-2xl w-full">
-    <h1 class="text-2xl font-bold text-yellow-400 mb-3">⚠ Legacy Configs Detected</h1>
-    <p class="text-sm text-gray-300 mb-4">
-      Llama Studio now stores model configs as executable shell scripts (<code>.sh</code>)
-      instead of JSON. Found {len(legacy_files)} legacy file(s) that need to be migrated
-      before models can be loaded.
-    </p>
-    <p class="text-sm text-gray-400 mb-4">
-      Migration is non-destructive: each <code>&lt;name&gt;.json</code> will be converted to
-      <code>&lt;name&gt;.sh</code> and the original renamed to <code>&lt;name&gt;.json.old</code>
-      (kept as a backup for rollback).
-    </p>
-    <details class="mb-4">
-      <summary class="cursor-pointer text-sm text-blue-400 hover:text-blue-300">
-        Show files to migrate
-      </summary>
-      <ul class="mt-2 ml-4 list-disc">{file_list_html}</ul>
-    </details>
-    <div id="migration-result" class="mb-4"></div>
-    <div class="flex gap-3">
-      <button
-        hx-post="/api/run-migration"
-        hx-target="#migration-result"
-        hx-swap="innerHTML"
-        class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">
-        Migrate now
-      </button>
-      <a href="/" class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold text-center">
-        Reload page
-      </a>
-    </div>
-    <p class="text-xs text-gray-500 mt-4">
-      Or run from CLI: <code>python backend/migrate_configs.py</code>
-    </p>
-  </div>
-</body></html>"""
-    return HTMLResponse(html)
-
-
-@app.post("/api/run-migration", response_class=HTMLResponse)
-async def run_migration():
-    """Trigger one-shot JSON -> SH migration and reload models."""
-    global LEGACY_CONFIGS_DETECTED
-    try:
-        successes, failures = migrate_configs.migrate_all(PROJECT_ROOT, dry_run=False)
-    except Exception as e:
-        logger.error(f"✗ Migration failed: {e}", exc_info=True)
-        return HTMLResponse(
-            f'<div class="p-3 bg-red-900 border border-red-600 rounded text-sm">'
-            f'✗ Migration failed: {str(e)}</div>'
-        )
-
-    if failures:
-        body = "<div class='p-3 bg-red-900 border border-red-600 rounded text-sm'>"
-        body += "<p class='font-bold mb-2'>✗ Migration completed with failures:</p><ul class='list-disc ml-4'>"
-        for f in failures:
-            body += f"<li>{f}</li>"
-        body += "</ul></div>"
-        return HTMLResponse(body)
-
-    # All migrated cleanly — clear the flag and load models
-    LEGACY_CONFIGS_DETECTED = False
-    if not migrate_configs.has_legacy_configs(PROJECT_ROOT):
-        try:
-            await config_manager.load_all_models()
-            gpu_manager.sync_models_from_config()
-        except Exception as e:
-            logger.error(f"✗ Error loading models after migration: {e}", exc_info=True)
-
-    body = "<div class='p-3 bg-green-900 border border-green-600 rounded text-sm'>"
-    body += f"<p class='font-bold mb-2'>✓ Migrated {len(successes)} model(s):</p>"
-    body += "<ul class='list-disc ml-4 max-h-48 overflow-y-auto'>"
-    for s in successes:
-        body += f"<li class='text-xs'>{s}</li>"
-    body += "</ul>"
-    body += "<p class='mt-3'>Reload the page to continue.</p>"
-    body += '<a href="/" class="inline-block mt-2 px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded">Reload</a>'
-    body += "</div>"
-    return HTMLResponse(body)
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     """Serve main page with config status."""
-    # If legacy JSON configs exist, render the migration page instead.
-    if LEGACY_CONFIGS_DETECTED:
-        return _legacy_migration_page()
-
     # Check if configuration is complete
     needs_config, error_msg = config_manager.needs_configuration()
     config_incomplete = needs_config

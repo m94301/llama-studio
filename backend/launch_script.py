@@ -21,10 +21,9 @@ Script format (llama.cpp):
       --no-mmap
 
 The meta fence holds user-owned display_name plus GGUF-derived cache fields,
-and is patched in place by the UI. Everything after the meta fence is the
-launch invocation; the UI rewrites it wholesale on save. The parser tolerates
-legacy fenced launch-args blocks (used during the initial migration) but new
-scripts are written without those markers.
+and is patched in place by the UI. Below it, a save rewrites only the launch
+invocation (patch_exec_invocation) and assignments that changed; comments and
+every other line are the user's and are kept as written.
 
 Script format (vLLM) — `# engine: vllm` in the meta fence, and the invocation
 is `exec ".../vllm" serve <model-dir> --flags...` with the model as a
@@ -49,8 +48,6 @@ logger = logging.getLogger(__name__)
 
 META_BEGIN = "# === llama-studio:meta BEGIN ==="
 META_END = "# === llama-studio:meta END ==="
-ARGS_BEGIN = "# === llama-studio:launch-args BEGIN ==="
-ARGS_END = "# === llama-studio:launch-args END ==="
 
 # Aliases: short form -> long form (normalize on parse, preserve user's choice when possible)
 FLAG_ALIASES: Dict[str, str] = {
@@ -223,7 +220,7 @@ class ParsedScript:
     raw_text: str = ""
     warnings: List[str] = field(default_factory=list)
     has_meta_fence: bool = False
-    has_args_fence: bool = False
+    has_invocation: bool = False
 
     @property
     def port(self) -> Optional[int]:
@@ -429,7 +426,7 @@ class ParsedScript:
 
     def is_configured(self) -> Tuple[bool, Optional[str]]:
         """Return (configured, reason_if_not)."""
-        if not self.has_args_fence:
+        if not self.has_invocation:
             return False, "no launch invocation found"
         if not self.model_path:
             return False, (
@@ -572,39 +569,6 @@ def _strip_comments(text: str) -> str:
     return "\n".join(out_lines)
 
 
-def _tokenize_args_fence(inner: str) -> Tuple[Optional[str], List[str]]:
-    """Tokenize the launch-args fence body.
-
-    Returns (binary_path, arg_tokens) where binary_path is the resolved path
-    to llama-server (with $LLAMA_BIN expanded to the value of an assignment
-    seen above, if present in the wider script — handled by caller) and
-    arg_tokens is the list of tokens following the binary.
-
-    If no recognizable llama-server invocation is found, returns (None, all_tokens).
-    """
-    collapsed = _collapse_continuations(inner)
-    # Drop standalone comment lines but keep inline-quoted content intact
-    no_comments = "\n".join(
-        line for line in collapsed.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
-
-    try:
-        tokens = shlex.split(no_comments, posix=True)
-    except ValueError as e:
-        raise ValueError(f"shell tokenization failed: {e}")
-
-    # Drop leading 'exec' if present
-    if tokens and tokens[0] == "exec":
-        tokens = tokens[1:]
-
-    if not tokens:
-        return None, []
-
-    binary = tokens[0]
-    return binary, tokens[1:]
-
-
 def _arg_tokens_to_dict(
     tokens: List[str], warnings: List[str]
 ) -> Tuple[Dict[str, Optional[str]], Optional[str], Dict[str, str]]:
@@ -733,26 +697,14 @@ def parse_script(text: str) -> ParsedScript:
     else:
         ps.warnings.append("meta fence missing")
 
-    # Launch invocation: prefer the legacy fence if present (older scripts),
-    # otherwise scan for the exec/llama-server line in the body below the meta fence.
-    args_fence = _extract_fence(text, ARGS_BEGIN, ARGS_END)
-    if args_fence is not None:
-        ps.has_args_fence = True
-        try:
-            binary, tokens = _tokenize_args_fence(args_fence[2])
-            ps.llama_bin = _resolve_llama_bin(binary, text) if binary else None
-            _set_llama_args(ps, tokens)
-        except ValueError as e:
-            ps.warnings.append(f"launch-args fence parse failed: {e}")
-    else:
-        # Fenceless: scan the body below the meta fence (if any) for the invocation
-        body = text
-        if meta_fence is not None:
-            lines = text.splitlines()
-            body = "\n".join(lines[meta_fence[1] + 1:])
-        _populate_from_body(ps, body, text)
+    # Launch invocation: the exec/llama-server line in the body below the meta fence.
+    body = text
+    if meta_fence is not None:
+        lines = text.splitlines()
+        body = "\n".join(lines[meta_fence[1] + 1:])
+    _populate_from_body(ps, body, text)
 
-    # Shell-level CVD (read from the whole script regardless of fence presence)
+    # Shell-level CVD (read from the whole script)
     ps.cuda_visible_devices = _extract_cuda_visible_devices(text)
 
     ps.env_assignments = extract_assignments(text)
@@ -816,7 +768,7 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
             break
 
     if invocation is None:
-        ps.has_args_fence = False  # no invocation found
+        ps.has_invocation = False
         ps.warnings.append("no launch invocation found")
         return
 
@@ -839,14 +791,14 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
         # Meta tag wins; an undeclared script with a vllm invocation is inferred.
         if not ps.engine_declared:
             ps.engine = "vllm"
-        ps.has_args_fence = True
+        ps.has_invocation = True
         ps.llama_bin = binary
         ps.args, ps.model_path, ps.raw_args, ps.raw_model_path, ps.raw_keys = _vllm_arg_tokens_to_dict(
             tokens[2:], full_text, ps.warnings, manifest_for_binary(binary)
         )
         return
 
-    ps.has_args_fence = True  # found a valid invocation; treat as "configured-able"
+    ps.has_invocation = True
     ps.llama_bin = _resolve_llama_bin(binary, full_text)
     _set_llama_args(ps, tokens[1:])
 
