@@ -318,6 +318,13 @@ class ModelConfig:
         return self.parsed.is_flexible_split
 
     @property
+    def weight_files(self) -> List[Path]:
+        """Every weights file the launch loads: the model plus a multimodal
+        projector (--mmproj) and a speculative draft model (--model-draft)."""
+        paths = [self.model_path] + [self.launch_args.get(k) for k in ("--mmproj", "--model-draft")]
+        return [Path(p) for p in paths if p]
+
+    @property
     def cuda_visible_devices(self) -> Optional[list]:
         return self.parsed.cuda_visible_devices
 
@@ -687,7 +694,7 @@ class ConfigManager:
 
         # Compute size and total VRAM
         if mc.model_path and Path(mc.model_path).exists():
-            mc.size_gb = self._get_gguf_size_gb(Path(mc.model_path))
+            mc.size_gb = round(sum(self._get_gguf_size_gb(p) for p in mc.weight_files if p.exists()), 1)
             args = mc.launch_args
             if mc.size_gb and mc.block_count and mc.kv_cache_multiplier and args:
                 ctx = _int_arg(args, "--ctx-size")

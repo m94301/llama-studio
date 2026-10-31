@@ -65,6 +65,9 @@ FLAG_ALIASES: Dict[str, str] = {
     "-np": "--parallel",
     "-kvu": "--kv-unified",
     "-no-kvu": "--no-kv-unified",
+    "-mm": "--mmproj",
+    "-md": "--model-draft",
+    "--spec-draft-model": "--model-draft",
 }
 
 
