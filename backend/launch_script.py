@@ -207,6 +207,11 @@ class ParsedScript:
     # indirection like --max-model-len "$MAXLEN" survives a structured edit.
     raw_args: Dict[str, Optional[str]] = field(default_factory=dict)
     raw_model_path: Optional[str] = None
+    # Each canonical flag as it was spelled (-a for --alias, -tp for
+    # --tensor-parallel-size), in script order. llama.cpp's -m / --model is
+    # included at its position. A save re-emits arguments in this order and
+    # spelling, so an edit changes only the lines it touches.
+    raw_keys: Dict[str, str] = field(default_factory=dict)
 
     # Shell-level state (read from script body, not args)
     cuda_visible_devices: Optional[List[int]] = None  # parsed CUDA_VISIBLE_DEVICES, None if absent
@@ -600,13 +605,16 @@ def _tokenize_args_fence(inner: str) -> Tuple[Optional[str], List[str]]:
     return binary, tokens[1:]
 
 
-def _arg_tokens_to_dict(tokens: List[str], warnings: List[str]) -> Tuple[Dict[str, Optional[str]], Optional[str]]:
+def _arg_tokens_to_dict(
+    tokens: List[str], warnings: List[str]
+) -> Tuple[Dict[str, Optional[str]], Optional[str], Dict[str, str]]:
     """Walk a list of arg tokens into an ordered dict.
 
-    Returns (args_dict, model_path). model_path is extracted from -m / --model
-    and removed from args_dict (the renderer puts it back).
+    Returns (args_dict, model_path, raw_keys). model_path is extracted from
+    -m / --model and removed from args_dict (the renderer puts it back).
     """
     args: Dict[str, Optional[str]] = {}
+    raw_keys: Dict[str, str] = {}
     model_path: Optional[str] = None
     i = 0
     while i < len(tokens):
@@ -618,6 +626,7 @@ def _arg_tokens_to_dict(tokens: List[str], warnings: List[str]) -> Tuple[Dict[st
 
         # Normalize alias to canonical long form
         canonical = FLAG_ALIASES.get(tok, tok)
+        raw_keys.setdefault(canonical, tok)
 
         # Determine if this is flag-only or takes a value
         is_flag_only = False
@@ -647,7 +656,15 @@ def _arg_tokens_to_dict(tokens: List[str], warnings: List[str]) -> Tuple[Dict[st
                 args[canonical] = value
             i += 2
 
-    return args, model_path
+    return args, model_path, raw_keys
+
+
+def _set_llama_args(ps: ParsedScript, tokens: List[str]) -> None:
+    """Populate ps from llama-server arg tokens. llama.cpp values are kept as
+    written (no $VAR resolution), so the raw forms equal the parsed ones."""
+    ps.args, ps.model_path, ps.raw_keys = _arg_tokens_to_dict(tokens, ps.warnings)
+    ps.raw_args = dict(ps.args)
+    ps.raw_model_path = ps.model_path
 
 
 # ---------- public parse API ----------
@@ -724,7 +741,7 @@ def parse_script(text: str) -> ParsedScript:
         try:
             binary, tokens = _tokenize_args_fence(args_fence[2])
             ps.llama_bin = _resolve_llama_bin(binary, text) if binary else None
-            ps.args, ps.model_path = _arg_tokens_to_dict(tokens, ps.warnings)
+            _set_llama_args(ps, tokens)
         except ValueError as e:
             ps.warnings.append(f"launch-args fence parse failed: {e}")
     else:
@@ -824,20 +841,20 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
             ps.engine = "vllm"
         ps.has_args_fence = True
         ps.llama_bin = binary
-        ps.args, ps.model_path, ps.raw_args, ps.raw_model_path = _vllm_arg_tokens_to_dict(
+        ps.args, ps.model_path, ps.raw_args, ps.raw_model_path, ps.raw_keys = _vllm_arg_tokens_to_dict(
             tokens[2:], full_text, ps.warnings, manifest_for_binary(binary)
         )
         return
 
     ps.has_args_fence = True  # found a valid invocation; treat as "configured-able"
     ps.llama_bin = _resolve_llama_bin(binary, full_text)
-    ps.args, ps.model_path = _arg_tokens_to_dict(tokens[1:], ps.warnings)
+    _set_llama_args(ps, tokens[1:])
 
 
 def _vllm_arg_tokens_to_dict(
     tokens: List[str], full_text: str, warnings: List[str],
     manifest: Optional[Dict[str, dict]] = None,
-) -> Tuple[Dict[str, Optional[str]], Optional[str]]:
+) -> Tuple[Dict[str, Optional[str]], Optional[str], Dict[str, Optional[str]], Optional[str], Dict[str, str]]:
     """Walk `vllm serve` arg tokens (after 'serve') into a dict.
 
     The model is the positional token before any flag. Whether a flag takes a
@@ -853,6 +870,7 @@ def _vllm_arg_tokens_to_dict(
 
     args: Dict[str, Optional[str]] = {}
     raw: Dict[str, Optional[str]] = {}
+    raw_keys: Dict[str, str] = {}
     model_path: Optional[str] = None
     raw_model_path: Optional[str] = None
     last_flag: Optional[str] = None
@@ -877,6 +895,7 @@ def _vllm_arg_tokens_to_dict(
         # Normalize short forms (-tp → --tensor-parallel-size) so downstream
         # lookups like gpu_count see one canonical key.
         canonical = aliases.get(tok, tok)
+        raw_keys.setdefault(canonical, tok)
         next_tok = tokens[i + 1] if i + 1 < len(tokens) else None
         next_is_flag = next_tok is not None and (
             next_tok.startswith("--")
@@ -905,7 +924,7 @@ def _vllm_arg_tokens_to_dict(
             last_flag = canonical
             i += 2
 
-    return args, model_path, raw, raw_model_path
+    return args, model_path, raw, raw_model_path, raw_keys
 
 
 def parse_pasted_script(text: str) -> ParsedScript:
@@ -922,7 +941,7 @@ def parse_pasted_script(text: str) -> ParsedScript:
     if ps.llama_bin is None and not ps.model_path and not ps.args:
         try:
             tokens = shlex.split(_collapse_continuations(text), posix=True)
-            ps.args, ps.model_path = _arg_tokens_to_dict(tokens, ps.warnings)
+            _set_llama_args(ps, tokens)
             ps.warnings.append("no llama-server invocation found; parsed pasted text as args only")
         except ValueError as e:
             ps.warnings.append(f"could not tokenize pasted text: {e}")
@@ -1200,40 +1219,6 @@ def patch_meta_fence(
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
-def patch_launch_args_fence(
-    text: str,
-    *,
-    llama_bin: str,
-    model_path: Optional[str],
-    args: Dict[str, Optional[str]],
-) -> str:
-    """Replace everything below the meta fence with a fresh LLAMA_BIN + invocation.
-
-    Any user content between the meta fence and the invocation is overwritten;
-    this is the agreed trade-off for dropping the launch-args fence markers.
-    Users who need custom shell content (pre-launch warmups, sourced files) can
-    edit the script via the Edit raw-script flow.
-    """
-    body = f'\nLLAMA_BIN={shlex.quote(llama_bin)}\n\n' + _render_invocation(llama_bin, model_path, args) + "\n"
-
-    meta_fence = _extract_fence(text, META_BEGIN, META_END)
-    lines = text.splitlines()
-    trailing_newline = "\n" if text.endswith("\n") else ""
-
-    if meta_fence is not None:
-        _, end_idx, _ = meta_fence
-        # Keep everything through the meta END line; replace everything after.
-        kept = lines[:end_idx + 1]
-        return "\n".join(kept) + "\n" + body.lstrip("\n") + (trailing_newline if not body.endswith("\n") else "")
-
-    # No meta fence: prepend shebang if missing, append body
-    if not lines or not lines[0].startswith("#!"):
-        prefix = "#!/usr/bin/env bash\n"
-    else:
-        prefix = ""
-    return prefix + text + (trailing_newline if not text.endswith("\n") else "") + body
-
-
 # Shell variables the app manages itself; the user edits these through their own
 # controls, not as free-form environment rows.
 MANAGED_ASSIGNMENTS = {_CVD_KEY, _DISPLAY_NAME_KEY}
@@ -1343,17 +1328,19 @@ def patch_exec_invocation(
     args: Dict[str, Optional[str]],
     model_path: Optional[str] = None,
     parsed: Optional[ParsedScript] = None,
+    binary: Optional[str] = None,
 ) -> str:
     """Rewrite only the exec line, preserving every other byte of the script.
 
-    This is what makes structured saves safe for vLLM, whose scripts are mostly
-    preamble: env vars, tuning comments, variable defaults. `patch_launch_args_fence`
-    replaces everything below the meta fence and would destroy all of it.
+    The structured save for both engines. Arguments keep the script's own order
+    and spelling (`-a` stays `-a`); new ones are appended. When `parsed` is
+    supplied, an argument whose value is unchanged is re-emitted exactly as
+    written — so `--max-model-len "$MAXLEN"` stays a variable reference instead
+    of being frozen to the resolved number. Changed values are written literally.
 
-    When `parsed` is supplied, any argument whose value is unchanged is re-emitted
-    in its original form — so `--max-model-len "$MAXLEN"` stays a variable
-    reference instead of being frozen to the resolved number. Changed values are
-    written literally.
+    `binary` replaces the executable token when it differs from the parsed one;
+    callers whose exec line names a variable (`"$LLAMA_BIN"`) patch that
+    variable's assignment instead and leave this unset.
     """
     span = find_invocation_span(text)
     if span is None:
@@ -1361,7 +1348,6 @@ def patch_exec_invocation(
     start, end = span
     lines = text.splitlines()
 
-    binary = parsed.llama_bin if parsed else None
     original = lines[start]
     # Preserve the original binary token (e.g. "$VLLM_BIN") rather than its
     # resolved path, and whether the line was exec'd.
@@ -1371,10 +1357,13 @@ def patch_exec_invocation(
         head_tokens = []
     is_exec = original.strip().startswith("exec ")
     m = re.match(r'^\s*(?:exec\s+)?("[^"]*"|\'[^\']*\'|\S+)', original)
-    binary_token = m.group(1) if m else (binary or "")
+    binary_token = m.group(1) if m else ((parsed.llama_bin if parsed else None) or "")
+    if binary and (parsed is None or binary != parsed.llama_bin):
+        binary_token = shlex.quote(binary)
     is_vllm = bool(parsed and parsed.engine == "vllm") or (
         len(head_tokens) > 1 and head_tokens[1] == "serve"
     )
+    raw_keys = parsed.raw_keys if parsed else {}
 
     indent = re.match(r"^(\s*)", original).group(1)
 
@@ -1393,31 +1382,40 @@ def patch_exec_invocation(
             raw = parsed.raw_args.get(key)
             if raw is not None and str(prior) == str(value):
                 return _requote(raw)
+        if _is_shell_var_ref(str(value)):
+            return f'"{value}"'
         return shlex.quote(str(value))
+
+    model = model_path if model_path is not None else (parsed.model_path if parsed else None)
+    model_token = None
+    if model is not None:
+        if parsed and parsed.raw_model_path and parsed.model_path == model:
+            model_token = _requote(parsed.raw_model_path)
+        else:
+            model_token = shlex.quote(str(model))
 
     parts: List[str] = []
     if is_vllm:
         # The model is positional and belongs on the `serve` line, matching how
         # these scripts are written by hand.
-        model = model_path if model_path is not None else (parsed.model_path if parsed else None)
-        model_token = ""
-        if model is not None:
-            if parsed and parsed.raw_model_path and parsed.model_path == model:
-                model_token = " " + _requote(parsed.raw_model_path)
-            else:
-                model_token = " " + shlex.quote(str(model))
-        prefix = f'{"exec " if is_exec else ""}{binary_token} serve{model_token}'
+        prefix = f'{"exec " if is_exec else ""}{binary_token} serve{" " + model_token if model_token else ""}'
     else:
         prefix = f'{"exec " if is_exec else ""}{binary_token}'
-        model = model_path if model_path is not None else (parsed.model_path if parsed else None)
-        if model:
-            parts.append(f"-m {shlex.quote(str(model))}")
 
-    for key, value in args.items():
-        if key in ("-m", "--model"):
+    # Script order first (llama.cpp's --model sits at its own position), then
+    # anything new in the order given.
+    order = [k for k in raw_keys if k in args or (k == "--model" and not is_vllm)]
+    if not is_vllm and "--model" not in order:
+        order.insert(0, "--model")
+    order += [k for k in args if k not in order and k not in ("-m", "--model")]
+    for key in order:
+        spelled = raw_keys.get(key, key)
+        if key == "--model":
+            if model_token:
+                parts.append(f"{raw_keys.get('--model', '-m')} {model_token}")
             continue
-        token = _value_token(key, value)
-        parts.append(key if token is None else f"{key} {token}")
+        token = _value_token(key, args[key])
+        parts.append(spelled if token is None else f"{spelled} {token}")
 
     if not parts:
         rendered = [f"{indent}{prefix}"]

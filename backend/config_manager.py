@@ -33,9 +33,11 @@ from launch_script import (
     render_skeleton_script,
     render_vllm_skeleton_script,
     patch_meta_fence,
-    patch_launch_args_fence,
     patch_cuda_visible_devices,
     patch_display_name_var,
+    patch_env_assignment,
+    patch_exec_invocation,
+    extract_assignments,
     DEFAULT_HEALTH_TIMEOUT,
 )
 
@@ -312,6 +314,13 @@ class ModelConfig:
     @property
     def cuda_visible_devices(self) -> Optional[list]:
         return self.parsed.cuda_visible_devices
+
+    @property
+    def cvd_matches_split(self) -> bool:
+        """The stored CUDA_VISIBLE_DEVICES names as many GPUs as the model splits
+        across (a flexible split runs on any number). False when there is none."""
+        cvd = self.cuda_visible_devices
+        return bool(cvd) and (self.is_flexible_split or self.gpu_count == len(cvd))
 
     @property
     def total_need_gb(self) -> float:
@@ -890,92 +899,85 @@ class ConfigManager:
             logger.error(f"✗ Error rescanning {model_name}: {e}")
             return None
 
-    def save_model_script(
+    def save_script_edits(
         self,
-        model_name: str,
+        source: str,
+        dest: str,
         *,
-        display_name: str,
-        model_path: str,
-        llama_bin: str,
         args: Dict[str, Optional[str]],
-        health_timeout: Optional[int] = None,
-    ) -> ModelConfig:
-        """Update a model's script by patching the launch-args and meta fences in place.
+        display_name=None,
+        health_timeout=None,
+        llama_bin: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Optional[ModelConfig]:
+        """Apply structured edits to `source`'s script and write the result as `dest`.
 
-        Preserves any user content outside the fences. If the script doesn't
-        exist yet, creates one from scratch.
+        The one save path for both engines (dest != source is Save-As). Only the
+        launch line, the meta fence and assignments that actually changed are
+        rewritten; every other line — comments, exports, CUDA_VISIBLE_DEVICES —
+        is kept byte-for-byte, and unchanged arguments keep their spelling.
 
-        `health_timeout`: optional per-model override (seconds). Pass None to
-        omit the line from the meta fence (load uses DEFAULT_HEALTH_TIMEOUT).
-
-        Side effect: for SWA-architecture models, re-parses the GGUF with the
-        saved --ctx-size as the reference context, so the cached
-        `kv_cache_multiplier` is accurate for the just-saved configuration.
-        Non-SWA models also re-parse (cheap and harmless) so any architectural
-        refinements in the parser propagate on save.
+        - `llama_bin`: a new llama-server path. Written to the script's
+          LLAMA_BIN= assignment when the exec line uses it, else to the exec line.
+        - `env`: the full set of preamble assignments the user kept (vLLM);
+          removed ones are deleted, changed ones rewritten.
+        - llama.cpp: the GGUF is re-read against the saved ctx/batch/cache types,
+          so the fence's kv_cache_multiplier matches the new configuration.
         """
-        script_path = self.project_root / "config" / "models" / f"{model_name}.sh"
-        script_path.parent.mkdir(parents=True, exist_ok=True)
+        mc = self.get_model_config(source)
+        parsed = mc.parsed
+        text = mc.script_path.read_text()
 
-        # Pull GGUF metadata for the meta fence (use existing parsed as fallback)
-        existing = self.models.get(model_name)
-        block_count = existing.block_count if existing else None
-        max_context = existing.max_context if existing else None
-        kv_cache_multiplier = existing.kv_cache_multiplier if existing else None
+        binary = None
+        if llama_bin and llama_bin != parsed.llama_bin:
+            if "LLAMA_BIN" in extract_assignments(text):
+                text = patch_env_assignment(text, "LLAMA_BIN", llama_bin)
+            else:
+                binary = llama_bin
+        text = patch_exec_invocation(text, args=args, parsed=parsed, binary=binary)
 
-        # Re-parse GGUF using the about-to-be-saved ctx + batch + cache types so
-        # SWA models get an accurate multiplier AND the compute-buffer overhead
-        # is baked for the user's actual config. Falls back to cached values if
-        # the file is missing or parsing fails.
-        if model_path and Path(model_path).exists():
+        if env:
+            for gone in set(parsed.env_assignments) - set(env):
+                text = patch_env_assignment(text, gone, None)
+            for name, value in env.items():
+                if parsed.env_assignments.get(name) != value:
+                    text = patch_env_assignment(text, name, value)
+
+        meta = {}
+        if mc.engine != "vllm":
+            meta = self._gguf_meta_for(mc, args)
+        text = patch_meta_fence(text, display_name=display_name, health_timeout=health_timeout, **meta)
+        if display_name and "$DISPLAY_NAME" in text:
+            text = patch_display_name_var(text, display_name)
+
+        dest_path = self.get_script_path(dest)
+        is_new = not dest_path.exists()
+        write_script_atomic(dest_path, text)
+        if is_new:
+            dest_path.chmod(0o755)
+        return self.rescan_model(dest)
+
+    def _gguf_meta_for(self, mc: ModelConfig, args: Dict[str, Optional[str]]) -> Dict[str, Any]:
+        """GGUF meta-fence fields re-read for the settings about to be saved.
+
+        SWA models' kv_cache_multiplier depends on the context and the compute
+        buffer on batch/cache types, so both are baked for the saved values.
+        Falls back to the cached figures if the file is missing or unreadable.
+        """
+        meta = {
+            "block_count": mc.block_count,
+            "max_context": mc.max_context,
+            "kv_cache_multiplier": mc.kv_cache_multiplier,
+        }
+        if mc.model_path and Path(mc.model_path).exists():
             try:
-                fresh = parse_gguf_metadata(model_path, **_gguf_reference(args))
-                if fresh.block_count is not None:
-                    block_count = fresh.block_count
-                if fresh.max_context is not None:
-                    max_context = fresh.max_context
-                if fresh.kv_cache_multiplier is not None:
-                    kv_cache_multiplier = fresh.kv_cache_multiplier
+                fresh = parse_gguf_metadata(mc.model_path, **_gguf_reference(args))
+                for key in meta:
+                    if getattr(fresh, key) is not None:
+                        meta[key] = getattr(fresh, key)
             except Exception as e:
-                logger.warning(f"⚠ GGUF re-parse on save failed for {model_name}: {e}")
-
-        if script_path.exists():
-            text = script_path.read_text()
-            text = patch_meta_fence(
-                text,
-                display_name=display_name,
-                block_count=block_count,
-                max_context=max_context,
-                kv_cache_multiplier=kv_cache_multiplier,
-                health_timeout=health_timeout,
-            )
-            text = patch_launch_args_fence(
-                text,
-                llama_bin=llama_bin,
-                model_path=model_path,
-                args=args,
-            )
-            # Keep DISPLAY_NAME= in sync if the script's -a references it
-            # (patch_launch_args_fence rewrites the body wholesale, so this
-            # runs after it, every save - matches the render_script guard).
-            if display_name and "$DISPLAY_NAME" in text:
-                text = patch_display_name_var(text, display_name)
-        else:
-            from launch_script import render_script
-            text = render_script(
-                display_name=display_name,
-                block_count=block_count,
-                max_context=max_context,
-                kv_cache_multiplier=kv_cache_multiplier,
-                llama_bin=llama_bin,
-                model_path=model_path,
-                args=args,
-                health_timeout=health_timeout,
-            )
-
-        write_script_atomic(script_path, text)
-        script_path.chmod(0o755)
-        return self.rescan_model(model_name)
+                logger.warning(f"⚠ GGUF re-parse on save failed for {mc.name}: {e}")
+        return meta
 
     def save_cuda_visible_devices(self, model_name: str, ids: Optional[list]) -> Optional[ModelConfig]:
         """Update the script's CUDA_VISIBLE_DEVICES line, no-op if unchanged.

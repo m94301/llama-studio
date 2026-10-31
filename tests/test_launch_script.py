@@ -14,7 +14,6 @@ from launch_script import (  # noqa: E402
     render_script,
     render_skeleton_script,
     patch_meta_fence,
-    patch_launch_args_fence,
     patch_cuda_visible_devices,
     META_BEGIN,
     META_END,
@@ -312,64 +311,6 @@ def test_patch_meta_fence_updates_in_place():
     assert ps.kv_cache_multiplier == 30
     # Launch args fence untouched
     assert ps.port == 8100
-
-
-def test_patch_args_fence_updates_in_place():
-    text = render_script(
-        display_name="X",
-        block_count=64,
-        max_context=4096,
-        kv_cache_multiplier=128,
-        llama_bin="/bin/llama-server",
-        model_path="/m.gguf",
-        args={"--port": "8100"},
-    )
-    new = patch_launch_args_fence(
-        text,
-        llama_bin="/bin/llama-server",
-        model_path="/other.gguf",
-        args={"--port": "9000", "--ctx-size": "8192"},
-    )
-    ps = parse_script(new)
-    assert ps.model_path == "/other.gguf"
-    assert ps.port == 9000
-    assert ps.args["--ctx-size"] == "8192"
-    # Meta fence untouched
-    assert ps.display_name == "X"
-    assert ps.block_count == 64
-
-
-def test_patch_overwrites_body_below_meta_fence():
-    """New contract: form-saves rewrite everything below the meta fence wholesale.
-
-    User content (custom env exports, sourced files) between meta and the exec
-    line is intentionally clobbered — preserved decision when dropping the
-    launch-args fence markers. The meta fence itself must survive untouched.
-    """
-    text = render_script(
-        display_name="X",
-        block_count=42,
-        max_context=None,
-        kv_cache_multiplier=None,
-        llama_bin="/bin/llama-server",
-        model_path="/m.gguf",
-        args={"--port": "8100"},
-    )
-    new = patch_launch_args_fence(
-        text,
-        llama_bin="/bin/llama-server",
-        model_path="/m.gguf",
-        args={"--port": "9999"},
-    )
-    # Meta fence preserved
-    ps = parse_script(new)
-    assert ps.display_name == "X"
-    assert ps.block_count == 42
-    # New port reflected in the rewritten invocation
-    assert ps.port == 9999
-    # No legacy fence markers in output
-    assert ARGS_BEGIN not in new
-    assert ARGS_END not in new
 
 
 # ---------- migration round-trip: legacy JSON shapes ----------

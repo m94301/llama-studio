@@ -954,16 +954,12 @@ async def save_llama_config(
             name_error = _validate_new_script_name(model_name)
             if name_error:
                 return name_error
-        # This save rewrites the script body, which would destroy a vLLM
-        # script's env-var preamble; vLLM saves go through /api/save-vllm-config.
+        # Each engine's form posts to its own endpoint (the field sets differ).
         try:
             if config_manager.get_model_config(src).engine == "vllm":
-                return _error_modal(
-                    "vLLM models are saved by the vLLM config editor — "
-                    "this save would overwrite the script's env-var preamble."
-                )
+                return _error_modal("vLLM models are saved by the vLLM config editor.")
         except FileNotFoundError:
-            pass
+            return _error_modal(f"Model not found: {src}")
 
         # Parse core fields
         try:
@@ -1056,30 +1052,14 @@ async def save_llama_config(
                 return _error_modal(
                     f"--tensor-split weights must all be positive: got {ts_raw!r}"
                 )
-            new_split_count = len(weights)
-
-        # A flexible-split model (--split-mode layer/row, no --tensor-split) can
-        # keep a CVD of any length, so its prior GPU assignment survives a save.
-        sm_raw = launch_args.get("--split-mode")
-        new_is_flexible_split = (
-            new_split_count == 1
-            and sm_raw is not None
-            and str(sm_raw).strip().lower() in ("layer", "row")
-        )
-
-        # Get the source config to preserve model_path and (if still valid) CVD.
-        # For a normal save src == model_name; for Save-As it's the original.
-        existing_config = config_manager.get_model_config(src)
-        prior_cvd = existing_config.cuda_visible_devices  # captured before save_model_script clobbers it
 
         try:
-            model_config = config_manager.save_model_script(
-                model_name,
-                display_name=display_name or existing_config.display_name,
-                model_path=existing_config.model_path,
-                llama_bin=llama_bin,
+            model_config = config_manager.save_script_edits(
+                src, model_name,
                 args=launch_args,
+                display_name=display_name or config_manager.get_model_config(src).display_name,
                 health_timeout=health_timeout,
+                llama_bin=llama_bin,
             )
         except Exception as e:
             logger.error(f"✗ Failed to save script: {e}", exc_info=True)
@@ -1088,18 +1068,15 @@ async def save_llama_config(
         if not model_config:
             return _error_modal(f"Model {model_name} not found after save")
 
-        # Re-apply prior CVD if it survives validation against the new --tensor-split count.
-        # save_model_script wipes everything below the meta fence, so we must explicitly
-        # restore CVD that's still consistent with the saved split. Mismatched CVDs are
-        # silently dropped (the picker will surface re-pick at next load).
-        if prior_cvd is not None:
-            if new_is_flexible_split or len(prior_cvd) == new_split_count:
-                model_config = config_manager.save_cuda_visible_devices(model_name, prior_cvd)
-            else:
-                logger.info(
-                    f"⚠ Dropping stale CUDA_VISIBLE_DEVICES for {model_name}: "
-                    f"had {len(prior_cvd)} GPU(s), tensor-split now declares {new_split_count}"
-                )
+        # A GPU assignment that no longer fits the saved split is dropped; the
+        # picker asks again at the next load.
+        if model_config.cuda_visible_devices and not model_config.cvd_matches_split:
+            logger.info(
+                f"⚠ Dropping stale CUDA_VISIBLE_DEVICES for {model_name}: "
+                f"{len(model_config.cuda_visible_devices)} GPU(s) no longer match a "
+                f"{model_config.gpu_count}-GPU split"
+            )
+            model_config = config_manager.save_cuda_visible_devices(model_name, None)
 
         logger.info(f"✓ Script saved for {model_name}")
         # Save-As and normal save both end on the confirmation popup.
@@ -1171,10 +1148,8 @@ def _stored_cvd_usability(model_config: ModelConfig, gpu_data: dict) -> tuple:
     slot is OK and the CVD count matches the model's split count.
     """
     cvd = model_config.cuda_visible_devices or []
-    # The CVD must name as many GPUs as the model splits across; a flexible
-    # split runs on any number. A mismatch (or no CVD) makes the caller force
-    # the picker.
-    if not cvd or not (model_config.is_flexible_split or model_config.gpu_count == len(cvd)):
+    # A count mismatch (or no CVD) makes the caller force the picker.
+    if not model_config.cvd_matches_split:
         return [], False
     needs = model_config.need_per_gpu(
         [gpu_data[gid]["memory"] if gid in gpu_data else 0.0 for gid in cvd]
@@ -1607,7 +1582,6 @@ async def save_vllm_config(
     (unsaved) form edits are applied to the SOURCE script's preamble and written
     to a brand-new <model_name>.sh, leaving the source untouched.
     """
-    from launch_script import patch_env_assignment, patch_exec_invocation
 
     src = source_model.strip() or model_name
     is_save_as = bool(source_model.strip() and source_model.strip() != model_name)
@@ -1678,34 +1652,19 @@ async def save_vllm_config(
                 f"Filling a card risks an allocation failure that can require a reboot."
             )
 
+    # Environment assignments carry launch config with no CLI flag.
     try:
-        # Read the SOURCE preamble; for a normal save src == model_name so this
-        # is the script's own text. For Save-As it's the original being forked.
-        text = config_manager.get_script_path(src).read_text()
-        dest_path = config_manager.get_script_path(model_name)
-        text = patch_exec_invocation(text, args=args, parsed=mc.parsed)
-        # Environment assignments carry launch config with no CLI flag; drop
-        # any the user removed, then set the rest.
-        try:
-            env = json.loads(env_json) or {}
-        except json.JSONDecodeError:
-            env = {}
-        if env:
-            for gone in set(mc.parsed.env_assignments) - set(env):
-                text = patch_env_assignment(text, gone, None)
-            for name, value in env.items():
-                if mc.parsed.env_assignments.get(name) != value:
-                    text = patch_env_assignment(text, name, value)
-        text = patch_meta_fence(
-            text,
+        env = json.loads(env_json) or {}
+    except json.JSONDecodeError:
+        env = {}
+    try:
+        updated = config_manager.save_script_edits(
+            src, model_name,
+            args=args,
             display_name=display_name.strip() or None,
             health_timeout=ht,
+            env=env,
         )
-        from config_manager import write_script_atomic
-        write_script_atomic(dest_path, text)
-        if is_save_as:
-            dest_path.chmod(0o755)
-        updated = config_manager.rescan_model(model_name)
     except Exception as e:
         logger.error(f"✗ vLLM save failed for {model_name}: {e}", exc_info=True)
         return _error_modal(f"Failed to save: {e}")

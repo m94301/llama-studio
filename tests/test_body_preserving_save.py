@@ -1,9 +1,9 @@
-"""Tests for patch_exec_invocation — body-preserving structured saves (doc 21 §2.2).
+"""Tests for patch_exec_invocation and ConfigManager.save_script_edits — the
+body-preserving structured save both engines use (doc 21 §2.2).
 
-The existing patch_launch_args_fence replaces everything below the meta fence,
-which is why vLLM models were raw-editor-only in Phase 1: their scripts are
-mostly preamble (env vars, tuning comments, variable defaults). This rewrites
-the exec line and nothing else.
+Scripts are mostly hand-written context (env vars, tuning comments, variable
+defaults); a save rewrites the exec line, the meta fence and changed
+assignments, and nothing else.
 """
 
 import sys
@@ -203,3 +203,108 @@ class TestLlamacppShape:
         assert again.model_path == "/models/x.gguf"
         assert again.args["--ctx-size"] == "8192"
         assert again.port == 8100
+
+
+# ---------- ConfigManager.save_script_edits: the one save path ----------
+
+import asyncio  # noqa: E402
+import difflib  # noqa: E402
+import json  # noqa: E402
+
+from config_manager import ConfigManager  # noqa: E402
+
+NOTES_SCRIPT = f"""#!/usr/bin/env bash
+{META_BEGIN}
+# display_name: Muse Glimmer
+# engine: llamacpp
+{META_END}
+# Notes: dense 30B, SWA. A/B by commenting out the --spec-* lines below.
+# VRAM budget on one 64GB card: ~36GB loaded.
+LLAMA_BIN=/opt/llama/bin/llama-server
+DISPLAY_NAME='Muse Glimmer'
+export CUDA_VISIBLE_DEVICES=0
+
+exec "$LLAMA_BIN" \\
+  -m {{model}} \\
+  -a "$DISPLAY_NAME" \\
+  --spec-draft-n-max 15 \\
+  --host 0.0.0.0 \\
+  --port 8135 \\
+  --ctx-size 131072 \\
+  -ngl 999
+"""
+
+
+@pytest.fixture
+def studio(tmp_path):
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    model = weights / "muse.gguf"
+    model.write_bytes(b"not really a gguf")
+    (tmp_path / "config" / "models").mkdir(parents=True)
+    (tmp_path / "config" / "app.json").write_text(json.dumps({
+        "models_directory": str(weights),
+        "llama_server_binary": "/opt/llama/bin/llama-server",
+    }))
+    script = tmp_path / "config" / "models" / "muse.sh"
+    script.write_text(NOTES_SCRIPT.format(model=model))
+    cm = ConfigManager(tmp_path / "config" / "app.json", project_root=tmp_path)
+    asyncio.run(cm.load_app_config())
+    asyncio.run(cm.load_all_models())
+    return cm, script
+
+
+def _changed_lines(before: str, after: str) -> list:
+    return [l for l in difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="", n=0)
+            if l[:1] in "+-" and l[:3] not in ("+++", "---")]
+
+
+class TestStructuredSave:
+    def _save(self, cm, dest="muse", **edits):
+        mc = cm.get_model_config("muse")
+        args = {**mc.parsed.args, **edits.pop("args", {})}
+        return cm.save_script_edits("muse", dest, args=args,
+                                    display_name=edits.pop("display_name", mc.display_name), **edits)
+
+    def test_no_change_save_is_byte_identical(self, studio):
+        cm, script = studio
+        before = script.read_text()
+        self._save(cm)
+        assert script.read_text() == before
+
+    def test_an_edit_changes_only_its_own_line(self, studio):
+        cm, script = studio
+        before = script.read_text()
+        self._save(cm, args={"--ctx-size": "65536"})
+        assert _changed_lines(before, script.read_text()) == [
+            "-  --ctx-size 131072 \\", "+  --ctx-size 65536 \\"]
+
+    def test_new_option_is_appended_and_spellings_kept(self, studio):
+        cm, script = studio
+        self._save(cm, args={"--no-mmap": None})
+        text = script.read_text()
+        assert text.rstrip().endswith("-ngl 999 \\\n  --no-mmap")
+        assert '-a "$DISPLAY_NAME"' in text
+
+    def test_new_binary_goes_to_the_llama_bin_assignment(self, studio):
+        cm, script = studio
+        before = script.read_text()
+        self._save(cm, llama_bin="/opt/llama-new/bin/llama-server")
+        assert _changed_lines(before, script.read_text()) == [
+            "-LLAMA_BIN=/opt/llama/bin/llama-server", "+LLAMA_BIN=/opt/llama-new/bin/llama-server"]
+
+    def test_display_name_updates_fence_and_variable(self, studio):
+        cm, script = studio
+        self._save(cm, display_name="Muse v2")
+        text = script.read_text()
+        assert "# display_name: Muse v2" in text and "DISPLAY_NAME='Muse v2'" in text
+        assert "# Notes: dense 30B" in text
+
+    def test_save_as_keeps_the_source_notes_and_leaves_source_alone(self, studio):
+        cm, script = studio
+        before = script.read_text()
+        self._save(cm, dest="muse-fork", args={"--port": "8136"})
+        fork = script.with_name("muse-fork.sh").read_text()
+        assert script.read_text() == before
+        assert "# Notes: dense 30B" in fork and "--port 8136" in fork
+        assert cm.get_model_config("muse-fork").port == 8136
