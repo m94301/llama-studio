@@ -584,22 +584,10 @@ class GpuManager:
                 f"Port {model_config.port} is already in use. Cannot load {model_name}."
             )
 
-        # Compute per-GPU VRAM need. vLLM claims util × capacity on every
-        # visible GPU regardless of model size (doc 21 decision 3); llama.cpp
-        # honors tensor-split weights / even-splits flexible models.
-        if model_config.engine == "vllm":
-            if self.gpus:
-                per_gpu_need = [model_config.needed_on_gpu(self.gpus[gid].memory) for gid in gpu_ids]
-            else:
-                per_gpu_need = [model_config.size_gb or 0] * len(gpu_ids)
-        else:
-            per_gpu_need = model_config.per_gpu_vram(count=len(gpu_ids)) or [model_config.total_vram or model_config.size_gb or 0]
-        if len(per_gpu_need) != len(gpu_ids):
-            # Defensive: pad/trim to match (shouldn't normally happen since gpu_count is the source)
-            if len(gpu_ids) == 1:
-                per_gpu_need = [sum(per_gpu_need)]
-            else:
-                per_gpu_need = [(model_config.total_vram or model_config.size_gb or 0) / len(gpu_ids)] * len(gpu_ids)
+        # Per-GPU VRAM need (the count was validated above, so it lines up with gpu_ids).
+        per_gpu_need = model_config.need_per_gpu(
+            [self.gpus[gid].memory if gid in self.gpus else 0.0 for gid in gpu_ids]
+        )
 
         # Check each chosen GPU has enough free VRAM for its share
         if self.gpus:

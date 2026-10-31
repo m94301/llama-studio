@@ -14,7 +14,7 @@ import shutil
 import stat
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 from gguf_metadata_parser import parse_gguf_metadata
@@ -308,37 +308,35 @@ class ModelConfig:
     def cuda_visible_devices(self) -> Optional[list]:
         return self.parsed.cuda_visible_devices
 
-    def per_gpu_vram(self, count: Optional[int] = None) -> Optional[list]:
-        """Return per-GPU VRAM share (in GB) as a list.
+    @property
+    def total_need_gb(self) -> float:
+        """llama.cpp VRAM need in total: weights + KV when known, else the file size."""
+        return self.total_vram or self.size_gb or 0.0
 
-        Returns None if total_vram is unknown. Behavior by model type:
-        - tensor-split: total_vram * weight_i / sum(weights), one per weight.
-        - flexible split (--split-mode layer/row): total_vram divided evenly
-          across `count` GPUs (falls back to the stored CVD length, else 1).
-        - single-GPU: [total_vram].
+    def need_per_gpu(self, gpu_caps: List[float]) -> List[float]:
+        """VRAM (GB) this model needs on each GPU it would run on.
 
-        `count` overrides the GPU count for the even-split cases (used by the
-        picker / load path where the user has chosen how many GPUs to use).
+        `gpu_caps` are those GPUs' capacities in visible order; its length is the
+        number of GPUs. The one rule used by the pickers, the stored-CVD check
+        and the load path:
+        - vLLM: needed_on_gpu(capacity) for each GPU.
+        - llama.cpp with --tensor-split: the total split by its weights (one entry
+          per weight; callers check that against the GPU count).
+        - otherwise: the total divided evenly across the GPUs.
         """
-        if self.total_vram is None:
-            return None
+        if self.engine == "vllm":
+            return [self.needed_on_gpu(cap) for cap in gpu_caps]
+        total = self.total_need_gb
         weights = self.tensor_split_weights
         if weights is not None and len(weights) > 1:
-            total_weight = sum(weights)
-            if total_weight <= 0:
-                return [self.total_vram / len(weights)] * len(weights)
-            return [round(self.total_vram * w / total_weight, 2) for w in weights]
-        # Even-split path (flexible split or plain single-GPU).
-        n = count
-        if n is None:
-            if self.is_flexible_split and self.cuda_visible_devices:
-                n = len(self.cuda_visible_devices)
-            else:
-                n = 1
-        n = max(1, n)
+            weight_sum = sum(weights)
+            if weight_sum <= 0:
+                return [total / len(weights)] * len(weights)
+            return [round(total * w / weight_sum, 2) for w in weights]
+        n = max(1, len(gpu_caps))
         if n == 1:
-            return [self.total_vram]
-        return [round(self.total_vram / n, 2)] * n
+            return [total]
+        return [round(total / n, 2)] * n
 
 
 class AppConfig(BaseModel):

@@ -78,8 +78,8 @@ def _model_record(mc, main) -> dict:
         "is_flexible_split": mc.is_flexible_split,
         "cuda_visible_devices": mc.cuda_visible_devices,
         "effective_health_timeout": mc.effective_health_timeout(),
-        "per_gpu_vram": mc.per_gpu_vram(),
-        "per_gpu_vram_by_count": {n: mc.per_gpu_vram(count=n) for n in (1, 2, 3, 4)},
+        "need_per_gpu": {f"{n}x{cap:g}": mc.need_per_gpu([cap] * n)
+                         for n in (1, 2, 3, 4) for cap in (24.0, 96.0)},
         "needed_on_gpu": {cap: mc.needed_on_gpu(cap) for cap in (24.0, 96.0)},
         "cvd_usability": {
             label: main._stored_cvd_usability(mc, gpus) for label, gpus in GPU_SETS.items()

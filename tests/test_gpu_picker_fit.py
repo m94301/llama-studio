@@ -35,11 +35,7 @@ def _render(mc: ModelConfig, gpu_free_gb: float, gpu_total_gb: float = 64.0) -> 
             "memory_pct": (gpu_total_gb - gpu_free_gb) / gpu_total_gb * 100,
         }
     }
-    if mc.engine == "vllm":
-        need_by_gpu = {g: mc.needed_on_gpu(i["memory"]) for g, i in gpu_data.items()}
-    else:
-        flat = mc.total_vram or mc.size_gb or 0
-        need_by_gpu = {g: flat for g in gpu_data}
+    need_by_gpu = {g: mc.need_per_gpu([i["memory"]])[0] for g, i in gpu_data.items()}
     return jinja_env.get_template("modals/gpu_selector.html").render(
         model_name="m", model_config=mc, display_name="M",
         gpu_data=gpu_data, need_by_gpu=need_by_gpu,
@@ -100,3 +96,31 @@ class TestLlamacppNeedUnchanged:
         mc = _model(LLAMACPP, size_gb=12.0, total_vram=None)
         html = _render(mc, gpu_free_gb=40.0)
         assert "12.0 GB needed" in html
+
+
+def _llama(extra_args: str = "", **kw) -> ModelConfig:
+    return _model(LLAMACPP.replace("--port 8100", "--port 8100 " + extra_args), **kw)
+
+
+class TestNeedPerGpu:
+    """ModelConfig.need_per_gpu is the one rule for pickers, CVD check and load."""
+
+    def test_vllm_need_follows_each_gpu_capacity(self):
+        mc = _model(VLLM, size_gb=0.92)
+        assert mc.need_per_gpu([64.0, 24.0]) == pytest.approx([57.6, 21.6])
+
+    def test_single_gpu_needs_the_whole_total(self):
+        assert _llama(size_gb=12.0, total_vram=20.0).need_per_gpu([64.0]) == [20.0]
+
+    def test_tensor_split_follows_the_weights(self):
+        mc = _llama("--tensor-split 3,1", size_gb=12.0, total_vram=20.0)
+        assert mc.need_per_gpu([64.0, 64.0]) == [15.0, 5.0]
+
+    def test_tensor_split_with_unknown_total_splits_the_file_size(self):
+        mc = _llama("--tensor-split 1,1", size_gb=12.0, total_vram=None)
+        assert mc.need_per_gpu([64.0, 64.0]) == [6.0, 6.0]
+
+    def test_flexible_split_divides_evenly_over_the_chosen_gpus(self):
+        mc = _llama("--split-mode layer", size_gb=12.0, total_vram=30.0)
+        assert mc.need_per_gpu([64.0, 64.0, 64.0]) == [10.0, 10.0, 10.0]
+        assert mc.need_per_gpu([64.0]) == [30.0]

@@ -335,8 +335,7 @@ async def model_list():
     rows = []
     for model_name, model_config in sorted_models:
         port_display = f":{model_config.port}" if model_config.port else "—"
-        # Calculated memory need if known, else the file size.
-        vram = model_config.total_vram or model_config.size_gb
+        vram = model_config.total_need_gb
         vram_display = f"{vram} GB" if vram else "—"
         rows.append((model_name, gpu_manager.get_model_state(model_name).value, model_config,
                      port_display, vram_display, str(config_manager.get_log_path(model_name))))
@@ -1254,27 +1253,16 @@ def _stored_cvd_usability(model_config: ModelConfig, gpu_data: dict) -> tuple:
     slot is OK and the CVD count matches the model's split count.
     """
     cvd = model_config.cuda_visible_devices or []
-    if model_config.engine == "vllm":
-        # vLLM claims util × capacity on each visible GPU; need depends on the
-        # target GPU, not the model (doc 21 decision 3). Count must match tp×pp.
-        if model_config.gpu_count != len(cvd) or not cvd:
-            return [], False
-        needs = [
-            model_config.needed_on_gpu(gpu_data[gid]["memory"]) if gid in gpu_data else 0.0
-            for gid in cvd
-        ]
-    elif model_config.is_flexible_split:
-        # Flexible split: any CVD of length >= 1 is valid; the share is the total
-        # divided evenly across however many GPUs the CVD names.
-        fallback = model_config.total_vram or model_config.size_gb or 0
-        needs = model_config.per_gpu_vram(count=len(cvd)) or [fallback / max(1, len(cvd))] * max(1, len(cvd))
-        if len(cvd) < 1 or len(needs) != len(cvd):
-            return [], False
-    else:
-        needs = model_config.per_gpu_vram() or [model_config.total_vram or model_config.size_gb or 0]
-        if model_config.gpu_count != len(cvd) or len(needs) != len(cvd):
-            # Count mismatch (or no CVD): caller treats this as "force picker"
-            return [], False
+    # The CVD must name as many GPUs as the model splits across; a flexible
+    # split runs on any number. A mismatch (or no CVD) makes the caller force
+    # the picker.
+    if not cvd or not (model_config.is_flexible_split or model_config.gpu_count == len(cvd)):
+        return [], False
+    needs = model_config.need_per_gpu(
+        [gpu_data[gid]["memory"] if gid in gpu_data else 0.0 for gid in cvd]
+    )
+    if len(needs) != len(cvd):
+        return [], False
 
     slots = []
     all_ok = True
@@ -1350,7 +1338,7 @@ async def gpu_selector(model: str, force_pick: int = 0):
         # The user picks any set of GPUs (>=1); the model splits evenly across
         # them. Per-GPU need is computed live in the template as total / count.
         if model_config.is_flexible_split:
-            total_need = model_config.total_vram or model_config.size_gb or 0
+            total_need = model_config.total_need_gb
             template = jinja_env.get_template("modals/gpu_flex_picker.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -1362,15 +1350,10 @@ async def gpu_selector(model: str, force_pick: int = 0):
 
         # Multi-pick path: tensor-split present, no usable CVD (or forced)
         if gpu_count > 1:
-            if model_config.engine == "vllm":
-                # Need is util × capacity of whichever GPU gets picked; show the
-                # largest-capacity figure so the display is conservative.
-                max_mem = max((g["memory"] for g in gpu_data.values()), default=0)
-                per_gpu_need = [model_config.needed_on_gpu(max_mem)] * gpu_count
-            else:
-                per_gpu_need = model_config.per_gpu_vram() or [
-                    (model_config.total_vram or model_config.size_gb or 0) / gpu_count
-                ] * gpu_count
+            # The GPUs aren't picked yet; size against the largest card, so a
+            # vLLM figure (which scales with capacity) errs high.
+            max_mem = max((g["memory"] for g in gpu_data.values()), default=0)
+            per_gpu_need = model_config.need_per_gpu([max_mem] * gpu_count)
             template = jinja_env.get_template("modals/gpu_multi_picker.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -1380,17 +1363,11 @@ async def gpu_selector(model: str, force_pick: int = 0):
                 gpu_data=gpu_data,
             ))
 
-        # Single-GPU picker. Per-GPU need is computed here rather than in the
-        # template so the engine-specific rules live in one place: vLLM claims
-        # util × that GPU's capacity, llama.cpp needs weights + KV.
-        if model_config.engine == "vllm":
-            need_by_gpu = {
-                gid: model_config.needed_on_gpu(info["memory"])
-                for gid, info in gpu_data.items()
-            }
-        else:
-            flat_need = model_config.total_vram or model_config.size_gb or 0
-            need_by_gpu = {gid: flat_need for gid in gpu_data}
+        # Single-GPU picker: the need on each candidate GPU on its own.
+        need_by_gpu = {
+            gid: model_config.need_per_gpu([info["memory"]])[0]
+            for gid, info in gpu_data.items()
+        }
 
         template = jinja_env.get_template("modals/gpu_selector.html")
         return HTMLResponse(template.render(
