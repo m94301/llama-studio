@@ -616,17 +616,6 @@ function validateAndHighlightFields(advanced) {
 // VRAM Calculator
 // ============================================================================
 
-window.KV_BYTES = {
-    'f16': 2.0,
-    'q8_0': 1.0,
-    'q6_k': 0.75,
-    'q5_k': 0.625,
-    'q5_0': 0.625,
-    'q4_k': 0.5,
-    'q4_0': 0.5,
-    'q3_k': 0.375
-};
-
 // Always overwrite — stale values from a previously-opened modal cause cross-model
 // VRAM miscalcs (the new modal's slider/dropdowns are fresh, but block_count etc.
 // would silently inherit from the prior model).

@@ -25,7 +25,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from config_manager import ConfigManager, ModelConfig, calculate_kv_cache_gb
+from config_manager import ConfigManager, ModelConfig
+from kv_calc import llama_kv_gb
 from engine_flags import get_vllm_manifest
 from launch_script import (
     get_vllm_manifest as get_vllm_manifest_runtime,
@@ -1657,7 +1658,7 @@ async def calculate_vram(
 ):
     """Calculate total VRAM needed for a model."""
     try:
-        kv_cache_gb = calculate_kv_cache_gb(block_count, ctx_size, kv_cache_multiplier, cache_type_k, cache_type_v)
+        kv_cache_gb = llama_kv_gb(block_count, ctx_size, kv_cache_multiplier, cache_type_k, cache_type_v)
         return {
             "total": round(size_gb + kv_cache_gb, 2),
             "weights": round(size_gb, 2),

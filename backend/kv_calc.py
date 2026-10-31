@@ -1,4 +1,4 @@
-"""KV-cache sizing for vLLM models (doc 21 §2.4).
+"""KV-cache sizing for both engines (vLLM: doc 21 §2.4).
 
 Both engines allocate a KV pool of N tokens shared across conversations, so the
 maximum simultaneous conversations at length L is N / L. The user states L
@@ -51,6 +51,35 @@ CONTEXT_GRANULARITY = 256
 # hold one full request. The math helpers below default to 1.0 (no padding) so
 # they stay honest; call sites that size a real budget apply this.
 DEFAULT_KV_HEADROOM = 1.2
+
+# llama.cpp --cache-type-k / --cache-type-v: bytes per element.
+LLAMA_CACHE_TYPE_BYTES = {
+    "f16": 2.0,
+    "q8_0": 1.0,
+    "q6_k": 0.75,
+    "q5_k": 0.625,
+    "q5_0": 0.625,
+    "q4_k": 0.5,
+    "q4_0": 0.5,
+    "q3_k": 0.375,
+}
+
+
+def llama_cache_type_bytes(cache_type: Optional[str]) -> float:
+    """Bytes per element for a llama.cpp cache type; unset or unknown counts as f16."""
+    return LLAMA_CACHE_TYPE_BYTES.get(str(cache_type or "f16"), 2.0)
+
+
+def llama_kv_gb(block_count: int, ctx_size: int, kv_cache_multiplier: int,
+                cache_type_k: Optional[str] = "f16", cache_type_v: Optional[str] = "f16") -> float:
+    """llama.cpp KV cache in GiB.
+
+    `kv_cache_multiplier` comes from the GGUF (gguf_metadata_parser): per-layer
+    KV elements per token, with SWA and compute-buffer effects folded in.
+    """
+    k = llama_cache_type_bytes(cache_type_k)
+    v = llama_cache_type_bytes(cache_type_v)
+    return block_count * ctx_size * kv_cache_multiplier * (k + v) / GIB
 
 
 def max_context_from_config(model_dir: str) -> Optional[int]:

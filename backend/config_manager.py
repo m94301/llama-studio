@@ -18,6 +18,15 @@ from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 from gguf_metadata_parser import parse_gguf_metadata
+from kv_calc import (
+    DEFAULT_OVERHEAD_GB,
+    GIB,
+    calibrate_from_log,
+    heaviest_rank_weights_from_log,
+    llama_cache_type_bytes,
+    llama_kv_gb,
+    max_context_from_config,
+)
 from launch_script import (
     ParsedScript,
     parse_script,
@@ -33,16 +42,26 @@ from launch_script import (
 logger = logging.getLogger(__name__)
 
 
-KV_BYTES: Dict[str, float] = {
-    "f16": 2.0,
-    "q8_0": 1.0,
-    "q6_k": 0.75,
-    "q5_k": 0.625,
-    "q5_0": 0.625,
-    "q4_k": 0.5,
-    "q4_0": 0.5,
-    "q3_k": 0.375,
-}
+def _int_arg(args: Dict[str, Any], key: str) -> Optional[int]:
+    """An integer launch arg, or None when absent, empty or not a number."""
+    value = args.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _gguf_reference(args: Dict[str, Any], fallback_ctx: Optional[int] = None) -> Dict[str, Any]:
+    """parse_gguf_metadata kwargs: the context, batch and cache types the GGUF's
+    kv_cache_multiplier is baked against (the script's own settings)."""
+    return dict(
+        reference_ctx=_int_arg(args, "--ctx-size") or fallback_ctx,
+        reference_batch_size=_int_arg(args, "--batch-size"),
+        reference_k_bytes=llama_cache_type_bytes(args.get("--cache-type-k")),
+        reference_v_bytes=llama_cache_type_bytes(args.get("--cache-type-v")),
+    )
 
 
 # llama.cpp splits large models into shards named `<base>-00001-of-00004.gguf`.
@@ -130,19 +149,6 @@ def parse_split_gguf(path: Path):
     return m.group("base"), int(m.group("idx")), int(m.group("total"))
 
 
-def calculate_kv_cache_gb(
-    block_count: int,
-    ctx_size: int,
-    kv_cache_multiplier: int,
-    cache_type_k: str = "f16",
-    cache_type_v: str = "f16",
-) -> float:
-    """Compute KV cache size in GiB."""
-    k = KV_BYTES.get(cache_type_k, 2.0)
-    v = KV_BYTES.get(cache_type_v, 2.0)
-    return block_count * ctx_size * kv_cache_multiplier * (k + v) / (1024 ** 3)
-
-
 def _sanitize_html_id(name: str) -> str:
     """Convert a model name to a safe HTML ID."""
     safe = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
@@ -213,7 +219,6 @@ class ModelConfig:
         budget = self.kv_cache_memory_bytes
         if budget is None:
             return round(gate, 2)
-        from kv_calc import DEFAULT_OVERHEAD_GB, GIB
         per_gpu = max(1, self.gpu_count)
         # Measured figures win where a real load has provided them: ranks are not
         # equal, and the heaviest one decides whether a placement fits.
@@ -620,31 +625,9 @@ class ConfigManager:
             and Path(parsed.model_path).exists()
             and any(getattr(parsed, f) is None for f in ("block_count", "max_context", "kv_cache_multiplier"))
         )
-        # Determine the ctx + batch + cache types the multiplier should be baked
-        # against, for both backfill and the forced-recompute path. Falls back to
-        # max_context when no ctx is set.
-        script_ctx = parsed.args.get("--ctx-size")
-        try:
-            script_ctx_int = int(script_ctx) if script_ctx else None
-        except (ValueError, TypeError):
-            script_ctx_int = None
-        reference_ctx = script_ctx_int or parsed.max_context
-        script_batch = parsed.args.get("--batch-size")
-        try:
-            script_batch_int = int(script_batch) if script_batch else None
-        except (ValueError, TypeError):
-            script_batch_int = None
-        ctk = parsed.args.get("--cache-type-k") or "f16"
-        ctv = parsed.args.get("--cache-type-v") or "f16"
-        k_bytes = KV_BYTES.get(str(ctk), 2.0)
-        v_bytes = KV_BYTES.get(str(ctv), 2.0)
-
-        _gguf_kwargs = dict(
-            reference_ctx=reference_ctx,
-            reference_batch_size=script_batch_int,
-            reference_k_bytes=k_bytes,
-            reference_v_bytes=v_bytes,
-        )
+        # The settings the multiplier is baked against, for both backfill and
+        # the forced-recompute path; ctx falls back to max_context when unset.
+        _gguf_kwargs = _gguf_reference(parsed.args, fallback_ctx=parsed.max_context)
 
         if needs_backfill:
             try:
@@ -679,7 +662,7 @@ class ConfigManager:
                     parsed = parse_script(new_text)
                     logger.info(
                         f"   Refreshed multiplier for {script_path.stem}: "
-                        f"{parsed.kv_cache_multiplier} (ref_ctx={reference_ctx})"
+                        f"{parsed.kv_cache_multiplier} (ref_ctx={_gguf_kwargs['reference_ctx']})"
                     )
             except Exception as e:
                 logger.warning(f"⚠ Could not refresh multiplier for {script_path.stem}: {e}")
@@ -694,7 +677,14 @@ class ConfigManager:
         # Compute size and total VRAM
         if mc.model_path and Path(mc.model_path).exists():
             mc.size_gb = self._get_gguf_size_gb(Path(mc.model_path))
-            mc.total_vram = self._calculate_total_vram(mc)
+            args = mc.launch_args
+            if mc.size_gb and mc.block_count and mc.kv_cache_multiplier and args:
+                ctx = _int_arg(args, "--ctx-size")
+                kv = llama_kv_gb(
+                    mc.block_count, 4096 if ctx is None else ctx, mc.kv_cache_multiplier,
+                    args.get("--cache-type-k"), args.get("--cache-type-v"),
+                )
+                mc.total_vram = round(mc.size_gb + kv, 2)
 
         # Configured check
         ok, reason = parsed.is_configured()
@@ -710,7 +700,6 @@ class ConfigManager:
         overhead on that rank, derived from the measured peak minus weights and
         the KV budget we asked for.
         """
-        from kv_calc import GIB, heaviest_rank_weights_from_log
 
         mc = self.models.get(model_name)
         if mc is None or mc.engine != "vllm":
@@ -757,7 +746,6 @@ class ConfigManager:
         shape isn't the standard one. Cached in the meta fence (a measurement,
         not a setting) and only written when it actually changes.
         """
-        from kv_calc import calibrate_from_log
 
         mc = self.models.get(model_name)
         if mc is None or mc.engine != "vllm":
@@ -806,7 +794,6 @@ class ConfigManager:
         # max_context does for llama.cpp. Read live rather than cached: it is a
         # property of the model directory, not something the user configures.
         if parsed.model_path and Path(parsed.model_path).is_dir():
-            from kv_calc import max_context_from_config
             mc.vllm_max_context = max_context_from_config(parsed.model_path)
         ok, reason = parsed.is_configured()
         mc.is_configured = ok
@@ -944,29 +931,9 @@ class ConfigManager:
         # SWA models get an accurate multiplier AND the compute-buffer overhead
         # is baked for the user's actual config. Falls back to cached values if
         # the file is missing or parsing fails.
-        new_ctx = args.get("--ctx-size")
-        try:
-            new_ctx_int = int(new_ctx) if new_ctx not in (None, "") else None
-        except (ValueError, TypeError):
-            new_ctx_int = None
-        new_batch = args.get("--batch-size")
-        try:
-            new_batch_int = int(new_batch) if new_batch not in (None, "") else None
-        except (ValueError, TypeError):
-            new_batch_int = None
-        ctk = args.get("--cache-type-k") or "f16"
-        ctv = args.get("--cache-type-v") or "f16"
-        k_bytes = KV_BYTES.get(str(ctk), 2.0)
-        v_bytes = KV_BYTES.get(str(ctv), 2.0)
         if model_path and Path(model_path).exists():
             try:
-                fresh = parse_gguf_metadata(
-                    model_path,
-                    reference_ctx=new_ctx_int,
-                    reference_batch_size=new_batch_int,
-                    reference_k_bytes=k_bytes,
-                    reference_v_bytes=v_bytes,
-                )
+                fresh = parse_gguf_metadata(model_path, **_gguf_reference(args))
                 if fresh.block_count is not None:
                     block_count = fresh.block_count
                 if fresh.max_context is not None:
@@ -1258,25 +1225,6 @@ class ConfigManager:
         except Exception as e:
             logger.warning(f"⚠ Could not get size for {gguf_path}: {e}")
             return 0.0
-
-    def _calculate_total_vram(self, mc: ModelConfig) -> Optional[float]:
-        if not mc.size_gb or not mc.block_count or not mc.kv_cache_multiplier:
-            return None
-        args = mc.launch_args
-        if not args:
-            return None
-        ctx_size = args.get("--ctx-size") or 4096
-        cache_type_k = args.get("--cache-type-k") or "f16"
-        cache_type_v = args.get("--cache-type-v") or "f16"
-        try:
-            ctx_size = int(ctx_size)
-        except (ValueError, TypeError):
-            ctx_size = 4096
-        kv = calculate_kv_cache_gb(
-            mc.block_count, ctx_size, mc.kv_cache_multiplier,
-            str(cache_type_k), str(cache_type_v),
-        )
-        return round(mc.size_gb + kv, 2)
 
     # GGUF stems that are never a servable model on their own: multimodal
     # projectors and MTP/speculative drafter weights, which exist only to be

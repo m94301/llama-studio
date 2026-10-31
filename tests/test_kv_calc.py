@@ -15,6 +15,7 @@ from kv_calc import (  # noqa: E402
     bytes_per_token_from_config,
     calibrate_from_log,
     context_for_vram,
+    llama_kv_gb,
     pool_tokens,
     vram_gb_for,
 )
@@ -350,3 +351,16 @@ class TestHeadroomFloor:
         from kv_calc import headroom_ok
         assert headroom_ok(22.0, 24.0)[0]        # 2.0 free on a 24 GB card
         assert not headroom_ok(23.0, 24.0)[0]    # 1.0 free
+
+
+class TestLlamaKv:
+    def test_f16_kv(self):
+        # 48 layers × 32768 ctx × 1024 elements × (2 + 2) bytes = 6 GiB
+        assert llama_kv_gb(48, 32768, 1024) == pytest.approx(6.0)
+
+    def test_quantized_cache_types_shrink_it(self):
+        assert llama_kv_gb(48, 32768, 1024, "q8_0", "q8_0") == pytest.approx(3.0)
+        assert llama_kv_gb(48, 32768, 1024, "q8_0", "f16") == pytest.approx(4.5)
+
+    def test_unset_or_unknown_cache_type_counts_as_f16(self):
+        assert llama_kv_gb(48, 32768, 1024, None, "bogus") == pytest.approx(6.0)
