@@ -69,3 +69,4 @@ config/models/*.sh.off
 
 # Local behavior snapshot (holds local paths)
 tests/.snapshot/
+CLAUDE.local.md
