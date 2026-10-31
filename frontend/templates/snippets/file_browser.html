@@ -1,0 +1,37 @@
+<!-- frontend/templates/snippets/file_browser.html
+     Directory picker, swapped into #file-browser-content. The page supplies
+     selectPath() and closeFileBrowser(). -->
+<div class="flex justify-between items-center mb-4">
+    <h2 class="text-xl font-bold">Select Directory</h2>
+    <button type="button" onclick="closeFileBrowser()"
+            class="text-gray-400 hover:text-white text-2xl">&times;</button>
+</div>
+
+<div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
+    <p class="text-xs text-gray-500 mb-1">Current Path:</p>
+    <p class="text-sm text-gray-300 font-mono">{{ current_path }}</p>
+</div>
+
+<div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
+    {% for label, path in entries %}
+    <button hx-get="/api/file-browser?{{ {'path_type': path_type, 'current_path': path}|urlencode }}"
+            hx-target="#file-browser-content"
+            hx-swap="innerHTML"
+            class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors {{ 'text-blue-400' if label == '../' else 'text-gray-300' }}">
+        📁 {{ label }}
+    </button>
+    {% else %}
+    <div class="p-4 text-gray-500">No subdirectories</div>
+    {% endfor %}
+</div>
+
+<div class="flex gap-3">
+    <button type="button" onclick="closeFileBrowser()"
+            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+        Cancel
+    </button>
+    <button type="button" onclick='selectPath({{ current_path|tojson }})'
+            class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
+        Select
+    </button>
+</div>

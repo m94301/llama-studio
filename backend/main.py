@@ -268,6 +268,15 @@ else:
     logger.warning(f"⚠ Static files directory not found: {static_dir}")
 
 
+def _render(template: str, **ctx) -> str:
+    return jinja_env.get_template(template).render(**ctx)
+
+
+def _error_fragment(message: str, status_code: int = 500) -> HTMLResponse:
+    """Inline error shown in place of a fragment that failed to render."""
+    return HTMLResponse(_render("snippets/error.html", message=message), status_code=status_code)
+
+
 # ============================================================================
 # API Routes - GPU Panel
 # ============================================================================
@@ -279,31 +288,14 @@ async def gpu_panel():
     gpu_data = gpu_manager.get_gpu_status()
 
     if not gpu_data:
-        return """
-        <div class="text-center py-8 text-gray-400">
-            <p>GPU detection not available</p>
-        </div>
-        """
+        return _render("snippets/empty_state.html", message="GPU detection not available")
 
-    # Machine's local IPv4 address (resolved once, then cached).
-    server_ipv4 = get_server_ipv4()
-
-    html = '<div class="gpu-table">'
-
-    # Render each GPU row with loaded models
-    row_template = jinja_env.get_template("snippets/gpu_row.html")
-    for gpu_id, gpu_info in sorted(gpu_data.items()):
-        memory_pct = (gpu_info["allocated"] / gpu_info["memory"]) * 100 if gpu_info["memory"] > 0 else 0
-
-        html += row_template.render(
-            gpu_id=gpu_id,
-            gpu=gpu_info,
-            memory_pct=memory_pct,
-            server_host=server_ipv4,
-        )
-
-    html += '</div>'
-    return html
+    rows = [
+        (gpu_id, info, (info["allocated"] / info["memory"]) * 100 if info["memory"] > 0 else 0)
+        for gpu_id, info in sorted(gpu_data.items())
+    ]
+    # Machine's local IPv4 (resolved once, then cached) for per-model server links.
+    return _render("snippets/gpu_panel.html", rows=rows, server_host=get_server_ipv4())
 
 
 # ============================================================================
@@ -320,16 +312,13 @@ async def model_list():
     # Check if llama-server is configured
     llama_binary = config_manager.app_config.llama_server_binary
     if not Path(llama_binary).exists():
-        return f"""
-        <div class="text-center py-8 text-yellow-400">
-            <p>⚠ Llama-server binary not configured</p>
-            <p class="text-sm text-gray-400 mt-2">Configure path in settings to load models</p>
-        </div>
-        """
+        return _render("snippets/empty_state.html", warn=True,
+                       message="⚠ Llama-server binary not configured",
+                       hint="Configure path in settings to load models")
 
     if not models:
         logger.warning("⚠ No models in config_manager")
-        return '<div class="text-center py-8 text-gray-400"><p>No models found</p></div>'
+        return _render("snippets/empty_state.html", message="No models found")
 
     # Sort: configured first, then unconfigured; within each group alphabetical
     # by the *display name* the table actually shows, case-insensitively (so
@@ -340,41 +329,20 @@ async def model_list():
                        (x[1].display_name or x[0]).lower())
     )
 
-    html = '<div class="models-table">'
-
+    rows = []
+    for model_name, model_config in sorted_models:
+        port_display = f":{model_config.port}" if model_config.port else "—"
+        # Calculated memory need if known, else the file size.
+        vram = model_config.total_vram or model_config.size_gb
+        vram_display = f"{vram} GB" if vram else "—"
+        rows.append((model_name, gpu_manager.get_model_state(model_name).value, model_config,
+                     port_display, vram_display, str(config_manager.get_log_path(model_name))))
     try:
-        # Render each model row using the model_row template
-        row_template = jinja_env.get_template("snippets/model_row.html")
-        for model_name, model_config in sorted_models:
-            state = gpu_manager.get_model_state(model_name)
-            status = state.value
-
-            port_display = f":{model_config.port}" if model_config.port else "—"
-
-            # Display total_vram (calculated memory needed) if available, otherwise show file size as fallback
-            if model_config.total_vram:
-                vram_display = f"{model_config.total_vram} GB"
-            elif model_config.size_gb:
-                vram_display = f"{model_config.size_gb} GB"
-            else:
-                vram_display = "—"
-
-            log_path = config_manager.get_log_path(model_name)
-
-            html += row_template.render(
-                model_name=model_name,
-                status=status,
-                model_config=model_config,
-                port_display=port_display,
-                vram_display=vram_display,
-                log_path=str(log_path),
-            )
+        html = _render("snippets/model_list.html", rows=rows)
     except Exception as e:
         logger.error(f"✗ Error rendering model rows: {type(e).__name__}: {e}", exc_info=True)
-        return f'<div class="text-red-500 p-4">Error: {str(e)}</div>'
-
-    html += '</div>'
-    logger.info(f"✓ Generated model list HTML: {len(html)} chars, {len(sorted_models)} models")
+        return _error_fragment(f"Error: {e}", 200)
+    logger.info(f"✓ Generated model list HTML: {len(html)} chars, {len(rows)} models")
     return html
 
 
@@ -387,7 +355,7 @@ async def model_list():
 async def get_model_status_inner(model: str):
     """Return status badge + action button HTML for inner polling."""
     if model not in config_manager.get_all_models():
-        return HTMLResponse('<div class="text-red-400 p-4">Model not found</div>', status_code=404)
+        return _error_fragment("Model not found", 404)
 
     state = gpu_manager.get_model_state(model)
     status = state.value
@@ -544,10 +512,8 @@ async def rescan_progress():
     current = RESCAN_STATE.get("current") or "…"
     done = RESCAN_STATE.get("done", 0)
     total = RESCAN_STATE.get("total", 0)
-    return HTMLResponse(
-        f'<span class="text-blue-300">⏳ Rescanning ({done}/{total}): '
-        f'<code class="text-blue-200">{current}</code></span>'
-    )
+    return HTMLResponse(_render("snippets/status_line.html", tone="info",
+                                text=f"⏳ Rescanning ({done}/{total}): ", code=current))
 
 
 @app.post("/api/rescan-models", response_class=HTMLResponse)
@@ -576,14 +542,14 @@ async def rescan_models():
         gpu_manager.sync_models_from_config()
         count = len(config_manager.get_all_models())
         return HTMLResponse(
-            content=f'<span class="text-green-400">✓ Rescanned: {count} model(s) found</span>',
+            content=_render("snippets/status_line.html", tone="ok", text=f"✓ Rescanned: {count} model(s) found"),
             status_code=200,
             headers={"HX-Trigger": "modelsRescanned"},
         )
     except Exception as e:
         logger.error(f"✗ Error rescanning models: {e}")
         return HTMLResponse(
-            content=f'<span class="text-red-400">✗ Error: {str(e)}</span>',
+            content=_render("snippets/status_line.html", tone="error", text=f"✗ Error: {e}"),
             status_code=500,
         )
     finally:
@@ -677,15 +643,12 @@ async def auto_load_banner():
     """
     if not AUTO_LOAD_PROGRESS.get("active"):
         return HTMLResponse("")
-    cur = AUTO_LOAD_PROGRESS.get("current_index", 0)
-    tot = AUTO_LOAD_PROGRESS.get("total", 0)
-    name = AUTO_LOAD_CURRENT_NAME or "…"
-    return HTMLResponse(
-        f'<div class="bg-red-900 border border-red-600 text-red-100 px-4 py-2 text-sm flex items-center gap-3">'
-        f'<span class="animate-pulse">⏳</span>'
-        f'<span><b>Auto-loading stored models</b> ({cur}/{tot}): <code class="text-red-200">{name}</code></span>'
-        f'</div>'
-    )
+    return HTMLResponse(_render(
+        "snippets/auto_load_banner.html",
+        current=AUTO_LOAD_PROGRESS.get("current_index", 0),
+        total=AUTO_LOAD_PROGRESS.get("total", 0),
+        name=AUTO_LOAD_CURRENT_NAME or "…",
+    ))
 
 
 # ============================================================================
@@ -720,18 +683,7 @@ def _render_store_button() -> str:
     state = _startup_state()
     if state["matches"]:
         return ""
-    tooltip_lines = state["stored"] if state["stored"] else ["(nothing stored)"]
-    tooltip = "Stored for startup:\n" + "\n".join(f"• {n}" for n in tooltip_lines)
-    return (
-        f'<button id="store-config-btn" '
-        f'hx-post="/api/store-startup-config" '
-        f'hx-target="#store-config-btn-wrap" hx-swap="innerHTML" '
-        f'title="{tooltip}" '
-        f'class="px-3 py-1 rounded border text-white text-xs font-bold transition-colors '
-        f'bg-green-700 hover:bg-green-600 border-green-500">'
-        f'Store this state to autoload [{state["loaded_count"]} Loaded]'
-        f'</button>'
-    )
+    return _render("snippets/store_button.html", **state)
 
 
 @app.get("/api/startup-config-status", response_class=JSONResponse)
@@ -763,7 +715,7 @@ async def store_startup_config():
     except Exception as e:
         logger.error(f"✗ Error storing startup config: {e}", exc_info=True)
         return HTMLResponse(
-            f'<span class="text-red-400 text-xs">✗ Save failed: {e}</span>',
+            _render("snippets/status_line.html", tone="error", small=True, text=f"✗ Save failed: {e}"),
             status_code=500,
         )
 
@@ -1052,7 +1004,7 @@ async def config_modal(model: str):
         return HTMLResponse(html)
     except Exception as e:
         logger.error(f"✗ Error in config_modal: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/save-llama-config", response_class=HTMLResponse)
@@ -1239,22 +1191,13 @@ async def save_llama_config(
 
 
 def _save_success_modal(model_config: ModelConfig, invalid_keys=None) -> str:
-    """Helper to generate the save-success modal HTML.
+    """Save-confirmation modal.
 
-    If the model is currently loaded (or loading), surface a warning that the
-    running process is still using the prior args, and offer to unload now or
-    keep the prior load running until the user is ready to relaunch.
+    If the model is currently loaded (or loading), it warns that the running
+    process still uses the prior args and offers to unload now or keep it.
     """
     invalid_keys = invalid_keys or []
-    is_configured = model_config.is_configured
-
-    # Detect "currently in use" state: a session exists or model is RUNNING/LOADING.
-    is_loaded = (
-        model_config.name in gpu_manager.sessions
-        or gpu_manager.get_model_state(model_config.name) in (ModelState.RUNNING, ModelState.LOADING)
-    )
-
-    if is_configured:
+    if model_config.is_configured:
         status_text = "✓ Model is now configured!"
     elif invalid_keys:
         status_text = f"⚠ Configuration saved but model is unconfigured (invalid options: {', '.join(invalid_keys)})"
@@ -1262,91 +1205,21 @@ def _save_success_modal(model_config: ModelConfig, invalid_keys=None) -> str:
         status_text = f"⚠ Configuration saved — {model_config.config_error}"
     else:
         status_text = "⚠ Configuration saved but model is still unconfigured"
-    status_color = "green" if is_configured else "yellow"
-
-    # Mode-specific block: loaded-model warning + actions, OR plain OK button
-    if is_loaded:
-        body_html = f"""
-            <div class="mt-2 mb-4 p-3 rounded border border-yellow-600 bg-yellow-900 bg-opacity-25">
-                <p class="text-sm text-yellow-300 font-bold mb-1">⚠ This model is currently loaded.</p>
-                <p class="text-xs text-gray-300">
-                    The running process is still using the previous launch args. Unload now to apply
-                    the new configuration on next load, or keep the prior load running.
-                </p>
-            </div>
-            <div class="flex gap-2">
-                <button onclick="document.getElementById('modal').remove(); refreshModelList();"
-                        class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                    Keep prior load
-                </button>
-                <button hx-get="/api/unload-confirm?model={model_config.name}"
-                        hx-target="#modal-container" hx-swap="innerHTML"
-                        class="flex-1 px-4 py-2 rounded bg-yellow-600 hover:bg-yellow-500 text-white font-bold transition-colors">
-                    Unload now
-                </button>
-            </div>
-        """
-    else:
-        body_html = f"""
-            <button onclick="closeModalAndRefresh();"
-                    class="w-full px-4 py-2 rounded bg-{status_color}-600 hover:bg-{status_color}-500 text-white font-bold transition-colors">
-                OK
-            </button>
-        """
-
-    return f"""
-    <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-         id="modal"
-         onclick="if(event.target.id === 'modal') closeModalAndRefresh();">
-        <div class="bg-gray-800 border border-{status_color}-600 rounded-lg p-6 w-full max-w-md"
-             onclick="event.stopPropagation()">
-            <div class="flex items-center space-x-3 mb-4">
-                <span class="text-2xl">{'✓' if is_configured else '⚠'}</span>
-                <h2 class="text-lg font-bold text-{status_color}-400">Configuration Saved</h2>
-            </div>
-            <p class="text-sm text-gray-400 mb-1">{model_config.display_name}</p>
-            <p class="text-sm text-gray-300 mb-4">{status_text}</p>
-            {body_html}
-        </div>
-    </div>
-    <script>
-    function refreshModelList() {{
-        setTimeout(() => {{
-            htmx.ajax('GET', '/api/model-list', {{ target: '#models-container', swap: 'innerHTML' }});
-        }}, 100);
-    }}
-    function closeModalAndRefresh() {{
-        document.getElementById('modal').remove();
-        refreshModelList();
-    }}
-    refreshModelList();
-    </script>
-    """
+    return _render(
+        "modals/save_success.html",
+        model_name=model_config.name,
+        display_name=model_config.display_name,
+        is_configured=model_config.is_configured,
+        status_text=status_text,
+        is_loaded=(
+            model_config.name in gpu_manager.sessions
+            or gpu_manager.get_model_state(model_config.name) in (ModelState.RUNNING, ModelState.LOADING)
+        ),
+    )
 
 
 def _error_modal(message: str) -> str:
-    """Helper to generate error modal HTML."""
-    return f"""
-    <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-         id="modal"
-         onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-        <div class="bg-gray-800 border border-red-600 rounded-lg p-6 w-full max-w-md"
-             onclick="event.stopPropagation()">
-            <div class="flex justify-between items-center mb-4">
-                <h2 class="text-lg font-bold text-red-400">Configuration Error</h2>
-                <button onclick="document.getElementById('modal').remove();"
-                        class="text-gray-400 hover:text-white text-2xl">
-                    ×
-                </button>
-            </div>
-            <p class="text-sm text-gray-300 mb-4">{message}</p>
-            <button onclick="document.getElementById('modal').remove();"
-                    class="w-full px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                Close
-            </button>
-        </div>
-    </div>
-    """
+    return _render("modals/message.html", tone="error", title="Configuration Error", message=message)
 
 
 # --- Save As helpers (shared by both structured-save endpoints) -------------
@@ -1439,11 +1312,11 @@ async def gpu_selector(model: str, force_pick: int = 0):
     try:
         model_config = config_manager.get_model_config(model)
         if not model_config.is_configured:
-            return HTMLResponse('<div class="text-red-500 p-4">Model not configured</div>')
+            return _error_fragment("Model not configured", 200)
 
         gpu_data = gpu_manager.get_gpu_status()
         if not gpu_data:
-            return HTMLResponse('<div class="text-red-500 p-4">No GPUs detected</div>')
+            return _error_fragment("No GPUs detected", 200)
 
         for gid, info in gpu_data.items():
             info["memory_pct"] = (info["allocated"] / info["memory"]) * 100 if info["memory"] > 0 else 0
@@ -1527,10 +1400,10 @@ async def gpu_selector(model: str, force_pick: int = 0):
         ))
     except FileNotFoundError as e:
         logger.error(f"✗ Model {model} not found: {e}")
-        return HTMLResponse('<div class="text-red-500 p-4">Model not found</div>', status_code=404)
+        return _error_fragment("Model not found", 404)
     except Exception as e:
         logger.error(f"✗ Error in gpu_selector: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/trigger-load", response_class=HTMLResponse)
@@ -1571,7 +1444,7 @@ document.getElementById("modal")?.remove();
 </script>'''
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.get("/api/unload-confirm", response_class=HTMLResponse)
@@ -1586,7 +1459,7 @@ async def unload_confirm(model: str):
         ))
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/trigger-unload", response_class=HTMLResponse)
@@ -1612,7 +1485,7 @@ document.getElementById("modal")?.remove();
 </script>'''
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.get("/api/cancel-confirm", response_class=HTMLResponse)
@@ -1627,7 +1500,7 @@ async def cancel_confirm(model: str):
         ))
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/trigger-cancel", response_class=HTMLResponse)
@@ -1652,7 +1525,7 @@ document.getElementById("modal")?.remove();
 </script>'''
     except Exception as e:
         logger.error(f"✗ Error cancelling {model_name}: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/clear-error", response_class=HTMLResponse)
@@ -1688,7 +1561,7 @@ async def clear_error(model_name: str = Form(...)):
         return html
     except Exception as e:
         logger.error(f"✗ Error clearing error: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.get("/api/delete-script-confirm", response_class=HTMLResponse)
@@ -1697,7 +1570,7 @@ async def delete_script_confirm(model: str):
     try:
         model_config = config_manager.get_model_config(model)
     except FileNotFoundError:
-        return HTMLResponse('<div class="text-red-500 p-4">Model not found</div>', status_code=404)
+        return _error_fragment("Model not found", 404)
     state = gpu_manager.get_model_state(model)
     running = state in (ModelState.RUNNING, ModelState.LOADING)
     siblings = config_manager.sibling_script_count(model)
@@ -2086,81 +1959,24 @@ async def file_browser(path_type: str, current_path: str = "/"):
         if current_path_obj.is_file():
             current_path_obj = current_path_obj.parent
         
-        # Get parent directory
-        parent_path = current_path_obj.parent if current_path_obj != current_path_obj.parent else current_path_obj
-        
-        # List directories
-        directories = []
+        # Parent link first (unless at /), then visible subdirectories.
+        entries = []
+        if current_path_obj != current_path_obj.parent:
+            entries.append(("../", str(current_path_obj.parent)))
         try:
-            items = sorted(current_path_obj.iterdir())
-            for item in items:
-                if item.is_dir() and not item.name.startswith('.'):
-                    directories.append(item)
+            entries += [
+                (f"{item.name}/", str(item))
+                for item in sorted(current_path_obj.iterdir())
+                if item.is_dir() and not item.name.startswith(".")
+            ]
         except PermissionError:
             logger.warning(f"⚠ Permission denied accessing {current_path_obj}")
-        
-        # Build directory list HTML
-        dir_html = ""
 
-        # Parent directory link
-        if current_path_obj != current_path_obj.parent:
-            dir_html += f"""
-            <button hx-get="/api/file-browser?path_type={path_type}&current_path={parent_path}"
-                    hx-target="#file-browser-content"
-                    hx-swap="innerHTML"
-                    class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors text-blue-400">
-                📁 ../
-            </button>
-            """
-
-        # Subdirectories
-        for directory in directories:
-            dir_html += f"""
-            <button hx-get="/api/file-browser?path_type={path_type}&current_path={directory}"
-                    hx-target="#file-browser-content"
-                    hx-swap="innerHTML"
-                    class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors text-gray-300">
-                📁 {directory.name}/
-            </button>
-            """
-        
-        # Build action buttons based on modal type
-        html = f"""
-        <div class="flex justify-between items-center mb-4">
-            <h2 class="text-xl font-bold">Select Directory</h2>
-            <button type="button"
-                    onclick="closeFileBrowser()"
-                    class="text-gray-400 hover:text-white text-2xl">
-                ×
-            </button>
-        </div>
-
-        <div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
-            <p class="text-xs text-gray-500 mb-1">Current Path:</p>
-            <p class="text-sm text-gray-300 font-mono">{current_path_obj}</p>
-        </div>
-
-        <div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
-            {dir_html if dir_html else '<div class="p-4 text-gray-500">No subdirectories</div>'}
-        </div>
-
-        <div class="flex gap-3">
-            <button type="button"
-                    onclick="closeFileBrowser()"
-                    class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                Cancel
-            </button>
-            <button type="button"
-                    onclick="selectPath('{current_path_obj}')"
-                    class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                Select
-            </button>
-        </div>
-        """
-        return html
+        return _render("snippets/file_browser.html", path_type=path_type,
+                       current_path=str(current_path_obj), entries=entries)
     except Exception as e:
         logger.error(f"✗ Error in file_browser: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/update-config-path", response_class=HTMLResponse)
@@ -2226,58 +2042,16 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
         else:
             raise ValueError(f"Unknown path type: {path_type}")
 
-        # Save updated config
-        config_file = PROJECT_ROOT / "config" / "app.json"
-        config_data = config_manager.app_config.model_dump()
-        with open(config_file, "w") as f:
-            json.dump(config_data, f, indent=2)
-
+        await config_manager.save_app_config()
         logger.info(f"✓ Config updated and saved: {path_type} = {new_path}")
-
-        # Return success message and refresh config section
-        html = f"""
-        <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-             id="modal"
-             onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-            <div class="bg-gray-800 border border-green-600 rounded-lg p-6 w-full max-w-md"
-                 onclick="event.stopPropagation()">
-                <div class="flex items-center space-x-3 mb-4">
-                    <span class="text-2xl">✓</span>
-                    <h2 class="text-lg font-bold text-green-400">Path Updated</h2>
-                </div>
-                <p class="text-sm text-gray-300 mb-4">
-                    <span class="font-bold text-gray-200">{path_type}:</span><br>
-                    <span class="font-mono text-xs text-gray-400">{new_path}</span>
-                </p>
-                <button onclick="document.getElementById('modal').remove();"
-                        class="w-full px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                    OK
-                </button>
-            </div>
-        </div>
-        """
-        return html
+        return _render("modals/message.html", tone="success", title="✓ Path Updated",
+                       label=path_type, detail=new_path)
     except Exception as e:
         logger.error(f"✗ Error in update_config_path: {type(e).__name__}: {e}", exc_info=True)
         # The status stays 200 so htmx still swaps this into the modal; the
         # data-config-error marker is what callers test to detect failure.
-        error_html = f"""
-        <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-             id="modal"
-             data-config-error="1"
-             onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-            <div class="bg-gray-800 border border-red-600 rounded-lg p-6 w-full max-w-md"
-                 onclick="event.stopPropagation()">
-                <h2 class="text-lg font-bold text-red-400 mb-4">Error Updating Path</h2>
-                <p class="text-sm text-gray-300 mb-4">{str(e)}</p>
-                <button onclick="document.getElementById('modal').remove();"
-                        class="w-full px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                    Close
-                </button>
-            </div>
-        </div>
-        """
-        return error_html
+        return _render("modals/message.html", tone="error", title="Error Updating Path",
+                       message=str(e), marker="config-error")
 
 
 @app.post("/api/update-webui-port", response_class=JSONResponse)
@@ -2291,12 +2065,7 @@ async def update_webui_port(port: int = Form(...)):
         # Update app config
         config_manager.app_config.webui_port = port
 
-        # Save updated config
-        config_file = PROJECT_ROOT / "config" / "app.json"
-        config_data = config_manager.app_config.model_dump()
-        with open(config_file, "w") as f:
-            json.dump(config_data, f, indent=2)
-
+        await config_manager.save_app_config()
         logger.info(f"✓ WebUI port updated to {port} and saved")
         return {
             "success": True,

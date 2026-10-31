@@ -1,0 +1,7 @@
+<button id="store-config-btn"
+        hx-post="/api/store-startup-config"
+        hx-target="#store-config-btn-wrap" hx-swap="innerHTML"
+        title="Stored for startup:{% for n in stored or ['(nothing stored)'] %}&#10;• {{ n }}{% endfor %}"
+        class="px-3 py-1 rounded border text-white text-xs font-bold transition-colors bg-green-700 hover:bg-green-600 border-green-500">
+    Store this state to autoload [{{ loaded_count }} Loaded]
+</button>

@@ -1,0 +1,21 @@
+<!-- frontend/templates/modals/message.html
+     One-message result modal. tone: "error" (red, Close) or "success" (green, OK).
+     Optional label/detail render a labelled monospace value under the message. -->
+{% extends "base_modal.html" %}
+{% set color = "green" if tone == "success" else "red" %}
+{% set title_class = "text-" ~ color ~ "-400" %}
+{% set border_color = color ~ "-600" %}
+
+{% block content %}
+{% if message %}<p class="text-sm text-gray-300 mb-4">{{ message }}</p>{% endif %}
+{% if detail %}
+<p class="text-sm text-gray-300 mb-4">
+    <span class="font-bold text-gray-200">{{ label }}:</span><br>
+    <span class="font-mono text-xs text-gray-400">{{ detail }}</span>
+</p>
+{% endif %}
+<button onclick="document.getElementById('modal').remove();"
+        class="w-full px-4 py-2 rounded {{ 'bg-green-600 hover:bg-green-500' if tone == 'success' else 'bg-gray-700 hover:bg-gray-600' }} text-white font-bold transition-colors">
+    {{ "OK" if tone == "success" else "Close" }}
+</button>
+{% endblock %}
