@@ -32,6 +32,8 @@ from launch_script import (
     parse_pasted_script,
     patch_meta_fence,
     set_vllm_manifest,
+    set_vllm_manifest_resolver,
+    manifest_for_binary,
 )
 import chat_proxy
 import migrate_configs
@@ -121,6 +123,11 @@ async def lifespan(app: FastAPI):
         # Install the vllm flag manifest before scanning too: it decides which
         # `vllm serve` flags take values and how -tp/-pp normalize, so parsing
         # is wrong without it. Cached after first capture, so this is cheap.
+        # Per-engine manifests: scripts that name their own vllm build are parsed
+        # against THAT build's flags (captured + cached on first sight).
+        set_vllm_manifest_resolver(
+            lambda b: get_vllm_manifest(b, PROJECT_ROOT / "config")
+        )
         if config_manager.app_config.vllm_binary:
             manifest = await asyncio.to_thread(
                 get_vllm_manifest,
@@ -902,7 +909,7 @@ async def config_modal_new(model: str):
                 DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, bytes_per_token_from_config,
             )
 
-            manifest = get_vllm_manifest_runtime() or {}
+            manifest = manifest_for_binary(model_config.parsed.llama_bin) or {}
             args = dict(model_config.launch_args)
             core_keys = {"--host", "--port", "--max-model-len", "--max-num-seqs",
                          "--kv-cache-memory-bytes"}

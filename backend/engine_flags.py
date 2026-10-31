@@ -23,10 +23,14 @@ so a flag takes a value iff it is followed by a metavar (uppercase token or a
 {choice,list}), and short aliases share the entry with their long form.
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -146,22 +150,62 @@ def parse_vllm_help(help_text: str) -> Dict[str, dict]:
     return {"flags": flags, "aliases": aliases}
 
 
-def _cache_path(config_dir: Path, version: str) -> Path:
+def _binary_id(binary_path: str) -> str:
+    """Short stable id of the binary's resolved path.
+
+    Version strings alone are not unique: every precompiled-wheel build reports
+    the same placeholder (e.g. '0.0.0+precompiled'), so two different engines
+    would otherwise share (and corrupt) one cached manifest.
+    """
+    try:
+        real = os.path.realpath(binary_path)
+    except Exception:
+        real = str(binary_path)
+    return hashlib.sha1(real.encode()).hexdigest()[:8]
+
+
+def _cache_path(config_dir: Path, version: str, binary_path: Optional[str] = None) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._+-]", "_", version)
-    return config_dir / "vllm" / f"manifest-{safe}.json"
+    suffix = f"-{_binary_id(binary_path)}" if binary_path else ""
+    return config_dir / "vllm" / f"manifest-{safe}{suffix}.json"
+
+
+# Per-process memo so parsing many scripts that share an engine captures it once.
+# Failures are remembered briefly so a broken binary is not re-probed (a 5 min
+# timeout each) for every script, but a fixed binary is picked up without a restart.
+_MANIFEST_MEM: Dict[str, tuple] = {}
+_MANIFEST_LOCK = threading.Lock()
+_FAILURE_RETRY_SECONDS = 60
 
 
 def get_vllm_manifest(binary_path: str, config_dir: Path) -> Optional[dict]:
     """Return this vllm build's flag manifest, capturing + caching on first use.
 
+    Keyed per binary (version + path id), so every engine gets its own flag list.
     Returns None when it cannot be determined — callers must then emit no
     optional flags and fall back to heuristics rather than guessing.
     """
+    try:
+        key = os.path.realpath(binary_path)
+    except Exception:
+        key = str(binary_path)
+    with _MANIFEST_LOCK:
+        hit = _MANIFEST_MEM.get(key)
+        if hit is not None:
+            data, ts = hit
+            if data is not None or time.time() - ts < _FAILURE_RETRY_SECONDS:
+                return data
+        data = _load_or_capture_manifest(binary_path, config_dir)
+        _MANIFEST_MEM[key] = (data, time.time())
+        return data
+
+
+def _load_or_capture_manifest(binary_path: str, config_dir: Path) -> Optional[dict]:
     version = get_vllm_version(binary_path)
     if not version:
         return None
 
-    cache = _cache_path(config_dir, version)
+    cache = _cache_path(config_dir, version, binary_path)
     if cache.exists():
         try:
             data = json.loads(cache.read_text())
@@ -191,7 +235,7 @@ def get_vllm_manifest(binary_path: str, config_dir: Path) -> Optional[dict]:
         logger.warning(f"⚠ Could not capture a flag manifest from {binary_path}")
         return None
 
-    data = {"format": MANIFEST_FORMAT, "version": version, **parsed}
+    data = {"format": MANIFEST_FORMAT, "version": version, "binary": os.path.realpath(binary_path), **parsed}
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(data, indent=1, sort_keys=True))

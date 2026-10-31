@@ -108,6 +108,33 @@ def set_vllm_manifest(manifest: Optional[Dict[str, dict]]) -> None:
 def get_vllm_manifest() -> Optional[Dict[str, dict]]:
     return _VLLM_MANIFEST
 
+
+_VLLM_MANIFEST_RESOLVER = None
+
+
+def set_vllm_manifest_resolver(fn) -> None:
+    """Install fn(binary_path) -> manifest|None.
+
+    Each vLLM script runs the engine named in its own `exec` line, which may be
+    a custom build whose flags differ from the default engine's. With a resolver
+    installed, a script is parsed against that engine's own manifest; the
+    default manifest (set_vllm_manifest) is only the fallback.
+    """
+    global _VLLM_MANIFEST_RESOLVER
+    _VLLM_MANIFEST_RESOLVER = fn
+
+
+def manifest_for_binary(binary: Optional[str]) -> Optional[Dict[str, dict]]:
+    """Flag manifest of the engine at `binary`, else the default engine's."""
+    if binary and _VLLM_MANIFEST_RESOLVER:
+        try:
+            found = _VLLM_MANIFEST_RESOLVER(binary)
+            if found:
+                return found
+        except Exception as e:  # never let manifest capture break parsing
+            logger.warning(f"⚠ vllm manifest lookup failed for {binary}: {e}")
+    return _VLLM_MANIFEST
+
 VALID_ENGINES = ("llamacpp", "vllm")
 
 # Distinguishes "caller didn't mention this field" from "caller passed None to
@@ -795,7 +822,7 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
         ps.has_args_fence = True
         ps.llama_bin = binary
         ps.args, ps.model_path, ps.raw_args, ps.raw_model_path = _vllm_arg_tokens_to_dict(
-            tokens[2:], full_text, ps.warnings
+            tokens[2:], full_text, ps.warnings, manifest_for_binary(binary)
         )
         return
 
@@ -805,7 +832,8 @@ def _populate_from_body(ps: ParsedScript, body: str, full_text: str) -> None:
 
 
 def _vllm_arg_tokens_to_dict(
-    tokens: List[str], full_text: str, warnings: List[str]
+    tokens: List[str], full_text: str, warnings: List[str],
+    manifest: Optional[Dict[str, dict]] = None,
 ) -> Tuple[Dict[str, Optional[str]], Optional[str]]:
     """Walk `vllm serve` arg tokens (after 'serve') into a dict.
 
@@ -816,7 +844,7 @@ def _vllm_arg_tokens_to_dict(
     --served-model-name a b c) accumulate trailing non-flag tokens onto the
     last flag, space-joined. $VAR references are resolved against the body.
     """
-    manifest = _VLLM_MANIFEST or {}
+    manifest = (manifest if manifest is not None else _VLLM_MANIFEST) or {}
     known_flags: Dict[str, dict] = manifest.get("flags", {})
     aliases: Dict[str, str] = manifest.get("aliases", {})
 
