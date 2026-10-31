@@ -456,25 +456,28 @@
                     {{ store_button_html | safe }}
                 </span>
 
-                <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
-                       title="Load stored models when Llama Studio starts">
-                    <input type="checkbox"
-                           id="auto-load-checkbox"
-                           {% if auto_load_on_startup %}checked{% endif %}
-                           onchange="toggleAutoLoadOnStartup(this.checked)"
-                           class="w-3.5 h-3.5 rounded cursor-pointer">
-                    <span>Load on startup</span>
-                </label>
+                <!-- Startup options, stacked so the header stays narrow on phones -->
+                <div class="flex flex-col gap-0.5">
+                    <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
+                           title="Load stored models when Llama Studio starts">
+                        <input type="checkbox"
+                               id="auto-load-checkbox"
+                               {% if auto_load_on_startup %}checked{% endif %}
+                               onchange="toggleAutoLoadOnStartup(this.checked)"
+                               class="w-3.5 h-3.5 rounded cursor-pointer">
+                        <span>Load on startup</span>
+                    </label>
 
-                <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
-                       title="When Llama Studio stops or restarts (Ctrl+C, a code reload), leave loaded model servers running and re-attach to them on the next start. Unload from the table to stop a server.">
-                    <input type="checkbox"
-                           id="keep-alive-checkbox"
-                           {% if keep_sessions_on_shutdown %}checked{% endif %}
-                           onchange="toggleKeepAlive(this.checked)"
-                           class="w-3.5 h-3.5 rounded cursor-pointer">
-                    <span>Keep servers alive on shutdown</span>
-                </label>
+                    <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
+                           title="When Llama Studio stops or restarts (Ctrl+C, a code reload), leave loaded model servers running and re-attach to them on the next start. Unload from the table to stop a server.">
+                        <input type="checkbox"
+                               id="keep-alive-checkbox"
+                               {% if keep_sessions_on_shutdown %}checked{% endif %}
+                               onchange="toggleKeepAlive(this.checked)"
+                               class="w-3.5 h-3.5 rounded cursor-pointer">
+                        <span>Keep servers alive on shutdown</span>
+                    </label>
+                </div>
 
                 <button type="button"
                         onclick="openSettingsModal()"
