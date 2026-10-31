@@ -11,7 +11,7 @@
     <div id="model-status-{{ model_config.html_id }}"
          class="polling-wrapper"
          hx-get="/api/get-model-status-inner?model={{ model_name }}"
-         hx-trigger="load, every 30s"
+         hx-trigger="load, every 30s, studioResync from:body"
          hx-swap="innerHTML"
          hx-on::after-request="
             let row = this.closest('.model-row');

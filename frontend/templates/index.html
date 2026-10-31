@@ -451,7 +451,7 @@
                      refreshed when the WebSocket reports a model state change, 30s fallback. -->
                 <span id="store-config-btn-wrap"
                       hx-get="/api/startup-store-button"
-                      hx-trigger="load, modelStateChanged from:body, every 30s"
+                      hx-trigger="load, modelStateChanged from:body, studioResync from:body, every 30s"
                       hx-swap="innerHTML">
                     {{ store_button_html | safe }}
                 </span>
@@ -497,7 +497,7 @@
             <h2 class="text-lg font-bold text-gray-300 mb-3">GPUs</h2>
             <div id="gpu-panel"
                  hx-get="/api/gpu-panel"
-                 hx-trigger="load, every 30s"
+                 hx-trigger="load, every 30s, studioResync from:body"
                  hx-swap="innerHTML">
             </div>
         </section>
@@ -619,21 +619,38 @@
             }
         });
 
-        // WebSocket real-time updates
+        // WebSocket real-time updates. The page trusts these for every state
+        // change, so the connection must be known-alive: the server answers
+        // pings, a socket silent for STALE_MS is replaced (phones kill them
+        // without telling the page), and every (re)connect or return to the
+        // tab re-fetches the page's state, since events sent while
+        // disconnected are gone.
         (function() {
-            const WS_URL = `ws://${window.location.host}/ws/status`;
+            const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/status`;
+            const PING_MS = 10000, STALE_MS = 20000;
             let ws = null;
             let retryDelay = 1000;
+            let retryTimer = null;
+            let lastMessage = 0;
+
+            function resync() {
+                htmx.trigger(document.body, 'studioResync');
+            }
 
             function connect() {
+                clearTimeout(retryTimer);
+                if (ws) { ws.onclose = ws.onmessage = ws.onerror = null; ws.close(); }
                 ws = new WebSocket(WS_URL);
 
                 ws.onopen = function() {
                     console.log('WS connected');
                     retryDelay = 1000;
+                    lastMessage = Date.now();
+                    resync();
                 };
 
                 ws.onmessage = function(event) {
+                    lastMessage = Date.now();
                     const data = JSON.parse(event.data);
                     if (data.type === 'model_state_change' && data.html_id) {
                         const selector = `#model-status-${data.html_id}`;
@@ -660,21 +677,34 @@
 
                 ws.onclose = function() {
                     console.log(`WS closed, retrying in ${retryDelay}ms`);
-                    setTimeout(connect, retryDelay);
+                    retryTimer = setTimeout(connect, retryDelay);
                     retryDelay = Math.min(retryDelay * 2, 30000);
                 };
 
                 ws.onerror = function() { ws.close(); };
             }
 
+            function alive() {
+                return ws && ws.readyState === WebSocket.OPEN && Date.now() - lastMessage < STALE_MS;
+            }
+
             connect();
 
-            // Keep-alive ping every 25s
             setInterval(function() {
-                if (ws && ws.readyState === WebSocket.OPEN) {
+                if (alive()) {
                     ws.send('ping');
+                } else if (ws && ws.readyState === WebSocket.OPEN) {
+                    console.log('WS silent too long, reconnecting');
+                    connect();
                 }
-            }, 25000);
+            }, PING_MS);
+
+            // Back on the tab (phone unlocked, app switched back): reconnect at
+            // once if the socket died meanwhile, else just catch up.
+            document.addEventListener('visibilitychange', function() {
+                if (document.visibilityState !== 'visible') return;
+                if (alive()) resync(); else connect();
+            });
         })();
 
         // Log Viewer Functions

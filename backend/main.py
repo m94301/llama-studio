@@ -1994,7 +1994,10 @@ async def ws_status(websocket: WebSocket):
     await event_bus.connect(websocket)
     try:
         while True:
-            await websocket.receive_text()
+            # The page pings to prove the connection is alive; it reconnects
+            # when nothing at all arrives for a while.
+            if await websocket.receive_text() == "ping":
+                await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         event_bus.disconnect(websocket)
     except Exception:
