@@ -364,3 +364,62 @@ class TestLlamaKv:
 
     def test_unset_or_unknown_cache_type_counts_as_f16(self):
         assert llama_kv_gb(48, 32768, 1024, None, "bogus") == pytest.approx(6.0)
+
+
+class TestKvCacheDtype:
+    """A measured KV bytes/token stays usable across --kv-cache-dtype changes."""
+
+    def _model(self, tmp_path, kv_dtype=None, measured=None, measured_at=None, torch_dtype="bfloat16"):
+        from config_manager import ModelConfig
+        from launch_script import parse_script
+        model_dir = Path(_write_config(tmp_path, torch_dtype=torch_dtype))
+        meta = "# engine: vllm\n"
+        if measured:
+            meta += f"# kv_bytes_per_token: {measured}\n"
+        if measured_at:
+            meta += f"# calibrated_kv_dtype: {measured_at}\n"
+        kv = f" --kv-cache-dtype {kv_dtype}" if kv_dtype else ""
+        text = (f"#!/bin/sh\n# === llama-studio:meta BEGIN ===\n{meta}# === llama-studio:meta END ===\n"
+                f"exec /venv/bin/vllm serve {model_dir} --port 8000{kv}\n")
+        return ModelConfig("m", tmp_path / "m.sh", parse_script(text))
+
+    def test_measurement_at_the_same_dtype_is_used(self, tmp_path):
+        mc = self._model(tmp_path, kv_dtype="fp8", measured=3125, measured_at="fp8")
+        assert mc.kv_bytes_per_token_for() == (3125, "measured")
+
+    def test_other_dtypes_are_scaled_from_the_measurement(self, tmp_path):
+        mc = self._model(tmp_path, kv_dtype="fp8", measured=3125, measured_at="fp8")
+        assert mc.kv_bytes_per_token_for("auto") == (6250, "scaled from fp8 measurement")       # bf16 model
+        assert mc.kv_bytes_per_token_for("int4_per_token_head") == (1562, "scaled from fp8 measurement")
+
+    def test_unstamped_measurement_counts_as_the_configured_dtype(self, tmp_path):
+        mc = self._model(tmp_path, measured=16000)
+        assert mc.kv_bytes_per_token_for() == (16000, "measured")
+        assert mc.kv_bytes_per_token_for("fp8") == (8000, "scaled from auto measurement")
+
+    def test_dtype_without_fixed_size_and_no_measurement_is_unknown(self, tmp_path):
+        mc = self._model(tmp_path, kv_dtype="fp8_ds_mla")
+        assert mc.kv_bytes_per_token_for() == (None, "unknown")
+
+    def test_calibration_stamp_records_the_kv_dtype(self, tmp_path):
+        from config_manager import ConfigManager
+        mc = self._model(tmp_path, kv_dtype="fp8", measured=3125)
+        assert ConfigManager._calibration_stamp(mc)["calibrated_kv_dtype"] == "fp8"
+        stamped = self._model(tmp_path, kv_dtype="fp8", measured=3125, measured_at="fp8")
+        assert "calibrated_kv_dtype" not in ConfigManager._calibration_stamp(stamped)
+
+
+def test_vllm_help_choice_lists_are_recorded():
+    from engine_flags import parse_vllm_help
+    m = parse_vllm_help(
+        "CacheConfig:\n"
+        "  --kv-cache-dtype {auto,fp8,int4_per_token_head}\n"
+        "                        Data type for kv cache storage.\n"
+        "  --tokenizer-mode ['auto', 'mistral']\n"
+        "                        Tokenizer mode.\n"
+        "  --max-model-len MAX_MODEL_LEN\n"
+        "                        Model context length.\n"
+    )
+    assert m["flags"]["--kv-cache-dtype"]["choices"] == ["auto", "fp8", "int4_per_token_head"]
+    assert m["flags"]["--tokenizer-mode"]["choices"] == ["auto", "mistral"]
+    assert "choices" not in m["flags"]["--max-model-len"]

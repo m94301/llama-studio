@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Bumped when the manifest layout changes, so stale caches regenerate instead
 # of being read with the wrong shape.
-MANIFEST_FORMAT = 3  # added category + description
+MANIFEST_FORMAT = 4  # added choices
 
 # One option entry: a flag, optionally followed by a metavar. vLLM renders
 # metavars four ways, all of which mean "this flag takes a value":
@@ -82,6 +82,16 @@ _GROUP_LABELS = {
     "CompilationConfig": "compilation",
     "StructuredOutputsConfig": "structured outputs",
 }
+
+
+def _choices(metavar: str) -> List[str]:
+    """The allowed values when a metavar is a choice list ({a,b} or ['a', 'b'])."""
+    mv = metavar.strip()
+    if mv.startswith("{") and mv.endswith("}"):
+        return [c.strip() for c in mv[1:-1].split(",") if c.strip()]
+    if mv.startswith("[") and "'" in mv:
+        return re.findall(r"'([^']*)'", mv)
+    return []
 
 
 def parse_vllm_help(help_text: str) -> Dict[str, dict]:
@@ -130,12 +140,15 @@ def parse_vllm_help(help_text: str) -> Dict[str, dict]:
             longs = [n for n in names if n.startswith("--")]
             canonical = longs[0] if longs else names[0]
 
+            choices = _choices(next((mv for _, mv in entries if mv.strip()), ""))
             for name in names:
                 flags[name] = {
                     "takes_value": takes_value,
                     "category": group,
                     "description": "",
                 }
+                if choices:
+                    flags[name]["choices"] = choices
                 # Only short forms are aliases. `--no-x` is a distinct flag with
                 # the opposite meaning, never an alias of `--x`.
                 if not name.startswith("--") and name != canonical:

@@ -14,13 +14,15 @@ import shutil
 import stat
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pydantic import BaseModel, Field, field_validator
 
 from gguf_metadata_parser import parse_gguf_metadata
 from kv_calc import (
     DEFAULT_OVERHEAD_GB,
     GIB,
+    bytes_per_token_from_config,
+    kv_dtype_bytes,
     calibrate_from_log,
     heaviest_rank_weights_from_log,
     llama_cache_type_bytes,
@@ -239,6 +241,31 @@ class ModelConfig:
         # util from this same usage figure, so for a tool-written script the two
         # numbers coincide and nothing is over-reserved.
         return round(max(usage, gate), 2)
+
+    def kv_bytes_per_token_for(self, kv_cache_dtype: Optional[str] = None) -> Tuple[Optional[int], str]:
+        """vLLM KV bytes per token at `kv_cache_dtype` (default: the configured
+        one), with where the figure came from.
+
+        A measurement taken at that dtype wins. One taken at another dtype is
+        rescaled by element size: it already reflects the model's real KV shape,
+        which config.json may not describe (MLA models). Else config.json's
+        estimate; None when neither is available.
+        """
+        dtype = kv_cache_dtype or self.parsed.kv_cache_dtype
+        measured = self.parsed.load_profile["kv_bytes_per_token"]
+        if measured:
+            # Unstamped (older) measurements were taken at the configured dtype.
+            at = self.parsed.calibrated_kv_dtype or self.parsed.kv_cache_dtype
+            if at == dtype:
+                return measured, "measured"
+            src, dst = kv_dtype_bytes(at, self.model_path), kv_dtype_bytes(dtype, self.model_path)
+            if src and dst:
+                return int(measured * dst / src), f"scaled from {at} measurement"
+        if self.model_path:
+            estimate = bytes_per_token_from_config(self.model_path, dtype)
+            if estimate:
+                return estimate, "estimated"
+        return None, "unknown"
 
     @property
     def model_path(self) -> Optional[str]:
@@ -738,13 +765,8 @@ class ConfigManager:
             updates["weights_max_gb"] = weights_max
         if overhead is not None and overhead != mc.parsed.runtime_overhead_gb:
             updates["runtime_overhead_gb"] = overhead
-        # Stamp the topology so the figures are discarded if it changes.
         if updates:
-            part = ",".join(str(n) for n in (mc.parsed.pp_layer_partition or []))
-            if mc.parsed.calibrated_gpus != mc.gpu_count:
-                updates["calibrated_gpus"] = mc.gpu_count
-            if (mc.parsed.calibrated_partition or "") != part:
-                updates["calibrated_partition"] = part or None
+            updates.update(self._calibration_stamp(mc))
         if not updates:
             return
         try:
@@ -776,20 +798,40 @@ class ConfigManager:
         except Exception as e:
             logger.debug(f"   Could not calibrate KV for {model_name}: {e}")
             return None
-        if not measured or measured == mc.parsed.kv_bytes_per_token:
+        if not measured:
             return measured
-        stamp = {"calibrated_gpus": mc.gpu_count} if mc.parsed.calibrated_gpus != mc.gpu_count else {}
+        updates = self._calibration_stamp(mc)
+        if measured != mc.parsed.kv_bytes_per_token:
+            updates["kv_bytes_per_token"] = measured
+        if not updates:
+            return measured
         try:
             script_path = self.get_script_path(model_name)
-            new_text = patch_meta_fence(
-                script_path.read_text(), kv_bytes_per_token=measured, **stamp
-            )
+            new_text = patch_meta_fence(script_path.read_text(), **updates)
             if write_script_atomic(script_path, new_text):
                 logger.info(f"   Calibrated KV for {model_name}: {measured} bytes/token")
             self.rescan_model(model_name)
         except Exception as e:
             logger.warning(f"⚠ Could not store calibrated KV for {model_name}: {e}")
         return measured
+
+    @staticmethod
+    def _calibration_stamp(mc: ModelConfig) -> Dict[str, Any]:
+        """Meta-fence fields recording the setup a measurement was taken at, where
+        they differ from what is stored. ParsedScript.load_profile discards the
+        figures once the setup changes (GPU count, layer split, KV cache dtype)."""
+        p = mc.parsed
+        current = {
+            "calibrated_gpus": mc.gpu_count,
+            "calibrated_partition": ",".join(str(n) for n in (p.pp_layer_partition or [])) or None,
+            "calibrated_kv_dtype": p.kv_cache_dtype,
+        }
+        stored = {
+            "calibrated_gpus": p.calibrated_gpus,
+            "calibrated_partition": p.calibrated_partition,
+            "calibrated_kv_dtype": p.calibrated_kv_dtype,
+        }
+        return {k: v for k, v in current.items() if v != stored[k]}
 
     def _finish_vllm_model(self, script_path: Path, parsed: ParsedScript) -> ModelConfig:
         """Build a ModelConfig for an engine:vllm script.

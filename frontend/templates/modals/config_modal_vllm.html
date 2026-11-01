@@ -85,6 +85,17 @@
                     <span class="text-xs text-gray-500">conversations served at once</span>
                 </div>
 
+                <div class="flex items-center gap-3 mb-3">
+                    <label class="text-xs font-bold text-gray-400 w-28">KV cache</label>
+                    <select id="v-kv-dtype" onchange="vOnKvDtype()"
+                            class="px-2 py-1 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300">
+                        {% for d in kv_bpt %}
+                        <option value="{{ d }}" {% if d == kv_dtype %}selected{% endif %}>{{ d }}</option>
+                        {% endfor %}
+                    </select>
+                    <span class="text-xs text-gray-500">--kv-cache-dtype · the engine's own choices; auto = the model's dtype</span>
+                </div>
+
                 <div class="bg-gray-900 border border-gray-700 rounded p-3">
                     <div class="flex items-center justify-between gap-4 flex-wrap">
                         <div id="v-derived" class="text-xs text-gray-400">{% if initial_tokens %}{{ "{:,}".format(context_length or 8192) }} × {{ concurrency or 1 }} + 20% headroom = <b class="text-gray-200">{{ "{:,}".format(initial_tokens) }} tokens</b>{% else %}—{% endif %}</div>
@@ -222,6 +233,9 @@ window.V = {
     gpuCount: {{ gpu_count }},
     maxContext: {{ max_context or 0 }},
     kvBudget: {{ kv_cache_memory_bytes | tojson }},
+    // [bytes/token, source] per KV cache dtype; switching the dropdown re-sizes.
+    kvBpt: {{ kv_bpt | tojson }},
+    kvDtypeInScript: {{ kv_dtype_in_script | tojson }},
     headroom: {{ kv_headroom }},
     gpuCapacity: {{ gpu_capacity }},
     weightsPerGpu: {{ weights_per_gpu_gb }},
@@ -229,6 +243,15 @@ window.V = {
     utilMax: 0.98,
 };
 const GIB = 1024 ** 3;
+
+function vKvDtype() { return document.getElementById('v-kv-dtype').value; }
+
+function vOnKvDtype() {
+    const [bpt, source] = window.V.kvBpt[vKvDtype()] || [0, 'unknown'];
+    window.V.bytesPerToken = bpt || 0;
+    window.V.bptSource = source;
+    vRecalc();
+}
 
 function vCtx()  { return parseInt(document.getElementById('v-ctx-value').value) || 0; }
 function vConc() { return Math.max(1, parseInt(document.getElementById('v-concurrency').value) || 1); }
@@ -311,7 +334,7 @@ async function vFitToFree() {
     const btn = document.getElementById('v-fit-btn');
     const r = await fetch('/api/calculate-vllm-vram', {
         method: 'POST',
-        body: new URLSearchParams({ model: vModel(), concurrency: vConc(), solve_for: 'fit' }),
+        body: new URLSearchParams({ model: vModel(), concurrency: vConc(), kv_cache_dtype: vKvDtype(), solve_for: 'fit' }),
     });
     const fit = await r.json();
     if (fit.error) { btn.textContent = fit.error; return; }
@@ -407,6 +430,7 @@ function vCollectArgs() {
     if (port) args['--port'] = port;
     args['--max-model-len'] = String(vCtx());
     args['--max-num-seqs'] = String(vConc());
+    if (vKvDtype() !== 'auto' || window.V.kvDtypeInScript) args['--kv-cache-dtype'] = vKvDtype();
     if (window.V.bytesPerToken) {
         args['--kv-cache-memory-bytes'] =
             String(Math.floor(vCtx() * vConc() * window.V.headroom) * window.V.bytesPerToken);

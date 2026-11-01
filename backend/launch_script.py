@@ -195,6 +195,8 @@ class ParsedScript:
     # partition directly, so re-balancing invalidates them just as surely as
     # changing the card count does.
     calibrated_partition: Optional[str] = None
+    # KV cache dtype the bytes/token figure was measured at (fp8 halves it).
+    calibrated_kv_dtype: Optional[str] = None
     # VLLM_PP_LAYER_PARTITION assignment from the body, parsed to ints.
     pp_layer_partition: Optional[List[int]] = None
 
@@ -315,7 +317,9 @@ class ParsedScript:
         """Measured figures from a real load, or empties when they don't apply.
 
         Everything here scales with layers-per-rank, so a profile captured at a
-        different GPU count is discarded rather than used to predict.
+        different GPU count or layer split is discarded rather than used to
+        predict. (A KV cache dtype change is handled by rescaling, see
+        ModelConfig.kv_bytes_per_token_for.)
         """
         current_partition = (
             ",".join(str(n) for n in self.pp_layer_partition)
@@ -336,6 +340,11 @@ class ParsedScript:
                 "runtime_overhead_gb": self.runtime_overhead_gb,
                 "kv_bytes_per_token": self.kv_bytes_per_token,
                 "stale_from": None}
+
+    @property
+    def kv_cache_dtype(self) -> str:
+        """vLLM --kv-cache-dtype as configured ("auto" = the model's own dtype)."""
+        return str(self.args.get("--kv-cache-dtype") or "auto")
 
     @property
     def kv_unified(self) -> bool:
@@ -672,6 +681,9 @@ def parse_script(text: str) -> ParsedScript:
         cp = meta.get("calibrated_partition")
         if cp:
             ps.calibrated_partition = str(cp).strip()
+        ckd = meta.get("calibrated_kv_dtype")
+        if ckd:
+            ps.calibrated_kv_dtype = str(ckd).strip()
         cg = meta.get("calibrated_gpus")
         if cg is not None and cg != "":
             try:
@@ -1098,6 +1110,7 @@ def patch_meta_fence(
     runtime_overhead_gb=_UNSET,
     calibrated_gpus=_UNSET,
     calibrated_partition=_UNSET,
+    calibrated_kv_dtype=_UNSET,
 ) -> str:
     """Merge the given fields into the meta fence, preserving everything else.
 
@@ -1124,6 +1137,7 @@ def patch_meta_fence(
         "runtime_overhead_gb": runtime_overhead_gb,
         "calibrated_gpus": calibrated_gpus,
         "calibrated_partition": calibrated_partition,
+        "calibrated_kv_dtype": calibrated_kv_dtype,
     }
     updates = {k: v for k, v in updates.items() if v is not _UNSET}
     # An empty string display_name behaves like a delete (legacy callers pass "").
@@ -1157,7 +1171,7 @@ def patch_meta_fence(
     # Append fields that weren't already present, in canonical order.
     for key in ("display_name", "engine", "vram_gb", "kv_bytes_per_token",
                 "weights_max_gb", "runtime_overhead_gb", "calibrated_gpus",
-                "calibrated_partition",
+                "calibrated_partition", "calibrated_kv_dtype",
                 "block_count", "max_context", "kv_cache_multiplier", "health_timeout"):
         if key in updates and key not in seen and updates[key] is not None:
             out.append(_render_meta_line(key, updates[key]))

@@ -690,22 +690,21 @@ async def config_modal(model: str):
         # vLLM models get their own modal, saved by /api/save-vllm-config,
         # which patches the exec line and leaves the env-var preamble intact.
         if model_config.engine == "vllm":
-            from kv_calc import (
-                DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, bytes_per_token_from_config,
-            )
+            from kv_calc import DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB
 
             manifest = manifest_for_binary(model_config.parsed.llama_bin) or {}
             args = dict(model_config.launch_args)
             core_keys = {"--host", "--port", "--max-model-len", "--max-num-seqs",
-                         "--kv-cache-memory-bytes"}
+                         "--kv-cache-memory-bytes", "--kv-cache-dtype"}
             mprofile = model_config.parsed.load_profile
-            bpt = mprofile["kv_bytes_per_token"]
-            bpt_source = "measured"
-            if not bpt and model_config.model_path:
-                bpt = bytes_per_token_from_config(
-                    model_config.model_path, args.get("--kv-cache-dtype")
-                )
-                bpt_source = "estimated"
+            # KV cache dtype: the engine's own choices, each with its bytes/token,
+            # so the dialog re-sizes when the dropdown changes.
+            kv_dtype = model_config.parsed.kv_cache_dtype
+            kv_choices = (manifest.get("flags", {}).get("--kv-cache-dtype") or {}).get("choices") or [kv_dtype]
+            if kv_dtype not in kv_choices:
+                kv_choices = [kv_dtype] + kv_choices
+            kv_bpt = {d: model_config.kv_bytes_per_token_for(d) for d in kv_choices}
+            bpt, bpt_source = kv_bpt[kv_dtype]
 
             gpu_caps = [info["memory"] for info in (gpu_manager.get_gpu_status() or {}).values()]
             # Utilization is a fraction of each card, so derive it against the
@@ -755,6 +754,9 @@ async def config_modal(model: str):
                 vllm_version=manifest.get("version", "unknown"),
                 bytes_per_token=bpt or 0,
                 bytes_per_token_source=bpt_source,
+                kv_dtype=kv_dtype,
+                kv_bpt=kv_bpt,
+                kv_dtype_in_script="--kv-cache-dtype" in args,
                 weights_gb=model_config.size_gb or 0,
                 overhead_gb=(mprofile["runtime_overhead_gb"]
                              if mprofile["runtime_overhead_gb"] is not None
@@ -1573,6 +1575,7 @@ async def calculate_vllm_vram(
     concurrency: int = Form(1),
     vram_gb: float = Form(0.0),
     solve_for: str = Form("vram"),
+    kv_cache_dtype: str = Form(""),
 ):
     """Both directions of the context/concurrency/VRAM relation (doc 21 §2.4).
 
@@ -1589,7 +1592,7 @@ async def calculate_vllm_vram(
     """
     from kv_calc import (
         DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, GIB, MIN_HEADROOM_GB,
-        bytes_per_token_from_config, context_for_vram, vram_gb_for,
+        context_for_vram, vram_gb_for,
     )
     try:
         mc = config_manager.get_model_config(model)
@@ -1598,13 +1601,8 @@ async def calculate_vllm_vram(
 
     # Measured figures, or empties when the profile was taken at a different GPU count.
     profile = mc.parsed.load_profile
-    bpt = profile["kv_bytes_per_token"]
-    source = "measured"
-    if not bpt and mc.model_path:
-        bpt = bytes_per_token_from_config(
-            mc.model_path, mc.launch_args.get("--kv-cache-dtype")
-        )
-        source = "estimated"
+    # The dialog sends its (possibly unsaved) KV cache dtype; default to the script's.
+    bpt, source = mc.kv_bytes_per_token_for(kv_cache_dtype or None)
     if not bpt:
         return JSONResponse({
             "error": "KV bytes/token unknown for this model — load it once to calibrate",

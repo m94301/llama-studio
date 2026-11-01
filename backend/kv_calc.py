@@ -30,10 +30,17 @@ logger = logging.getLogger(__name__)
 GIB = 1024 ** 3
 
 # Bytes per element for the dtypes that appear in HF configs / --kv-cache-dtype.
+# Quantized KV types count their payload only (per-head scales are small and
+# the pool headroom covers them). Types without a fixed element size, such as
+# DeepSeek's fp8_ds_mla layout, are absent: their size comes from a measurement.
 DTYPE_BYTES = {
     "float32": 4.0, "float": 4.0, "fp32": 4.0,
     "bfloat16": 2.0, "float16": 2.0, "half": 2.0, "fp16": 2.0, "bf16": 2.0,
-    "float8": 1.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0, "int8": 1.0,
+    "float8": 1.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0, "fp8_inc": 1.0, "int8": 1.0,
+    "fp8_per_token_head": 1.0, "int8_per_token_head": 1.0,
+    "int4_per_token_head": 0.5, "nvfp4": 0.5,
+    "turboquant_4bit_nc": 0.5, "turboquant_3bit_nc": 0.375,
+    "turboquant_k3v4_nc": 0.4375, "turboquant_k8v4": 0.75,
 }
 
 # Activation + CUDA-graph working memory, i.e. everything that is neither
@@ -106,6 +113,28 @@ def dtype_bytes(name: Optional[str], default: float = 2.0) -> float:
     return DTYPE_BYTES.get(str(name).strip().lower(), default)
 
 
+def _read_config(model_dir: str) -> Optional[dict]:
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except Exception as e:
+        logger.debug(f"   kv_calc: no readable config.json in {model_dir}: {e}")
+        return None
+    # Some configs nest the real thing (multimodal wrappers, quantized repacks).
+    if "num_hidden_layers" not in cfg and isinstance(cfg.get("text_config"), dict):
+        cfg = cfg["text_config"]
+    return cfg
+
+
+def kv_dtype_bytes(kv_cache_dtype: Optional[str], model_dir: Optional[str] = None) -> Optional[float]:
+    """Bytes per KV element for a --kv-cache-dtype; "auto" is the model's own
+    dtype (config.json torch_dtype, 2 bytes if unstated). None when the type has
+    no fixed element size."""
+    if not kv_cache_dtype or kv_cache_dtype == "auto":
+        cfg = _read_config(model_dir) if model_dir else None
+        return dtype_bytes((cfg or {}).get("torch_dtype"))
+    return DTYPE_BYTES.get(str(kv_cache_dtype).strip().lower())
+
+
 def bytes_per_token_from_config(model_dir: str, kv_cache_dtype: Optional[str] = None) -> Optional[int]:
     """Estimate KV bytes per token from a HF model directory's config.json.
 
@@ -114,15 +143,9 @@ def bytes_per_token_from_config(model_dir: str, kv_cache_dtype: Optional[str] = 
     caller must then fall back to calibration from a real load rather than
     guessing.
     """
-    try:
-        cfg = json.loads((Path(model_dir) / "config.json").read_text())
-    except Exception as e:
-        logger.debug(f"   kv_calc: no readable config.json in {model_dir}: {e}")
+    cfg = _read_config(model_dir)
+    if cfg is None:
         return None
-
-    # Some configs nest the real thing (multimodal wrappers, quantized repacks).
-    if "num_hidden_layers" not in cfg and isinstance(cfg.get("text_config"), dict):
-        cfg = cfg["text_config"]
 
     layers = cfg.get("num_hidden_layers")
     if not layers:
@@ -142,8 +165,9 @@ def bytes_per_token_from_config(model_dir: str, kv_cache_dtype: Optional[str] = 
         logger.debug("   kv_calc: MLA-style config; deferring to load-time calibration")
         return None
 
-    per_element = dtype_bytes(kv_cache_dtype) if kv_cache_dtype and kv_cache_dtype != "auto" \
-        else dtype_bytes(cfg.get("torch_dtype"))
+    per_element = kv_dtype_bytes(kv_cache_dtype, model_dir)
+    if per_element is None:
+        return None
     return int(2 * layers * kv_heads * head_dim * per_element)
 
 
