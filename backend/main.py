@@ -18,7 +18,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 from fastapi import FastAPI, BackgroundTasks, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
