@@ -754,6 +754,17 @@
             else closeModelLog(htmlId);
         }
 
+        function autoScrollLogViewer(element) {
+            // Called after HTMX swap - scroll to bottom if auto-update is enabled
+            const htmlId = element.dataset.htmlId;
+            const checkbox = document.getElementById(`autoupdate-${htmlId}`);
+            if (element && checkbox && checkbox.checked) {
+                setTimeout(() => {
+                    element.scrollTop = element.scrollHeight;
+                }, 0);
+            }
+        }
+
         function initLogAutoScroll(htmlId) {
             // Start polling if checkbox is checked
             const checkbox = document.getElementById(`autoupdate-${htmlId}`);
