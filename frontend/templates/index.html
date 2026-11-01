@@ -661,9 +661,11 @@
                             `/api/get-model-status-inner?model=${encodeURIComponent(data.model_name)}`,
                             { source: selector, target: selector, swap: 'innerHTML' }
                         );
-                        // Auto-open log viewer when model starts loading
+                        // Show the log while a model loads; close it again when done.
                         if (data.state === 'loading') {
                             setTimeout(() => ensureModelLogOpen(data.html_id), 100);
+                        } else {
+                            finishAutoOpenedLog(data.html_id, data.state);
                         }
                         htmx.trigger(document.body, 'modelStateChanged');
                     } else if (data.type === 'auto_load') {
@@ -708,55 +710,48 @@
         })();
 
         // Log Viewer Functions
-        const openLogs = new Set();
+        // Log viewers the page opened itself when a load started. They close
+        // again when the load ends; a failed load's log stays open to show why.
+        const autoOpenedLogs = new Set();
+
+        function openModelLog(htmlId) {
+            const logRow = document.getElementById(`log-row-${htmlId}`);
+            if (!logRow || !logRow.classList.contains('hidden')) return false;
+            logRow.classList.remove('hidden');
+            // Trigger immediate load when opened
+            htmx.ajax('GET',
+                `/api/model-log-tail?model=${encodeURIComponent(logRow.dataset.modelName)}&lines=30`,
+                { target: `#log-content-${htmlId}`, swap: 'innerHTML' }
+            );
+            initLogAutoScroll(htmlId);
+            return true;
+        }
+
+        function closeModelLog(htmlId) {
+            const logRow = document.getElementById(`log-row-${htmlId}`);
+            if (!logRow) return;
+            logRow.classList.add('hidden');
+            toggleLogPolling(htmlId, false);  // a hidden log must not keep fetching
+            autoOpenedLogs.delete(htmlId);
+        }
 
         function toggleModelLog(htmlId) {
             const logRow = document.getElementById(`log-row-${htmlId}`);
             if (!logRow) return;
-
-            logRow.classList.toggle('hidden');
-
-            if (logRow.classList.contains('hidden')) {
-                openLogs.delete(htmlId);
-            } else {
-                openLogs.add(htmlId);
-                // Trigger immediate load when opened
-                htmx.ajax('GET',
-                    `/api/model-log-tail?model=${encodeURIComponent(logRow.dataset.modelName)}&lines=30`,
-                    { target: `#log-content-${htmlId}`, swap: 'innerHTML' }
-                );
-                // Setup scroll listener for this log viewer
-                initLogAutoScroll(htmlId);
-            }
+            autoOpenedLogs.delete(htmlId);  // the user has taken this one over
+            if (logRow.classList.contains('hidden')) openModelLog(htmlId);
+            else closeModelLog(htmlId);
         }
 
         function ensureModelLogOpen(htmlId) {
-            const logRow = document.getElementById(`log-row-${htmlId}`);
-            if (!logRow) return;
-
-            // Only open if currently hidden
-            if (logRow.classList.contains('hidden')) {
-                logRow.classList.remove('hidden');
-                openLogs.add(htmlId);
-                // Trigger immediate load when opened
-                htmx.ajax('GET',
-                    `/api/model-log-tail?model=${encodeURIComponent(logRow.dataset.modelName)}&lines=30`,
-                    { target: `#log-content-${htmlId}`, swap: 'innerHTML' }
-                );
-                // Setup scroll listener for this log viewer
-                initLogAutoScroll(htmlId);
-            }
+            if (openModelLog(htmlId)) autoOpenedLogs.add(htmlId);
         }
 
-        function autoScrollLogViewer(element) {
-            // Called after HTMX swap - scroll to bottom if auto-update is enabled
-            const htmlId = element.dataset.htmlId;
-            const checkbox = document.getElementById(`autoupdate-${htmlId}`);
-            if (element && checkbox && checkbox.checked) {
-                setTimeout(() => {
-                    element.scrollTop = element.scrollHeight;
-                }, 0);
-            }
+        // A load ended (running, failed or cancelled back to idle).
+        function finishAutoOpenedLog(htmlId, state) {
+            if (!autoOpenedLogs.has(htmlId)) return;
+            if (state === 'failed') autoOpenedLogs.delete(htmlId);
+            else closeModelLog(htmlId);
         }
 
         function initLogAutoScroll(htmlId) {
@@ -781,6 +776,11 @@
             if (enabled) {
                 // Fetch and auto-scroll function using plain fetch
                 const fetchAndScroll = async () => {
+                    // The row was re-rendered (save, rescan): this viewer is gone.
+                    if (!element.isConnected) {
+                        clearInterval(element._pollingInterval);
+                        return;
+                    }
                     try {
                         const url = element.getAttribute('hx-get');
                         const response = await fetch(url);
