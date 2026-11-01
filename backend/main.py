@@ -707,10 +707,7 @@ async def config_modal(model: str):
                 )
                 bpt_source = "estimated"
 
-            gpu_free, gpu_caps = {}, []
-            for gid, info in (gpu_manager.get_gpu_status() or {}).items():
-                gpu_free[gid] = round(info["memory"] - info["allocated"], 1)
-                gpu_caps.append(info["memory"])
+            gpu_caps = [info["memory"] for info in (gpu_manager.get_gpu_status() or {}).values()]
             # Utilization is a fraction of each card, so derive it against the
             # smallest one present; anything larger then has room to spare.
             gpu_capacity = round(min(gpu_caps), 2) if gpu_caps else 0.0
@@ -766,7 +763,6 @@ async def config_modal(model: str):
                 kv_headroom=DEFAULT_KV_HEADROOM,
                 env_assignments=model_config.parsed.env_assignments,
                 pp_size=model_config.parsed.pipeline_parallel_size,
-                gpu_free=gpu_free,
                 gpu_capacity=gpu_capacity,
                 initial_vram=initial_vram,
                 initial_tokens=initial_tokens,
@@ -1582,13 +1578,17 @@ async def calculate_vllm_vram(
 
     solve_for='vram'    : context + concurrency -> total VRAM
     solve_for='context' : VRAM budget + concurrency -> largest context that fits
+    solve_for='fit'     : the largest context the emptiest GPU can take while
+                          keeping the same spare room save_vllm_config demands
+                          (MIN_HEADROOM_GB on the smallest card), so a fitted
+                          value is always one the save accepts
 
     One shared helper backs both so a round-trip returns to the same slider
     position. Returns the pool token count and the KV budget to write into the
     script as --kv-cache-memory-bytes.
     """
     from kv_calc import (
-        DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, GIB,
+        DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, GIB, MIN_HEADROOM_GB,
         bytes_per_token_from_config, context_for_vram, vram_gb_for,
     )
     try:
@@ -1616,6 +1616,17 @@ async def calculate_vllm_vram(
     if overhead is None:
         overhead = DEFAULT_OVERHEAD_GB
     concurrency = max(1, concurrency)
+    fit = {}
+    if solve_for == "fit":
+        gpus = gpu_manager.get_gpu_status() or {}
+        if not gpus:
+            return JSONResponse({"error": "no GPUs detected"}, status_code=422)
+        gpu_id, info = max(gpus.items(), key=lambda kv: kv[1]["memory"] - kv[1]["allocated"])
+        free = info["memory"] - info["allocated"]
+        smallest = min(g["memory"] for g in gpus.values())
+        vram_gb = min(free, smallest) - MIN_HEADROOM_GB
+        fit = {"gpu_id": gpu_id, "free_gb": round(free, 1), "spare_gb": MIN_HEADROOM_GB}
+        solve_for = "context"
     if solve_for == "context":
         ctx = context_for_vram(
             vram_gb=vram_gb, concurrency=concurrency, bytes_per_token=bpt,
@@ -1654,6 +1665,7 @@ async def calculate_vllm_vram(
         "gpu_count": mc.gpu_count,
         "total_gb": round(total * mc.gpu_count, 2),
         "kv_cache_memory_bytes": tokens * bpt,
+        **fit,
     })
 
 

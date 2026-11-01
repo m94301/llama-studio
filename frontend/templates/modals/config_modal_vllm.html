@@ -221,7 +221,6 @@ window.V = {
     overheadGb: {{ overhead_gb }},
     gpuCount: {{ gpu_count }},
     maxContext: {{ max_context or 0 }},
-    gpuFree: {{ gpu_free | tojson }},
     kvBudget: {{ kv_cache_memory_bytes | tojson }},
     headroom: {{ kv_headroom }},
     gpuCapacity: {{ gpu_capacity }},
@@ -306,13 +305,19 @@ function vOnVram(vramGb) {
     vOnSlider(Math.max(256, ctx));
 }
 
-function vFitToFree() {
-    const entries = Object.entries(window.V.gpuFree || {});
-    if (!entries.length) return;
-    // No GPU is assigned at config time, so target the emptiest one and say which.
-    const [gid, free] = entries.reduce((a, b) => (b[1] > a[1] ? b : a));
-    document.getElementById('v-fit-btn').textContent = `fit to GPU ${gid} — ${free} GB free`;
-    vOnVram(free);
+// The server picks the emptiest GPU and solves for the largest context that
+// still leaves the spare room the save check requires (one rule, kv_calc).
+async function vFitToFree() {
+    const btn = document.getElementById('v-fit-btn');
+    const r = await fetch('/api/calculate-vllm-vram', {
+        method: 'POST',
+        body: new URLSearchParams({ model: vModel(), concurrency: vConc(), solve_for: 'fit' }),
+    });
+    const fit = await r.json();
+    if (fit.error) { btn.textContent = fit.error; return; }
+    if (!fit.context_length) { btn.textContent = `GPU ${fit.gpu_id}: not enough free VRAM`; return; }
+    btn.textContent = `fit to GPU ${fit.gpu_id} — ${fit.free_gb} GB free, ${fit.spare_gb} GB kept spare`;
+    vOnSlider(fit.context_length);
 }
 
 function vAddArg(name, value) {
