@@ -87,7 +87,7 @@
                     <div class="flex items-center gap-3 mb-4">
                         <label class="text-xs font-bold text-gray-400 w-24">Context Size</label>
                         <input type="range" id="ctx-slider"
-                               min="512" max="{{ max_context or 32768 }}" step="512"
+                               min="512" max="{{ max_context or 262144 }}" step="512"
                                value="{{ current_ctx }}"
                                oninput="updateCtx(this.value)"
                                class="flex-1 h-2 bg-gray-700 rounded appearance-none cursor-pointer">
@@ -152,6 +152,54 @@
             <!-- LAUNCH ARGS SECTION -->
             <fieldset>
                 <legend class="text-sm font-bold text-gray-300 mb-4">Launch Args</legend>
+
+                <!-- MULTI-GPU & BATCH ADVISOR WIDGET -->
+                <div class="mb-4 p-4 bg-gray-900 border border-indigo-700/60 rounded-lg space-y-3">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-bold text-indigo-300 flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-indigo-500"></span>
+                            Multi-GPU Allocation &amp; Batch Advisor
+                        </span>
+                        <span class="text-xs text-gray-400">Heterogeneous VRAM Balancer</span>
+                    </div>
+
+                    <!-- Target GPU Checkboxes -->
+                    <div class="bg-gray-800 p-3 rounded border border-gray-700">
+                        <div class="flex items-center justify-between mb-2">
+                            <label class="text-xs font-bold text-gray-300">Target GPUs for <code>--tensor-split</code>:</label>
+                            <label class="flex items-center space-x-1 text-xs text-gray-400 cursor-pointer">
+                                <input type="checkbox" id="tensor-use-total-vram" class="rounded text-indigo-600 bg-gray-700 border-gray-600">
+                                <span>Theoretical (Total VRAM)</span>
+                            </label>
+                        </div>
+                        <div class="grid grid-cols-2 sm:grid-cols-3 gap-2" id="tensor-split-gpu-grid">
+                            {% if gpus %}
+                                {% for gid, gpu in gpus.items() %}
+                                <label class="flex items-center space-x-2 text-xs text-gray-300 bg-gray-900/80 p-2 rounded border border-gray-700/80 hover:border-gray-500 cursor-pointer">
+                                    <input type="checkbox" value="{{ gid }}" class="tensor-split-gpu-cb rounded text-indigo-600 bg-gray-700 border-gray-600" checked>
+                                    <span>GPU {{ gid }} ({{ gpu.name if gpu.name else 'NVIDIA' }} - {{ gpu.memory|round(1) }} GB)</span>
+                                </label>
+                                {% endfor %}
+                            {% else %}
+                                <span class="text-xs text-gray-500">No GPUs detected via NVML.</span>
+                            {% endif %}
+                        </div>
+
+                        <div class="flex items-center gap-4 mt-3 pt-2 border-t border-gray-700">
+                            <div class="flex items-center space-x-2">
+                                <label for="tensor-headroom-input" class="text-xs text-gray-400">Headroom (MB):</label>
+                                <input type="number" id="tensor-headroom-input" value="768" class="w-20 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs text-gray-200">
+                            </div>
+                            <button type="button" onclick="calculateAndApplyTensorSplit()" class="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded transition-colors">
+                                Auto-Calculate Split
+                            </button>
+                            <div id="tensor-split-status" class="text-xs font-mono"></div>
+                        </div>
+                    </div>
+
+                    <!-- Batch & Context Advisory Alert Container -->
+                    <div id="batch-advisor-container" class="hidden"></div>
+                </div>
 
                 <!-- Validation errors display -->
                 <div id="validation-errors" class="mb-4 hidden">
@@ -427,11 +475,9 @@ function showOptionBrowser() {
     const searchBox = document.getElementById('option-search-box');
     const emptyState = document.getElementById('option-search-empty');
 
-    // Clear search box and empty state
     searchBox.value = '';
     emptyState.classList.add('hidden');
 
-    // Group by category
     const byCategory = {};
     for (const [key, spec] of Object.entries(window.OPTION_SCHEMA)) {
         const cat = spec.category || 'other';
@@ -439,11 +485,9 @@ function showOptionBrowser() {
         byCategory[cat].push({ key, ...spec });
     }
 
-    // Define display order: gpu, network, context, threading, then rest
     const categoryOrder = ['gpu', 'networking', 'context', 'threading'];
     const orderedCategories = [];
 
-    // Add categories in specified order
     for (const cat of categoryOrder) {
         if (byCategory[cat]) {
             orderedCategories.push([cat, byCategory[cat]]);
@@ -451,7 +495,6 @@ function showOptionBrowser() {
         }
     }
 
-    // Add remaining categories in alphabetical order
     for (const [cat, options] of Object.entries(byCategory).sort()) {
         orderedCategories.push([cat, options]);
     }
@@ -505,8 +548,6 @@ function addOptionFromBrowser(key) {
     `;
     table.appendChild(row);
     document.getElementById('option-browser-modal').classList.add('hidden');
-
-    // Focus the value input
     row.querySelector('[data-arg-value]').focus();
 }
 
@@ -529,43 +570,34 @@ function filterOptions(query) {
             if (matches) visibleInCategory++;
         }
 
-        // Hide empty categories
         cat.style.display = visibleInCategory > 0 ? 'block' : 'none';
         if (visibleInCategory > 0) hasVisibleOptions = true;
     }
 
-    // Show empty state message
     emptyState.classList.toggle('hidden', hasVisibleOptions);
 }
 
 function serializeFormData() {
-    // Core fields
     const htRaw = document.getElementById('health-timeout-input').value.trim();
     const core = {
         port: parseInt(document.querySelector('input[name="port"]').value) || null,
         display_name: document.querySelector('input[name="display_name"]').value.trim() || null,
         host: document.querySelector('input[name="host"]').value.trim() || "0.0.0.0",
         llama_path: document.getElementById('llama-path-input').value.trim() || "default",
-        // Empty → use default (server treats null/empty as "omit the meta line")
         health_timeout: htRaw === '' ? null : parseInt(htRaw),
     };
 
-    // Launch args: collect all rows (permanent + user-added)
     const advanced = {};
-
-    // Collect permanent required args from table
     advanced['--host'] = document.getElementById('table-host-value').value.trim();
     advanced['--port'] = document.getElementById('table-port-value').value.trim();
     advanced['--ctx-size'] = document.getElementById('table-ctx-size-value').value.trim();
     advanced['--cache-type-k'] = document.getElementById('table-cache-type-k-value').value.trim();
     advanced['--cache-type-v'] = document.getElementById('table-cache-type-v-value').value.trim();
 
-    // Collect user-added rows from launch-args-table (those with inputs having data-arg-name attribute)
     document.querySelectorAll('#launch-args-table input[data-arg-name]').forEach(input => {
         const row = input.closest('div');
         const argName = row.querySelector('[data-arg-name]')?.value.trim();
         const argValue = row.querySelector('[data-arg-value]')?.value.trim();
-        // Allow arguments with or without values (e.g., --no-mmap has no value)
         if (argName) {
             advanced[argName] = argValue || null;
         }
@@ -573,8 +605,6 @@ function serializeFormData() {
 
     document.getElementById('core-json-field').value = JSON.stringify(core);
     document.getElementById('advanced-json-field').value = JSON.stringify(advanced);
-
-    // === NEW: Validate fields and highlight invalid ones ===
     validateAndHighlightFields(advanced);
 }
 
@@ -583,7 +613,6 @@ function validateAndHighlightFields(advanced) {
     const errorsDiv = document.getElementById('validation-errors');
     const errors = [];
 
-    // Only validate user-added rows (those with data-arg-name inputs), skip permanent rows
     document.querySelectorAll('#launch-args-table input[data-arg-name]').forEach(input => {
         const row = input.closest('div');
         const argName = row.querySelector('[data-arg-name]')?.value.trim();
@@ -591,12 +620,11 @@ function validateAndHighlightFields(advanced) {
 
         if (!argName || !argValue) return;
 
-        // Check if option is valid
         if (!(argName in window.OPTION_SCHEMA)) {
             errors.push(argName);
-            row.style.backgroundColor = '#7f1d1d';  // red-900
+            row.style.backgroundColor = '#7f1d1d';
         } else {
-            row.style.backgroundColor = '';  // reset
+            row.style.backgroundColor = '';
         }
     });
 
@@ -607,6 +635,150 @@ function validateAndHighlightFields(advanced) {
         errorsDiv.classList.add('hidden');
     }
 }
+
+// Injects or updates an argument in the options table
+function setOrAddLaunchArg(argName, argVal) {
+    let found = false;
+    document.querySelectorAll('#launch-args-table input[data-arg-name]').forEach(input => {
+        if (input.value.trim() === argName) {
+            const row = input.closest('div');
+            const valInput = row.querySelector('[data-arg-value]');
+            if (valInput) {
+                valInput.value = argVal;
+                found = true;
+            }
+        }
+    });
+
+    if (!found) {
+        addAdvancedRow(argName, argVal);
+    }
+}
+
+// Reads argument value from table
+function getLaunchArgValue(argName, alias = null) {
+    let val = null;
+    document.querySelectorAll('#launch-args-table input[data-arg-name]').forEach(input => {
+        const name = input.value.trim();
+        if (name === argName || (alias && name === alias)) {
+            const row = input.closest('div');
+            const valInput = row.querySelector('[data-arg-value]');
+            if (valInput) val = valInput.value.trim();
+        }
+    });
+    return val;
+}
+
+// Calculates tensor split from selected GPU checkboxes
+async function calculateAndApplyTensorSplit() {
+    const selectedBoxes = document.querySelectorAll('.tensor-split-gpu-cb:checked');
+    const selectedGpuIds = Array.from(selectedBoxes).map(cb => parseInt(cb.value));
+    const statusEl = document.getElementById('tensor-split-status');
+
+    if (selectedGpuIds.length === 0) {
+        if (statusEl) statusEl.innerHTML = '<span class="text-amber-400">Select at least 1 GPU.</span>';
+        return;
+    }
+
+    const headroom = parseFloat(document.getElementById('tensor-headroom-input')?.value || "768");
+    const useTotal = document.getElementById('tensor-use-total-vram')?.checked || false;
+    if (statusEl) statusEl.innerHTML = '<span class="text-blue-400">Computing...</span>';
+
+    try {
+        const resp = await fetch('/api/calculate-tensor-split', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                gpu_ids: selectedGpuIds,
+                headroom_mb: headroom,
+                use_total_vram: useTotal,
+                integer_ratios: false
+            })
+        });
+
+        const data = await resp.json();
+        if (data.error) {
+            if (statusEl) statusEl.innerHTML = `<span class="text-rose-400">Error: ${data.error}</span>`;
+            return;
+        }
+
+        setOrAddLaunchArg('--tensor-split', data.tensor_split);
+        if (statusEl) {
+            statusEl.innerHTML = `<span class="text-emerald-400">Applied: ${data.tensor_split}</span>`;
+        }
+    } catch (err) {
+        if (statusEl) statusEl.innerHTML = `<span class="text-rose-400">Failed: ${err.message}</span>`;
+    }
+}
+
+// Batch, micro-batch, and context validation check
+async function runBatchAdvisorCheck() {
+    const ctxInput = document.getElementById('table-ctx-size-value');
+    const ctxSize = ctxInput ? parseInt(ctxInput.value) || 4096 : 4096;
+
+    const bRaw = getLaunchArgValue('--batch-size', '-b');
+    const ubRaw = getLaunchArgValue('--ubatch-size', '-ub');
+    const faRaw = getLaunchArgValue('--flash-attn', '-fa');
+
+    const batchSize = bRaw ? parseInt(bRaw) : 2048;
+    const ubatchSize = ubRaw ? parseInt(ubRaw) : 512;
+    const flashAttn = faRaw !== null;
+
+    try {
+        const resp = await fetch('/api/validate-batch-advisor', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ctx_size: ctxSize,
+                batch_size: batchSize,
+                ubatch_size: ubatchSize,
+                flash_attn: flashAttn
+            })
+        });
+
+        const data = await resp.json();
+        const advisorContainer = document.getElementById('batch-advisor-container');
+        if (!advisorContainer) return;
+
+        if (!data.valid || (data.warnings && data.warnings.length > 0)) {
+            advisorContainer.classList.remove('hidden');
+            let html = '<div class="p-3 bg-amber-950/60 border border-amber-600 rounded text-xs space-y-1">';
+            
+            if (data.issues && data.issues.length > 0) {
+                data.issues.forEach(issue => {
+                    html += `<div class="text-rose-400 font-semibold">⚠️ ${issue}</div>`;
+                });
+            }
+            if (data.warnings && data.warnings.length > 0) {
+                data.warnings.forEach(warn => {
+                    html += `<div class="text-amber-300">💡 ${warn}</div>`;
+                });
+            }
+
+            if (data.recommended && Object.keys(data.recommended).length > 0) {
+                html += '<div class="pt-2"><button type="button" id="btn-apply-batch-rec" class="px-2 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded text-xs font-bold">Apply Recommended Parameters</button></div>';
+            }
+            html += '</div>';
+            advisorContainer.innerHTML = html;
+
+            document.getElementById('btn-apply-batch-rec')?.addEventListener('click', () => {
+                if (data.recommended.batch_size) setOrAddLaunchArg('--batch-size', data.recommended.batch_size);
+                if (data.recommended.ubatch_size) setOrAddLaunchArg('--ubatch-size', data.recommended.ubatch_size);
+                if (data.recommended.flash_attn) setOrAddLaunchArg('--flash-attn', '');
+                runBatchAdvisorCheck();
+            });
+        } else {
+            advisorContainer.innerHTML = '';
+            advisorContainer.classList.add('hidden');
+        }
+    } catch (e) {
+        console.error("Batch advisor check error:", e);
+    }
+}
+
+// Attach listeners to context slider / input
+document.getElementById('table-ctx-size-value')?.addEventListener('input', runBatchAdvisorCheck);
+document.getElementById('ctx-slider')?.addEventListener('input', runBatchAdvisorCheck);
 
 // ============================================================================
 // VRAM Calculator
@@ -623,9 +795,6 @@ window.KV_BYTES = {
     'q3_k': 0.375
 };
 
-// Always overwrite — stale values from a previously-opened modal cause cross-model
-// VRAM miscalcs (the new modal's slider/dropdowns are fresh, but block_count etc.
-// would silently inherit from the prior model).
 window.VRAM_CONFIG = {
     kv_cache_multiplier: {{ kv_cache_multiplier or 0 }},
     block_count: {{ block_count or 0 }},
@@ -649,7 +818,6 @@ async function updateVramEstimate() {
     const kvV = document.getElementById('kv-quant-v').value;
 
     try {
-        // Call backend API for calculation (single source of truth)
         const response = await fetch('/api/calculate-vram', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -687,6 +855,7 @@ window.updateCtx = function(value) {
     document.getElementById('ctx-display').textContent = value;
     document.getElementById('table-ctx-size-value').value = value;
     updateVramEstimate();
+    runBatchAdvisorCheck();
 };
 
 window.updateHostInTable = function(value) {
@@ -713,17 +882,14 @@ window.validateLlamaPath = async function() {
     const errorText = document.getElementById('llama-error-text');
     const path = pathInput.value.trim();
 
-    // Clear previous states
     badge.classList.add('hidden');
     errorText.classList.add('hidden');
 
-    // Empty or "default" is valid
     if (!path || path === 'default') {
         pathInput.value = 'default';
         return;
     }
 
-    // Validate the path
     try {
         const response = await fetch('/api/validate-binary-path', {
             method: 'POST',
@@ -738,7 +904,6 @@ window.validateLlamaPath = async function() {
             pathInput.classList.add('border-red-600');
             pathInput.classList.remove('border-gray-700');
         } else if (data.version) {
-            // Update input with resolved path (may have /llama-server appended)
             if (data.resolved_path) {
                 pathInput.value = data.resolved_path;
             }
@@ -773,10 +938,10 @@ window.selectPath = function(path) {
     validateLlamaPath();
 };
 
-// Run calculation on modal load
+// Initial calculations and checks on load
 updateVramEstimate();
-// Auto-load the script preview so the user doesn't have to click Refresh
 loadScriptPreview();
+runBatchAdvisorCheck();
 
 // ---------- Script preview / download / copy ----------
 
@@ -811,8 +976,6 @@ async function copyScriptToClipboard(ev) {
 async function openPasteScriptModal() {
     const input = document.getElementById('paste-script-input');
     document.getElementById('paste-script-warnings').innerHTML = '';
-    // Pre-populate with the current script so the user can edit in place.
-    // Fall back to the preview textarea if the live fetch fails.
     try {
         const resp = await fetch('/api/model-script-raw?model={{ model_name }}');
         input.value = resp.ok ? await resp.text() : (document.getElementById('script-preview').value || '');
@@ -846,11 +1009,9 @@ async function applyPastedScript() {
         return;
     }
 
-    // Populate fields (overwrite always — resolved decision #1 applies to display_name; we apply same rule to other fields when present in paste)
     if (result.display_name) {
         document.querySelector('input[name="display_name"]').value = result.display_name;
     }
-    // Health timeout from meta fence (null = leave blank; user keeps their previous value)
     if (result.health_timeout !== null && result.health_timeout !== undefined) {
         document.getElementById('health-timeout-input').value = result.health_timeout;
     }
@@ -883,14 +1044,12 @@ async function applyPastedScript() {
         if (typeof validateLlamaPath === 'function') validateLlamaPath();
     }
 
-    // Clear existing user-added rows and append the parsed 'advanced' dict
     const table = document.getElementById('launch-args-table');
     table.querySelectorAll('[data-option-key]').forEach(row => row.remove());
     for (const [key, value] of Object.entries(result.advanced || {})) {
         addAdvancedRow(key, value);
     }
 
-    // Render any warnings
     const warnings = result.warnings || [];
     if (warnings.length === 0) {
         warningsBox.innerHTML = '<span class="text-green-400">✓ Applied to form.</span>';
@@ -901,10 +1060,11 @@ async function applyPastedScript() {
     setTimeout(() => {
         document.getElementById('paste-script-modal').classList.add('hidden');
         if (typeof updateVramEstimate === 'function') updateVramEstimate();
+        runBatchAdvisorCheck();
     }, warnings.length === 0 ? 800 : 2500);
 }
 
-// Helper to append an advanced-args row (used by paste-script flow)
+// Appends an advanced-args row
 function addAdvancedRow(key, value) {
     const table = document.getElementById('launch-args-table');
     const row = document.createElement('div');
