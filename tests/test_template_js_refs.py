@@ -21,7 +21,7 @@ URL URLSearchParams FormData WebSocket AbortController TextDecoder
 
 
 def _texts():
-    return {p.relative_to(TEMPLATES).as_posix(): p.read_text() for p in TEMPLATES.rglob("*.html")}
+    return {p.relative_to(TEMPLATES).as_posix(): p.read_text(encoding="utf-8") for p in TEMPLATES.rglob("*.html")}
 
 
 def _defined(all_text: str) -> set:

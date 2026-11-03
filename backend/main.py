@@ -11,6 +11,9 @@ import os
 import sys
 import argparse
 import socket
+from backend.tensor_allocator import compute_tensor_split, validate_batch_parameters
+from pydantic import BaseModel
+from typing import List, Optional
 
 import httpx
 
@@ -800,6 +803,7 @@ async def config_modal(model: str):
             display_name=model_config.display_name or model,
             port=port,
             host=host,
+            gpus=gpu_manager.gpus,
             llama_path=model_config.llama_path or "default",
             advanced_options=advanced_options,
             option_schema=option_schema,
@@ -1430,6 +1434,66 @@ async def delete_model(model_name: str = Form(...), confirm_name: str = Form("")
 # API Routes - Configuration
 # ============================================================================
 
+class SplitCalculationRequest(BaseModel):
+    gpu_ids: List[int]
+    headroom_mb: Optional[float] = 768.0
+    use_total_vram: Optional[bool] = False
+    integer_ratios: Optional[bool] = False
+
+
+class BatchValidationRequest(BaseModel):
+    ctx_size: int
+    batch_size: Optional[int] = None
+    ubatch_size: Optional[int] = None
+    flash_attn: Optional[bool] = False
+
+
+@app.post("/api/calculate-tensor-split", response_class=JSONResponse)
+async def api_calculate_tensor_split(req: SplitCalculationRequest):
+    """Calculates proportional --tensor-split values based on available VRAM across selected GPUs."""
+    try:
+        capacities = {}
+        sorted_ids = sorted(req.gpu_ids)
+        for gid in sorted_ids:
+            if gid in gpu_manager.gpus:
+                gpu_info = gpu_manager.gpus[gid]
+                if req.use_total_vram:
+                    vram_mb = gpu_info.memory * 1024.0
+                else:
+                    free_gb = max(0.0, gpu_info.memory - (gpu_info.mem_used_gb or 0.0))
+                    vram_mb = free_gb * 1024.0
+                capacities[gid] = float(vram_mb)
+            else:
+                return JSONResponse({"error": f"GPU {gid} not recognized"}, status_code=400)
+
+        split_str, fractions = compute_tensor_split(
+            capacities,
+            headroom_mb=req.headroom_mb or 768.0,
+            integer_ratios=req.integer_ratios or False,
+        )
+        return {
+            "tensor_split": split_str,
+            "weights": fractions,
+            "gpu_ids": sorted_ids,
+        }
+    except Exception as e:
+        logger.error(f"Error calculating tensor split: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/api/validate-batch-advisor", response_class=JSONResponse)
+async def api_validate_batch_advisor(req: BatchValidationRequest):
+    """Validates batch and ubatch parameters against context window sizing."""
+    try:
+        result = validate_batch_parameters(
+            ctx_size=req.ctx_size,
+            batch_size=req.batch_size,
+            ubatch_size=req.ubatch_size,
+            flash_attn=req.flash_attn,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error validating batch parameters: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/api/calculate-vram", response_class=JSONResponse)
 async def calculate_vram(
