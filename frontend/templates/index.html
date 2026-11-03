@@ -60,7 +60,7 @@
 
         .table-header {
             display: grid;
-            grid-template-columns: 100px 100px 2fr 100px 120px 80px 50px;
+            grid-template-columns: 100px 100px 2fr 100px 120px 80px 90px;
             gap: 1rem;
             padding: 0.75rem 1rem;
             font-weight: bold;
@@ -75,7 +75,7 @@
 
         .model-row {
             display: grid;
-            grid-template-columns: 100px 100px 2fr 100px 120px 80px 50px;
+            grid-template-columns: 100px 100px 2fr 100px 120px 80px 90px;
             gap: 1rem;
             padding: 0.75rem 1rem;
             align-items: center;
@@ -159,6 +159,19 @@
             cursor: not-allowed;
         }
 
+        /* Failed-load state: a clickable dismiss that clears the error and
+           returns the row to the green LOAD button. Distinct from the green
+           LOAD so a failure never reads as "ready to go". */
+        .btn-dismiss {
+            background: #6b7280;
+            color: white;
+        }
+
+        .btn-dismiss:hover:not(:disabled) {
+            background: #4b5563;
+            box-shadow: 0 0 8px rgba(107, 114, 128, 0.4);
+        }
+
         /* Icon Buttons */
         .btn-icon {
             background: none;
@@ -176,6 +189,11 @@
             color: #e5e7eb;
             border-color: #4b5563;
         }
+
+        /* Chat button only while the model is running. data-status is kept
+           current by the row's status polling, so no re-render is needed. */
+        .column-actions { display: flex; gap: 0.35rem; justify-content: flex-end; }
+        .model-row:not([data-status="running"]) .btn-chat { display: none; }
 
         /* Status Badges */
         .status-badge {
@@ -417,33 +435,49 @@
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
     <!-- Header -->
-    <!-- Auto-load progress banner: empty unless startup auto-load is running -->
+    <!-- Auto-load progress banner: empty unless startup auto-load is running.
+         Polls only while loading (the endpoint answers 286 to stop); auto_load
+         WebSocket events refresh it, so a tab left open across a restart sees it too. -->
     <div id="auto-load-banner"
          hx-get="/api/auto-load-banner"
-         hx-trigger="load, every 2s"
+         hx-trigger="load, every 2s, autoLoadChanged from:body"
          hx-swap="innerHTML"></div>
 
     <header class="bg-gray-800 border-b border-gray-700 px-6 py-4">
         <div class="flex justify-between items-center max-w-7xl mx-auto">
             <h1 class="text-2xl font-bold text-white">🦙 Llama Studio <span class="text-sm text-gray-400 font-normal">{{ app_version }}</span></h1>
             <div class="flex gap-3 items-center">
-                <!-- Store-Current-State button: server-rendered fragment so color/tooltip are correct on first load -->
+                <!-- Store-Current-State button: server-rendered so it is right on first load;
+                     refreshed when the WebSocket reports a model state change, 30s fallback. -->
                 <span id="store-config-btn-wrap"
                       hx-get="/api/startup-store-button"
-                      hx-trigger="load, every 5s"
+                      hx-trigger="load, modelStateChanged from:body, studioResync from:body, every 30s"
                       hx-swap="innerHTML">
                     {{ store_button_html | safe }}
                 </span>
 
-                <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
-                       title="Load stored models when Llama Studio starts">
-                    <input type="checkbox"
-                           id="auto-load-checkbox"
-                           {% if auto_load_on_startup %}checked{% endif %}
-                           onchange="toggleAutoLoadOnStartup(this.checked)"
-                           class="w-3.5 h-3.5 rounded cursor-pointer">
-                    <span>Load on startup</span>
-                </label>
+                <!-- Startup options, stacked so the header stays narrow on phones -->
+                <div class="flex flex-col gap-0.5">
+                    <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
+                           title="Load stored models when Llama Studio starts">
+                        <input type="checkbox"
+                               id="auto-load-checkbox"
+                               {% if auto_load_on_startup %}checked{% endif %}
+                               onchange="toggleAutoLoadOnStartup(this.checked)"
+                               class="w-3.5 h-3.5 rounded cursor-pointer">
+                        <span>Load on startup</span>
+                    </label>
+
+                    <label class="flex items-center gap-1 text-xs text-gray-300 cursor-pointer select-none"
+                           title="When Llama Studio stops or restarts (Ctrl+C, a code reload), leave loaded model servers running and re-attach to them on the next start. Unload from the table to stop a server.">
+                        <input type="checkbox"
+                               id="keep-alive-checkbox"
+                               {% if keep_sessions_on_shutdown %}checked{% endif %}
+                               onchange="toggleKeepAlive(this.checked)"
+                               class="w-3.5 h-3.5 rounded cursor-pointer">
+                        <span>Keep servers alive on shutdown</span>
+                    </label>
+                </div>
 
                 <button type="button"
                         onclick="openSettingsModal()"
@@ -458,22 +492,12 @@
     <!-- Main Content -->
     <main class="max-w-7xl mx-auto px-6 py-6 space-y-8">
 
-        <!-- Configuration Paths Panel (Collapsible) -->
-        <section id="config-paths-panel" class="hidden bg-gray-800 border border-gray-700 rounded p-4">
-            <h2 class="text-sm font-bold text-gray-300 mb-4">Configuration Paths</h2>
-            <div id="config-paths-content"
-                 hx-get="/api/config-paths"
-                 hx-trigger="load"
-                 hx-swap="innerHTML">
-            </div>
-        </section>
-
         <!-- GPU Panel -->
         <section>
             <h2 class="text-lg font-bold text-gray-300 mb-3">GPUs</h2>
             <div id="gpu-panel"
                  hx-get="/api/gpu-panel"
-                 hx-trigger="load, every 30s"
+                 hx-trigger="load, every 30s, studioResync from:body"
                  hx-swap="innerHTML">
             </div>
         </section>
@@ -562,6 +586,20 @@
             }
         }
 
+        // Persist the "Keep servers alive on shutdown" checkbox to app.json
+        async function toggleKeepAlive(enabled) {
+            const fd = new FormData();
+            fd.append('enabled', enabled ? 'true' : 'false');
+            try {
+                const r = await fetch('/api/toggle-keep-alive', { method: 'POST', body: fd });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+            } catch (e) {
+                console.error('toggle keep-alive failed:', e);
+                document.getElementById('keep-alive-checkbox').checked = !enabled;
+                alert('Could not save keep-alive setting: ' + e);
+            }
+        }
+
         // Close modal when pressing Escape
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') {
@@ -581,32 +619,57 @@
             }
         });
 
-        // WebSocket real-time updates
+        // WebSocket real-time updates. The page trusts these for every state
+        // change, so the connection must be known-alive: the server answers
+        // pings, a socket silent for STALE_MS is replaced (phones kill them
+        // without telling the page), and every (re)connect or return to the
+        // tab re-fetches the page's state, since events sent while
+        // disconnected are gone.
         (function() {
-            const WS_URL = `ws://${window.location.host}/ws/status`;
+            const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/status`;
+            const PING_MS = 10000, STALE_MS = 20000;
             let ws = null;
             let retryDelay = 1000;
+            let retryTimer = null;
+            let lastMessage = 0;
+
+            function resync() {
+                htmx.trigger(document.body, 'studioResync');
+            }
 
             function connect() {
+                clearTimeout(retryTimer);
+                if (ws) { ws.onclose = ws.onmessage = ws.onerror = null; ws.close(); }
                 ws = new WebSocket(WS_URL);
 
                 ws.onopen = function() {
                     console.log('WS connected');
                     retryDelay = 1000;
+                    lastMessage = Date.now();
+                    resync();
                 };
 
                 ws.onmessage = function(event) {
+                    lastMessage = Date.now();
                     const data = JSON.parse(event.data);
                     if (data.type === 'model_state_change' && data.html_id) {
                         const selector = `#model-status-${data.html_id}`;
+                        // source = the polling wrapper, so its hx-on::after-request
+                        // runs and copies the new state into the row's data-status
+                        // (without it htmx issues the request from <body>).
                         htmx.ajax('GET',
                             `/api/get-model-status-inner?model=${encodeURIComponent(data.model_name)}`,
-                            { target: selector, swap: 'innerHTML' }
+                            { source: selector, target: selector, swap: 'innerHTML' }
                         );
-                        // Auto-open log viewer when model starts loading
+                        // Show the log while a model loads; close it again when done.
                         if (data.state === 'loading') {
                             setTimeout(() => ensureModelLogOpen(data.html_id), 100);
+                        } else {
+                            finishAutoOpenedLog(data.html_id, data.state);
                         }
+                        htmx.trigger(document.body, 'modelStateChanged');
+                    } else if (data.type === 'auto_load') {
+                        htmx.trigger(document.body, 'autoLoadChanged');
                     } else if (data.type === 'gpu_update') {
                         htmx.ajax('GET', '/api/gpu-panel',
                             { target: '#gpu-panel', swap: 'innerHTML' }
@@ -616,62 +679,79 @@
 
                 ws.onclose = function() {
                     console.log(`WS closed, retrying in ${retryDelay}ms`);
-                    setTimeout(connect, retryDelay);
+                    retryTimer = setTimeout(connect, retryDelay);
                     retryDelay = Math.min(retryDelay * 2, 30000);
                 };
 
                 ws.onerror = function() { ws.close(); };
             }
 
+            function alive() {
+                return ws && ws.readyState === WebSocket.OPEN && Date.now() - lastMessage < STALE_MS;
+            }
+
             connect();
 
-            // Keep-alive ping every 25s
             setInterval(function() {
-                if (ws && ws.readyState === WebSocket.OPEN) {
+                if (alive()) {
                     ws.send('ping');
+                } else if (ws && ws.readyState === WebSocket.OPEN) {
+                    console.log('WS silent too long, reconnecting');
+                    connect();
                 }
-            }, 25000);
+            }, PING_MS);
+
+            // Back on the tab (phone unlocked, app switched back): reconnect at
+            // once if the socket died meanwhile, else just catch up.
+            document.addEventListener('visibilitychange', function() {
+                if (document.visibilityState !== 'visible') return;
+                if (alive()) resync(); else connect();
+            });
         })();
 
         // Log Viewer Functions
-        const openLogs = new Set();
+        // Log viewers the page opened itself when a load started. They close
+        // again when the load ends; a failed load's log stays open to show why.
+        const autoOpenedLogs = new Set();
+
+        function openModelLog(htmlId) {
+            const logRow = document.getElementById(`log-row-${htmlId}`);
+            if (!logRow || !logRow.classList.contains('hidden')) return false;
+            logRow.classList.remove('hidden');
+            // Trigger immediate load when opened
+            htmx.ajax('GET',
+                `/api/model-log-tail?model=${encodeURIComponent(logRow.dataset.modelName)}&lines=30`,
+                { target: `#log-content-${htmlId}`, swap: 'innerHTML' }
+            );
+            initLogAutoScroll(htmlId);
+            return true;
+        }
+
+        function closeModelLog(htmlId) {
+            const logRow = document.getElementById(`log-row-${htmlId}`);
+            if (!logRow) return;
+            logRow.classList.add('hidden');
+            toggleLogPolling(htmlId, false);  // a hidden log must not keep fetching
+            autoOpenedLogs.delete(htmlId);
+        }
 
         function toggleModelLog(htmlId) {
             const logRow = document.getElementById(`log-row-${htmlId}`);
             if (!logRow) return;
-
-            logRow.classList.toggle('hidden');
-
-            if (logRow.classList.contains('hidden')) {
-                openLogs.delete(htmlId);
-            } else {
-                openLogs.add(htmlId);
-                // Trigger immediate load when opened
-                htmx.ajax('GET',
-                    `/api/model-log-tail?model=${encodeURIComponent(logRow.dataset.modelName)}&lines=30`,
-                    { target: `#log-content-${htmlId}`, swap: 'innerHTML' }
-                );
-                // Setup scroll listener for this log viewer
-                initLogAutoScroll(htmlId);
-            }
+            autoOpenedLogs.delete(htmlId);  // the user has taken this one over
+            if (logRow.classList.contains('hidden')) openModelLog(htmlId);
+            else closeModelLog(htmlId);
         }
 
         function ensureModelLogOpen(htmlId) {
-            const logRow = document.getElementById(`log-row-${htmlId}`);
-            if (!logRow) return;
+            if (openModelLog(htmlId)) autoOpenedLogs.add(htmlId);
+        }
 
-            // Only open if currently hidden
-            if (logRow.classList.contains('hidden')) {
-                logRow.classList.remove('hidden');
-                openLogs.add(htmlId);
-                // Trigger immediate load when opened
-                htmx.ajax('GET',
-                    `/api/model-log-tail?model=${encodeURIComponent(logRow.dataset.modelName)}&lines=30`,
-                    { target: `#log-content-${htmlId}`, swap: 'innerHTML' }
-                );
-                // Setup scroll listener for this log viewer
-                initLogAutoScroll(htmlId);
-            }
+        // A load ended (running, failed or cancelled back to idle).
+        function finishAutoOpenedLog(htmlId, state) {
+            if (!autoOpenedLogs.has(htmlId)) return;
+            if (state === 'failed') autoOpenedLogs.delete(htmlId);
+            else closeModelLog(htmlId);
         }
 
         function autoScrollLogViewer(element) {
@@ -707,6 +787,11 @@
             if (enabled) {
                 // Fetch and auto-scroll function using plain fetch
                 const fetchAndScroll = async () => {
+                    // The row was re-rendered (save, rescan): this viewer is gone.
+                    if (!element.isConnected) {
+                        clearInterval(element._pollingInterval);
+                        return;
+                    }
                     try {
                         const url = element.getAttribute('hx-get');
                         const response = await fetch(url);
@@ -741,9 +826,10 @@
 
         let currentSettingsPaths = {
             llama_server: '',
-            models_directory: ''
+            models_directory: '',
+            vllm_binary: ''
         };
-        let filePickerMode = null; // 'llama_server' or 'models_directory'
+        let filePickerMode = null; // 'llama_server', 'models_directory', or 'vllm_binary'
 
         async function openSettingsModal() {
             const modal = document.getElementById('settings-modal');
@@ -753,14 +839,21 @@
                 const settings = await response.json();
                 currentSettingsPaths.llama_server = settings.llama_server;
                 currentSettingsPaths.models_directory = settings.models_directory;
+                currentSettingsPaths.vllm_binary = settings.vllm_binary || '';
 
                 // Update display fields
                 document.getElementById('llama-server-display').value = settings.llama_server;
                 document.getElementById('models-directory-display').value = settings.models_directory;
+                document.getElementById('vllm-binary-display').value = settings.vllm_binary || '';
                 document.getElementById('webui-port-input').value = settings.webui_port || 7999;
                 const versionBadge = document.getElementById('llama-server-version-badge');
                 if (versionBadge) {
                     versionBadge.textContent = settings.llama_server_version || 'unknown';
+                }
+                const vllmBadge = document.getElementById('vllm-version-badge');
+                if (vllmBadge) {
+                    vllmBadge.textContent = settings.vllm_binary
+                        ? (settings.vllm_version || 'unknown') : 'not configured';
                 }
             } catch (e) {
                 console.error('Error loading settings:', e);
@@ -807,8 +900,9 @@
 
         function openFileBrowser(pathType) {
             filePickerMode = pathType;
+            window.filePickerOnSelect = null;  // this pick belongs to Settings
             const currentPath = currentSettingsPaths[pathType] || '/';
-            const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}&modal=settings`;
+            const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}`;
 
             htmx.ajax('GET', url, {
                 target: '#file-browser-content',
@@ -820,17 +914,51 @@
         function closeFileBrowser() {
             document.getElementById('file-browser-modal').classList.add('hidden');
             filePickerMode = null;
+            window.filePickerOnSelect = null;
         }
 
+        // The file browser is shared between this modal and the per-model config
+        // modal. Whoever opens it registers window.filePickerOnSelect; unset
+        // means the Settings fields are the target.
         function selectPath(path) {
-            // Called by file browser when user selects a path
+            if (typeof window.filePickerOnSelect === 'function') {
+                window.filePickerOnSelect(path);
+                return;
+            }
+            if (!filePickerMode) {
+                console.error('selectPath called with no active picker');
+                closeFileBrowser();
+                return;
+            }
             currentSettingsPaths[filePickerMode] = path;
             // Convert underscores to hyphens for HTML ID (llama_server -> llama-server)
             const displayId = filePickerMode.replace(/_/g, '-') + '-display';
-            document.getElementById(displayId).value = path;
+            const field = document.getElementById(displayId);
+            if (field) {
+                field.value = path;
+            } else {
+                console.error('no settings field for picker mode: ' + filePickerMode);
+            }
             closeFileBrowser();
             // Focus back on settings modal
             document.getElementById('settings-modal').focus();
+        }
+
+        // /api/update-config-path answers 200 even on failure (so htmx can swap
+        // its error modal), so every caller must check the error marker —
+        // otherwise a rejected path is reported to the user as saved.
+        async function updateConfigPath(pathType, newPath) {
+            const resp = await fetch('/api/update-config-path', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `path_type=${encodeURIComponent(pathType)}&new_path=${encodeURIComponent(newPath)}`
+            });
+            const html = await resp.text();
+            if (!resp.ok || html.includes('data-config-error')) {
+                const m = html.match(/<p class="text-sm text-gray-300 mb-4">([^<]*)<\/p>/);
+                throw new Error(m ? m[1] : `${pathType}: update failed`);
+            }
+            return html;
         }
 
         async function saveSettings() {
@@ -852,22 +980,21 @@
                 // Step 2: Update llama server
                 if (currentSettingsPaths.llama_server) {
                     statusMsg.textContent = '⏳ Loading llama-server schema...';
-                    await fetch('/api/update-config-path', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `path_type=llama_server&new_path=${encodeURIComponent(currentSettingsPaths.llama_server)}`
-                    });
+                    await updateConfigPath('llama_server', currentSettingsPaths.llama_server);
                     await sleep(1000);
+                }
+
+                // Step 2b: Update vLLM executable (captures the engine's flag
+                // manifest via its own `serve --help`; slow on first run)
+                if (currentSettingsPaths.vllm_binary) {
+                    statusMsg.textContent = '⏳ Validating vLLM + capturing flag manifest (can take a minute on first run)...';
+                    await updateConfigPath('vllm_binary', currentSettingsPaths.vllm_binary);
                 }
 
                 // Step 3: Update models directory
                 if (currentSettingsPaths.models_directory) {
                     statusMsg.textContent = '⏳ Rescanning models...';
-                    await fetch('/api/update-config-path', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: `path_type=models_directory&new_path=${encodeURIComponent(currentSettingsPaths.models_directory)}`
-                    });
+                    await updateConfigPath('models_directory', currentSettingsPaths.models_directory);
                     await sleep(1000);
                 }
 
@@ -940,6 +1067,32 @@
                         </button>
                     </div>
                     <p class="text-xs text-gray-500 mt-2">Path to llama-server executable</p>
+                </fieldset>
+
+                <!-- vLLM Executable Section -->
+                <fieldset>
+                    <legend class="text-sm font-bold text-gray-300 mb-3">
+                        vLLM Executable
+                        <span id="vllm-version-badge"
+                              class="ml-2 inline-block px-2 py-0.5 rounded text-xs font-mono font-normal bg-gray-700 text-gray-300"
+                              title="Detected vllm version">not configured</span>
+                    </legend>
+                    <div class="flex gap-3">
+                        <input type="text"
+                               id="vllm-binary-display"
+                               readonly
+                               class="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded text-sm text-gray-300 font-mono"
+                               placeholder="Optional — enables vLLM model discovery">
+                        <button type="button"
+                                onclick="openFileBrowser('vllm_binary')"
+                                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold">
+                            Browse
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">
+                        Select the venv (or its bin/) containing the vllm executable. Saving runs
+                        <code>vllm serve --help</code> to capture the exact flags this build supports.
+                    </p>
                 </fieldset>
 
                 <!-- Models Directory Section -->

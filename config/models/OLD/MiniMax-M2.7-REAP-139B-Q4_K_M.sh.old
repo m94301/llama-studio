@@ -9,7 +9,7 @@ LLAMA_BIN=/home/m6/projects/llama.cpp/build-cuda-avx1/bin/llama-server
 export CUDA_VISIBLE_DEVICES=1,2,3
 
 exec "$LLAMA_BIN" \
-  -m /home/m6/models/dervig/m51Lab-MiniMax-M2.7-REAP-139B-A10B-GGUF/MiniMax-M2.7-REAP-139B-Q4_K_M.gguf \
+  -m /home/m6/models/drive1/dervig/m51Lab-MiniMax-M2.7-REAP-139B-A10B-GGUF/MiniMax-M2.7-REAP-139B-Q4_K_M.gguf \
   --host 0.0.0.0 \
   --port 8888 \
   --ctx-size 4096 \

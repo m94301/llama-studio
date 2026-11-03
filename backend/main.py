@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import json
+import re
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Dict, Optional
@@ -14,26 +15,33 @@ from backend.tensor_allocator import compute_tensor_split, validate_batch_parame
 from pydantic import BaseModel
 from typing import List, Optional
 
+import httpx
+
 # Add backend directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Update on each release. Surfaced in the page <title> and header.
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.4.0"
 
-from fastapi import FastAPI, BackgroundTasks, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from config_manager import ConfigManager, ModelConfig, calculate_kv_cache_gb
-from launch_script import parse_pasted_script
-import migrate_configs
+from config_manager import ConfigManager, ModelConfig
+from kv_calc import llama_kv_gb
+from engine_flags import flag_manifest, install_vllm_parse_manifests, validate_llama_option
+from launch_script import (
+    canonical_args,
+    parse_pasted_script,
+    patch_meta_fence,
+    manifest_for_binary,
+)
+import chat_proxy
 from gpu_manager import GpuManager, ModelState, LoadingPhase
 from templates import jinja_env
 from event_bus import event_bus
-from llama_options import get_option_schema, validate_option, set_runtime_schema
-from llama_version import get_version
-from schema_parser import parse_help, load_schema, save_schema
+from llama_version import get_vllm_version
 
 # Get project root (one level up from backend directory)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -62,13 +70,13 @@ if verbose_mode:
 # Suppress verbose HTTP access logs to reduce noise and keep app logs visible
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("starlette.middleware.base").setLevel(logging.WARNING)
+# httpx logs every request at INFO: the chat page heartbeat (/v1/models every
+# 5s per open tab) and load health checks would flood the log.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Initialize managers
 config_manager = ConfigManager(PROJECT_ROOT / "config" / "app.json", project_root=PROJECT_ROOT)
 gpu_manager = GpuManager(config_manager)
-
-# Set by lifespan if legacy JSON configs are present at startup; cleared after migration.
-LEGACY_CONFIGS_DETECTED = False
 
 # Progress state for the startup auto-load background task. Cleared when complete.
 AUTO_LOAD_PROGRESS: Dict[str, int] = {"active": 0, "current_index": 0, "total": 0}
@@ -108,17 +116,12 @@ async def lifespan(app: FastAPI):
 
     try:
         await config_manager.load_app_config()
-        # Load or detect llama-server schema BEFORE model scanning
-        await ensure_schema_for_binary(config_manager.app_config.llama_server_binary, config_manager, update_global=True)
+        # Before scanning: a vLLM script's flags decide which tokens are values
+        # and how -tp/-pp normalize, so each is parsed against its own engine's
+        # manifest (captured + cached on first sight), else the default engine's.
+        install_vllm_parse_manifests(_config_dir(), lambda: config_manager.app_config.vllm_binary)
 
-        # Hard-block on legacy JSON configs — they must be migrated to shell scripts.
-        if migrate_configs.has_legacy_configs(PROJECT_ROOT):
-            global LEGACY_CONFIGS_DETECTED
-            LEGACY_CONFIGS_DETECTED = True
-            logger.warning("⚠ Legacy JSON model configs detected — model loading is blocked until migration completes.")
-            logger.warning("   Visit the WebUI and click 'Migrate now', or run: python backend/migrate_configs.py")
-        else:
-            await config_manager.load_all_models()
+        await config_manager.load_all_models()
 
         await gpu_manager.initialize()
 
@@ -130,12 +133,15 @@ async def lifespan(app: FastAPI):
         # Auto-load stored models as a background task so the WebUI is reachable
         # immediately. Each load is async (health-check polling, etc.) and can
         # take 30-120s; the banner endpoint surfaces progress to the UI.
-        if (
-            not LEGACY_CONFIGS_DETECTED
-            and config_manager.app_config.auto_load_on_startup
-            and config_manager.app_config.startup_models
-        ):
+        if config_manager.app_config.auto_load_on_startup and config_manager.app_config.startup_models:
             asyncio.create_task(_auto_load_startup_models())
+
+        # Warm the vllm version cache in the background so the first Settings
+        # open doesn't pay for `vllm --version` importing torch.
+        if config_manager.app_config.vllm_binary:
+            asyncio.create_task(
+                asyncio.to_thread(get_vllm_version, config_manager.app_config.vllm_binary)
+            )
     except Exception as e:
         logger.error(f"✗ Startup failed: {e}")
         raise
@@ -147,70 +153,29 @@ async def lifespan(app: FastAPI):
     logger.info("🦙 Llama Studio Shutting Down")
     logger.info("=" * 60)
     try:
-        await gpu_manager.cleanup()
-        logger.info("✓ All sessions terminated")
+        await gpu_manager.cleanup(keep_alive=config_manager.app_config.keep_sessions_on_shutdown)
     except Exception as e:
         logger.error(f"✗ Error during cleanup: {e}")
 
     logger.info("✓ Shutdown complete")
 
 
-async def ensure_schema_for_binary(binary_path: str, config_mgr, update_global: bool = False) -> str | None:
-    """
-    Validate binary, get version, load or generate+cache schema.
-    Returns version_str on success, None on failure.
-    If update_global=True, updates app_config.llama_schema_version and saves app.json.
-    """
-    config_dir = config_mgr.project_root / "config"
+def _config_dir() -> Path:
+    return config_manager.project_root / "config"
 
-    # Step 1: Always detect binary version
-    version_str = get_version(binary_path)
-    if not version_str:
-        logger.warning(f"⚠ Could not detect llama-server version for {binary_path}")
-        if update_global:
-            set_runtime_schema({})
-        return None
 
-    # Step 2: For global binary, check if version changed
-    if update_global:
-        config = config_mgr.app_config
-        if config.llama_schema_version and config.llama_schema_version == version_str:
-            schema = load_schema(config.llama_schema_version, config_dir)
-            if schema:
-                set_runtime_schema(schema)
-                logger.info(f"✓ Using cached schema: {config.llama_schema_version}")
-                return version_str
-        else:
-            if config.llama_schema_version:
-                logger.info(f"⚠ Binary version changed: {config.llama_schema_version} → {version_str}")
+def _flags(engine: str, binary: Optional[str]) -> Optional[dict]:
+    """The one flag lookup (engine_flags.flag_manifest) against this app's config dir."""
+    return flag_manifest(engine, binary, _config_dir())
 
-    # Step 3: Try to load cached schema for this version
-    schema = load_schema(version_str, config_dir)
-    if schema:
-        if update_global:
-            config_mgr.app_config.llama_schema_version = version_str
-            await config_mgr.save_app_config()
-            set_runtime_schema(schema)
-        logger.info(f"✓ Loaded cached schema for version: {version_str}")
-        return version_str
 
-    # Step 4: Parse help text and generate new schema
-    logger.info(f"⏳ Parsing help text for version: {version_str}")
-    schema = parse_help(binary_path)
-    if not schema:
-        logger.warning(f"⚠ Could not parse llama-server help for {binary_path}")
-        if update_global:
-            set_runtime_schema({})
-        return None
-
-    # Step 5: Save schema
-    save_schema(schema, version_str, config_dir)
-    if update_global:
-        config_mgr.app_config.llama_schema_version = version_str
-        await config_mgr.save_app_config()
-        set_runtime_schema(schema)
-    logger.info(f"✓ Generated and cached schema for version: {version_str}")
-    return version_str
+def _llama_version_label(manifest: Optional[dict]) -> str:
+    """'11067_fe93f196b' -> '11067 (fe93f196b)'; 'unknown' when it couldn't be probed."""
+    version = (manifest or {}).get("version")
+    if not version:
+        return "unknown"
+    parts = version.split("_")
+    return f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version
 
 
 app = FastAPI(title="Llama Studio", lifespan=lifespan)
@@ -232,6 +197,15 @@ else:
     logger.warning(f"⚠ Static files directory not found: {static_dir}")
 
 
+def _render(template: str, **ctx) -> str:
+    return jinja_env.get_template(template).render(**ctx)
+
+
+def _error_fragment(message: str, status_code: int = 500) -> HTMLResponse:
+    """Inline error shown in place of a fragment that failed to render."""
+    return HTMLResponse(_render("snippets/error.html", message=message), status_code=status_code)
+
+
 # ============================================================================
 # API Routes - GPU Panel
 # ============================================================================
@@ -243,31 +217,14 @@ async def gpu_panel():
     gpu_data = gpu_manager.get_gpu_status()
 
     if not gpu_data:
-        return """
-        <div class="text-center py-8 text-gray-400">
-            <p>GPU detection not available</p>
-        </div>
-        """
+        return _render("snippets/empty_state.html", message="GPU detection not available")
 
-    # Machine's local IPv4 address (resolved once, then cached).
-    server_ipv4 = get_server_ipv4()
-
-    html = '<div class="gpu-table">'
-
-    # Render each GPU row with loaded models
-    row_template = jinja_env.get_template("snippets/gpu_row.html")
-    for gpu_id, gpu_info in sorted(gpu_data.items()):
-        memory_pct = (gpu_info["allocated"] / gpu_info["memory"]) * 100 if gpu_info["memory"] > 0 else 0
-
-        html += row_template.render(
-            gpu_id=gpu_id,
-            gpu=gpu_info,
-            memory_pct=memory_pct,
-            server_host=server_ipv4,
-        )
-
-    html += '</div>'
-    return html
+    rows = [
+        (gpu_id, info, (info["allocated"] / info["memory"]) * 100 if info["memory"] > 0 else 0)
+        for gpu_id, info in sorted(gpu_data.items())
+    ]
+    # Machine's local IPv4 (resolved once, then cached) for per-model server links.
+    return _render("snippets/gpu_panel.html", rows=rows, server_host=get_server_ipv4())
 
 
 # ============================================================================
@@ -281,61 +238,39 @@ async def model_list():
     models = config_manager.get_all_models()
     logger.info(f"📋 model_list called: {len(models)} models found")
 
-    # === NEW: Check if llama-server is configured ===
+    # Check if llama-server is configured
     llama_binary = config_manager.app_config.llama_server_binary
     if not Path(llama_binary).exists():
-        return f"""
-        <div class="text-center py-8 text-yellow-400">
-            <p>⚠ Llama-server binary not configured</p>
-            <p class="text-sm text-gray-400 mt-2">Configure path in settings to load models</p>
-        </div>
-        """
+        return _render("snippets/empty_state.html", warn=True,
+                       message="⚠ Llama-server binary not configured",
+                       hint="Configure path in settings to load models")
 
     if not models:
         logger.warning("⚠ No models in config_manager")
-        return '<div class="text-center py-8 text-gray-400"><p>No models found</p></div>'
+        return _render("snippets/empty_state.html", message="No models found")
 
-    # Sort: configured first (alphabetically), then unconfigured (alphabetically)
+    # Sort: configured first, then unconfigured; within each group alphabetical
+    # by the *display name* the table actually shows, case-insensitively (so
+    # e.g. "gemma" and "GLM" interleave the way a human reads them).
     sorted_models = sorted(
         models.items(),
-        key=lambda x: (not x[1].is_configured, x[0])
+        key=lambda x: (not x[1].is_configured,
+                       (x[1].display_name or x[0]).lower())
     )
 
-    html = '<div class="models-table">'
-
+    rows = []
+    for model_name, model_config in sorted_models:
+        port_display = f":{model_config.port}" if model_config.port else "—"
+        vram = model_config.total_need_gb
+        vram_display = f"{vram} GB" if vram else "—"
+        rows.append((model_name, gpu_manager.get_model_state(model_name).value, model_config,
+                     port_display, vram_display, str(config_manager.get_log_path(model_name))))
     try:
-        # Render each model row using the model_row template
-        row_template = jinja_env.get_template("snippets/model_row.html")
-        for model_name, model_config in sorted_models:
-            state = gpu_manager.get_model_state(model_name)
-            status = state.value
-
-            port_display = f":{model_config.port}" if model_config.port else "—"
-
-            # Display total_vram (calculated memory needed) if available, otherwise show file size as fallback
-            if model_config.total_vram:
-                vram_display = f"{model_config.total_vram} GB"
-            elif model_config.size_gb:
-                vram_display = f"{model_config.size_gb} GB"
-            else:
-                vram_display = "—"
-
-            log_path = config_manager.get_log_path(model_name)
-
-            html += row_template.render(
-                model_name=model_name,
-                status=status,
-                model_config=model_config,
-                port_display=port_display,
-                vram_display=vram_display,
-                log_path=str(log_path),
-            )
+        html = _render("snippets/model_list.html", rows=rows)
     except Exception as e:
         logger.error(f"✗ Error rendering model rows: {type(e).__name__}: {e}", exc_info=True)
-        return f'<div class="text-red-500 p-4">Error: {str(e)}</div>'
-
-    html += '</div>'
-    logger.info(f"✓ Generated model list HTML: {len(html)} chars, {len(sorted_models)} models")
+        return _error_fragment(f"Error: {e}", 200)
+    logger.info(f"✓ Generated model list HTML: {len(html)} chars, {len(rows)} models")
     return html
 
 
@@ -348,7 +283,7 @@ async def model_list():
 async def get_model_status_inner(model: str):
     """Return status badge + action button HTML for inner polling."""
     if model not in config_manager.get_all_models():
-        return HTMLResponse('<div class="text-red-400 p-4">Model not found</div>', status_code=404)
+        return _error_fragment("Model not found", 404)
 
     state = gpu_manager.get_model_state(model)
     status = state.value
@@ -375,106 +310,9 @@ async def get_model_status_inner(model: str):
 # ============================================================================
 
 
-def _legacy_migration_page() -> HTMLResponse:
-    """Render a one-page migration UI shown when legacy JSON configs are present."""
-    legacy_files = migrate_configs.find_legacy_configs(PROJECT_ROOT / "config" / "models")
-    file_list_html = "".join(
-        f'<li class="font-mono text-xs text-gray-300 py-1">{p.name}</li>' for p in legacy_files
-    )
-    html = f"""<!DOCTYPE html>
-<html><head><title>Llama Studio — Migration Required</title>
-<script src="https://unpkg.com/htmx.org@1.9.10"></script>
-<script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-900 text-gray-100 min-h-screen flex items-center justify-center p-6">
-  <div class="bg-gray-800 border border-yellow-600 rounded-lg p-6 max-w-2xl w-full">
-    <h1 class="text-2xl font-bold text-yellow-400 mb-3">⚠ Legacy Configs Detected</h1>
-    <p class="text-sm text-gray-300 mb-4">
-      Llama Studio now stores model configs as executable shell scripts (<code>.sh</code>)
-      instead of JSON. Found {len(legacy_files)} legacy file(s) that need to be migrated
-      before models can be loaded.
-    </p>
-    <p class="text-sm text-gray-400 mb-4">
-      Migration is non-destructive: each <code>&lt;name&gt;.json</code> will be converted to
-      <code>&lt;name&gt;.sh</code> and the original renamed to <code>&lt;name&gt;.json.old</code>
-      (kept as a backup for rollback).
-    </p>
-    <details class="mb-4">
-      <summary class="cursor-pointer text-sm text-blue-400 hover:text-blue-300">
-        Show files to migrate
-      </summary>
-      <ul class="mt-2 ml-4 list-disc">{file_list_html}</ul>
-    </details>
-    <div id="migration-result" class="mb-4"></div>
-    <div class="flex gap-3">
-      <button
-        hx-post="/api/run-migration"
-        hx-target="#migration-result"
-        hx-swap="innerHTML"
-        class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">
-        Migrate now
-      </button>
-      <a href="/" class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold text-center">
-        Reload page
-      </a>
-    </div>
-    <p class="text-xs text-gray-500 mt-4">
-      Or run from CLI: <code>python backend/migrate_configs.py</code>
-    </p>
-  </div>
-</body></html>"""
-    return HTMLResponse(html)
-
-
-@app.post("/api/run-migration", response_class=HTMLResponse)
-async def run_migration():
-    """Trigger one-shot JSON -> SH migration and reload models."""
-    global LEGACY_CONFIGS_DETECTED
-    try:
-        successes, failures = migrate_configs.migrate_all(PROJECT_ROOT, dry_run=False)
-    except Exception as e:
-        logger.error(f"✗ Migration failed: {e}", exc_info=True)
-        return HTMLResponse(
-            f'<div class="p-3 bg-red-900 border border-red-600 rounded text-sm">'
-            f'✗ Migration failed: {str(e)}</div>'
-        )
-
-    if failures:
-        body = "<div class='p-3 bg-red-900 border border-red-600 rounded text-sm'>"
-        body += "<p class='font-bold mb-2'>✗ Migration completed with failures:</p><ul class='list-disc ml-4'>"
-        for f in failures:
-            body += f"<li>{f}</li>"
-        body += "</ul></div>"
-        return HTMLResponse(body)
-
-    # All migrated cleanly — clear the flag and load models
-    LEGACY_CONFIGS_DETECTED = False
-    if not migrate_configs.has_legacy_configs(PROJECT_ROOT):
-        try:
-            await config_manager.load_all_models()
-            gpu_manager.sync_models_from_config()
-        except Exception as e:
-            logger.error(f"✗ Error loading models after migration: {e}", exc_info=True)
-
-    body = "<div class='p-3 bg-green-900 border border-green-600 rounded text-sm'>"
-    body += f"<p class='font-bold mb-2'>✓ Migrated {len(successes)} model(s):</p>"
-    body += "<ul class='list-disc ml-4 max-h-48 overflow-y-auto'>"
-    for s in successes:
-        body += f"<li class='text-xs'>{s}</li>"
-    body += "</ul>"
-    body += "<p class='mt-3'>Reload the page to continue.</p>"
-    body += '<a href="/" class="inline-block mt-2 px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded">Reload</a>'
-    body += "</div>"
-    return HTMLResponse(body)
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     """Serve main page with config status."""
-    # If legacy JSON configs exist, render the migration page instead.
-    if LEGACY_CONFIGS_DETECTED:
-        return _legacy_migration_page()
-
     # Check if configuration is complete
     needs_config, error_msg = config_manager.needs_configuration()
     config_incomplete = needs_config
@@ -487,6 +325,7 @@ async def index():
         app_version=APP_VERSION,
         store_button_html=_render_store_button(),
         auto_load_on_startup=config_manager.app_config.auto_load_on_startup,
+        keep_sessions_on_shutdown=config_manager.app_config.keep_sessions_on_shutdown,
     )
 
 
@@ -503,10 +342,8 @@ async def rescan_progress():
     current = RESCAN_STATE.get("current") or "…"
     done = RESCAN_STATE.get("done", 0)
     total = RESCAN_STATE.get("total", 0)
-    return HTMLResponse(
-        f'<span class="text-blue-300">⏳ Rescanning ({done}/{total}): '
-        f'<code class="text-blue-200">{current}</code></span>'
-    )
+    return HTMLResponse(_render("snippets/status_line.html", tone="info",
+                                text=f"⏳ Rescanning ({done}/{total}): ", code=current))
 
 
 @app.post("/api/rescan-models", response_class=HTMLResponse)
@@ -535,14 +372,14 @@ async def rescan_models():
         gpu_manager.sync_models_from_config()
         count = len(config_manager.get_all_models())
         return HTMLResponse(
-            content=f'<span class="text-green-400">✓ Rescanned: {count} model(s) found</span>',
+            content=_render("snippets/status_line.html", tone="ok", text=f"✓ Rescanned: {count} model(s) found"),
             status_code=200,
             headers={"HX-Trigger": "modelsRescanned"},
         )
     except Exception as e:
         logger.error(f"✗ Error rescanning models: {e}")
         return HTMLResponse(
-            content=f'<span class="text-red-400">✗ Error: {str(e)}</span>',
+            content=_render("snippets/status_line.html", tone="error", text=f"✗ Error: {e}"),
             status_code=500,
         )
     finally:
@@ -559,8 +396,8 @@ async def _auto_load_startup_models() -> None:
     port collision, insufficient VRAM, or any load_model exception. Never aborts
     the loop.
 
-    Updates AUTO_LOAD_PROGRESS and AUTO_LOAD_CURRENT_NAME so the banner endpoint
-    can surface progress to the UI.
+    Updates AUTO_LOAD_PROGRESS and AUTO_LOAD_CURRENT_NAME and announces each
+    step over the WebSocket, so open pages refresh the banner.
     """
     global AUTO_LOAD_CURRENT_NAME
     names = sorted(config_manager.app_config.startup_models or [])
@@ -576,17 +413,27 @@ async def _auto_load_startup_models() -> None:
     AUTO_LOAD_PROGRESS["current_index"] = 0
     AUTO_LOAD_CURRENT_NAME = ""
 
+    def announce() -> None:
+        asyncio.create_task(event_bus.broadcast({"type": "auto_load"}))
+
     loaded = 0
     skipped = 0
     try:
         for idx, name in enumerate(names, start=1):
             AUTO_LOAD_PROGRESS["current_index"] = idx
             AUTO_LOAD_CURRENT_NAME = name
+            announce()
             try:
                 try:
                     mc = config_manager.get_model_config(name)
                 except FileNotFoundError:
                     logger.warning(f"   ⏭  {name}: skipped — script no longer exists")
+                    skipped += 1
+                    continue
+
+                if name in gpu_manager.sessions:
+                    # Kept running across the restart and re-attached already.
+                    logger.info(f"   ⏭  {name}: already running (re-attached)")
                     skipped += 1
                     continue
 
@@ -599,7 +446,7 @@ async def _auto_load_startup_models() -> None:
                     skipped += 1
                     continue
 
-                if not mc.is_flexible_split and len(cvd) != mc.gpu_count:
+                if not mc.cvd_matches_split:
                     logger.warning(
                         f"   ⏭  {name}: skipped — CVD has {len(cvd)} GPU(s) but "
                         f"--tensor-split declares {mc.gpu_count}"
@@ -616,6 +463,7 @@ async def _auto_load_startup_models() -> None:
     finally:
         AUTO_LOAD_PROGRESS["active"] = 0
         AUTO_LOAD_CURRENT_NAME = ""
+        announce()
 
     logger.info("=" * 60)
     logger.info(f"🚀 Auto-load complete: {loaded} loaded, {skipped} skipped")
@@ -626,19 +474,17 @@ async def _auto_load_startup_models() -> None:
 async def auto_load_banner():
     """Return banner HTML when startup auto-load is in progress, empty otherwise.
 
-    Polled by the index page. When loading finishes the swap clears the banner.
+    Fetched on page load and on each `auto_load` WebSocket event. When nothing
+    is loading it answers 286, htmx's "stop polling", so the page stops asking.
     """
     if not AUTO_LOAD_PROGRESS.get("active"):
-        return HTMLResponse("")
-    cur = AUTO_LOAD_PROGRESS.get("current_index", 0)
-    tot = AUTO_LOAD_PROGRESS.get("total", 0)
-    name = AUTO_LOAD_CURRENT_NAME or "…"
-    return HTMLResponse(
-        f'<div class="bg-red-900 border border-red-600 text-red-100 px-4 py-2 text-sm flex items-center gap-3">'
-        f'<span class="animate-pulse">⏳</span>'
-        f'<span><b>Auto-loading stored models</b> ({cur}/{tot}): <code class="text-red-200">{name}</code></span>'
-        f'</div>'
-    )
+        return HTMLResponse("", status_code=286)
+    return HTMLResponse(_render(
+        "snippets/auto_load_banner.html",
+        current=AUTO_LOAD_PROGRESS.get("current_index", 0),
+        total=AUTO_LOAD_PROGRESS.get("total", 0),
+        name=AUTO_LOAD_CURRENT_NAME or "…",
+    ))
 
 
 # ============================================================================
@@ -673,18 +519,7 @@ def _render_store_button() -> str:
     state = _startup_state()
     if state["matches"]:
         return ""
-    tooltip_lines = state["stored"] if state["stored"] else ["(nothing stored)"]
-    tooltip = "Stored for startup:\n" + "\n".join(f"• {n}" for n in tooltip_lines)
-    return (
-        f'<button id="store-config-btn" '
-        f'hx-post="/api/store-startup-config" '
-        f'hx-target="#store-config-btn-wrap" hx-swap="innerHTML" '
-        f'title="{tooltip}" '
-        f'class="px-3 py-1 rounded border text-white text-xs font-bold transition-colors '
-        f'bg-green-700 hover:bg-green-600 border-green-500">'
-        f'Store this state to autoload [{state["loaded_count"]} Loaded]'
-        f'</button>'
-    )
+    return _render("snippets/store_button.html", **state)
 
 
 @app.get("/api/startup-config-status", response_class=JSONResponse)
@@ -716,7 +551,7 @@ async def store_startup_config():
     except Exception as e:
         logger.error(f"✗ Error storing startup config: {e}", exc_info=True)
         return HTMLResponse(
-            f'<span class="text-red-400 text-xs">✗ Save failed: {e}</span>',
+            _render("snippets/status_line.html", tone="error", small=True, text=f"✗ Save failed: {e}"),
             status_code=500,
         )
 
@@ -731,6 +566,19 @@ async def toggle_auto_load(enabled: bool = Form(...)):
         return JSONResponse({"auto_load": bool(enabled)})
     except Exception as e:
         logger.error(f"✗ Error toggling auto-load: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/toggle-keep-alive", response_class=JSONResponse)
+async def toggle_keep_alive(enabled: bool = Form(...)):
+    """Update keep_sessions_on_shutdown."""
+    try:
+        config_manager.app_config.keep_sessions_on_shutdown = bool(enabled)
+        await config_manager.save_app_config()
+        logger.info(f"💾 keep_sessions_on_shutdown = {enabled}")
+        return JSONResponse({"keep_alive": bool(enabled)})
+    except Exception as e:
+        logger.error(f"✗ Error toggling keep-alive: {e}", exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -835,54 +683,121 @@ async def save_raw_script(
 
 
 
-@app.get("/api/config-modal-new", response_class=HTMLResponse)
-async def config_modal_new(model: str):
+@app.get("/api/config-modal", response_class=HTMLResponse)
+async def config_modal(model: str):
     """Return improved config modal with form + advanced table + VRAM calculator."""
-    logger.info(f"📝 Edit config (v2) requested for model: {model}")
+    logger.info(f"📝 Edit config requested for model: {model}")
     try:
         model_config = config_manager.get_model_config(model)
 
-        # Determine which schema to use based on model's llama_path
-        version_raw = None
-        if model_config.llama_path and model_config.llama_path != "default":
-            # Use custom binary's schema if available
-            custom_version = get_version(model_config.llama_path)
-            if custom_version:
-                version_raw = custom_version
-                option_schema = load_schema(custom_version, config_manager.project_root / "config")
-                if not option_schema:
-                    logger.warning(f"⚠ Schema not found for custom binary version {custom_version}, using global schema")
-                    option_schema = get_option_schema()
+        # vLLM models get their own modal, saved by /api/save-vllm-config,
+        # which patches the exec line and leaves the env-var preamble intact.
+        if model_config.engine == "vllm":
+            from kv_calc import DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB
 
-        # Fall back to global schema if not using custom binary
-        if not version_raw:
-            version_raw = config_manager.app_config.llama_schema_version
-            option_schema = get_option_schema()
+            manifest = manifest_for_binary(model_config.parsed.llama_bin) or {}
+            args = dict(model_config.launch_args)
+            core_keys = {"--host", "--port", "--max-model-len", "--max-num-seqs",
+                         "--kv-cache-memory-bytes", "--kv-cache-dtype"}
+            mprofile = model_config.parsed.load_profile
+            # KV cache dtype: the engine's own choices, each with its bytes/token,
+            # so the dialog re-sizes when the dropdown changes.
+            kv_dtype = model_config.parsed.kv_cache_dtype
+            kv_choices = (manifest.get("flags", {}).get("--kv-cache-dtype") or {}).get("choices") or [kv_dtype]
+            if kv_dtype not in kv_choices:
+                kv_choices = [kv_dtype] + kv_choices
+            kv_bpt = {d: model_config.kv_bytes_per_token_for(d) for d in kv_choices}
+            bpt, bpt_source = kv_bpt[kv_dtype]
 
-        # Format the version string
-        if version_raw:
-            parts = version_raw.split("_")
-            version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
-        else:
-            version_str = "unknown"
+            gpu_caps = [info["memory"] for info in (gpu_manager.get_gpu_status() or {}).values()]
+            # Utilization is a fraction of each card, so derive it against the
+            # smallest one present; anything larger then has room to spare.
+            gpu_capacity = round(min(gpu_caps), 2) if gpu_caps else 0.0
+
+            # Render the opening VRAM figure server-side. The box previously
+            # relied entirely on JS having run to show anything, so it appeared
+            # blank on open if the script hadn't executed yet.
+            from kv_calc import vram_gb_for
+            initial_ctx = model_config.context_length or 8192
+            initial_conc = model_config.concurrency or 1
+            initial_vram, initial_tokens = ("", 0)
+            if bpt:
+                initial_vram, initial_tokens = vram_gb_for(
+                    context_length=initial_ctx, concurrency=initial_conc,
+                    bytes_per_token=bpt, weights_gb=model_config.size_gb or 0,
+                    headroom=DEFAULT_KV_HEADROOM, gpu_count=model_config.gpu_count,
+                    overhead_gb=(mprofile["runtime_overhead_gb"]
+                                 if mprofile["runtime_overhead_gb"] is not None
+                                 else DEFAULT_OVERHEAD_GB),
+                    weights_per_gpu_gb=mprofile["weights_max_gb"],
+                )
+
+            template = jinja_env.get_template("modals/config_modal_vllm.html")
+            return HTMLResponse(template.render(
+                model_name=model,
+                display_name=model_config.display_name or model,
+                script_text=config_manager.get_script_text(model),
+                config_error=model_config.config_error,
+                # Parse warnings that predict a failed launch (e.g. a layer
+                # partition whose length no longer matches --pipeline-parallel-size)
+                # belong in front of the user before they spend minutes on a load.
+                warnings=[w for w in model_config.parsed.warnings
+                          if "meta fence missing" not in w],
+                gpu_count=model_config.gpu_count,
+                health_timeout=model_config.health_timeout,
+                default_health_timeout=model_config.effective_health_timeout(),
+                host=args.get("--host", "0.0.0.0"),
+                port=args.get("--port", ""),
+                context_length=model_config.context_length or "",
+                concurrency=model_config.concurrency or "",
+                kv_cache_memory_bytes=model_config.kv_cache_memory_bytes or "",
+                max_context=model_config.max_context or 0,
+                advanced_options={k: v for k, v in args.items() if k not in core_keys},
+                option_schema=manifest.get("flags", {}),
+                vllm_version=manifest.get("version", "unknown"),
+                bytes_per_token=bpt or 0,
+                bytes_per_token_source=bpt_source,
+                kv_dtype=kv_dtype,
+                kv_bpt=kv_bpt,
+                kv_dtype_in_script="--kv-cache-dtype" in args,
+                weights_gb=model_config.size_gb or 0,
+                overhead_gb=(mprofile["runtime_overhead_gb"]
+                             if mprofile["runtime_overhead_gb"] is not None
+                             else DEFAULT_OVERHEAD_GB),
+                weights_per_gpu_gb=mprofile["weights_max_gb"] or 0,
+                kv_headroom=DEFAULT_KV_HEADROOM,
+                env_assignments=model_config.parsed.env_assignments,
+                pp_size=model_config.parsed.pipeline_parallel_size,
+                gpu_capacity=gpu_capacity,
+                initial_vram=initial_vram,
+                initial_tokens=initial_tokens,
+            ))
+
+        # Options and version of the binary this script actually runs.
+        manifest = await asyncio.to_thread(
+            _flags, "llamacpp",
+            model_config.llama_bin_absolute or config_manager.app_config.llama_server_binary,
+        )
+        option_schema = (manifest or {}).get("flags", {})
+        version_str = _llama_version_label(manifest)
 
         # Split launch_args into individual options
         launch_args = model_config.launch_args or {}
 
-        # Extract context and KV quantization settings for VRAM calculator
-        # Long form first — matches the lookup order in _calculate_total_vram()
-        current_ctx = launch_args.get("--ctx-size") or launch_args.get("-c") or "4096"
-        current_ctk = launch_args.get("--cache-type-k") or launch_args.get("-ctk") or "f16"
-        current_ctv = launch_args.get("--cache-type-v") or launch_args.get("-ctv") or "f16"
+        # Context and KV quantization for the VRAM calculator (parsed args are
+        # always long-form).
+        current_ctx = launch_args.get("--ctx-size") or "4096"
+        current_ctk = launch_args.get("--cache-type-k") or "f16"
+        current_ctv = launch_args.get("--cache-type-v") or "f16"
 
-        # Remove -c, -ctk, -ctv from advanced_options to prevent duplication
+        # These have their own rows in the modal; keep them out of the free-form table.
         advanced_options = {k: v for k, v in launch_args.items()
-                           if k not in ["--host", "--port", "-c", "--ctx-size", "-ctk", "--cache-type-k", "-ctv", "--cache-type-v"]}
+                           if k not in ("--host", "--port", "--ctx-size", "--cache-type-k", "--cache-type-v")}
         host = launch_args.get("--host", "0.0.0.0")
         port = launch_args.get("--port", model_config.port or "")
 
         # Render template
-        template = jinja_env.get_template("modals/config_modal_new.html")
+        template = jinja_env.get_template("modals/config_modal_llama.html")
         html = template.render(
             model_name=model,
             display_name=model_config.display_name or model,
@@ -907,19 +822,41 @@ async def config_modal_new(model: str):
         )
         return HTMLResponse(html)
     except Exception as e:
-        logger.error(f"✗ Error in config_modal_new: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        logger.error(f"✗ Error in config_modal: {type(e).__name__}: {e}", exc_info=True)
+        return _error_fragment(f"Error: {e}")
 
 
-@app.post("/api/save-model-config-new", response_class=HTMLResponse)
-async def save_model_config_new(
+@app.post("/api/save-llama-config", response_class=HTMLResponse)
+async def save_llama_config(
     model_name: str = Form(...),
     core_json: str = Form(...),
     advanced_json: str = Form(...),
+    source_model: str = Form(""),
 ):
-    """Save config with validation at each step."""
-    logger.info(f"💾 Saving config (v2) for model: {model_name}")
+    """Save config with validation at each step.
+
+    'Save As': when source_model is set and differs from model_name, the current
+    edits are written to a new <model_name>.sh serving the same weights as the
+    source, leaving the source untouched.
+    """
+    src = source_model.strip() or model_name
+    is_save_as = bool(source_model.strip() and source_model.strip() != model_name)
+    logger.info(
+        f"💾 {'Save-As' if is_save_as else 'Saving'} llama.cpp config for model: "
+        f"{src + ' → ' + model_name if is_save_as else model_name}"
+    )
     try:
+        if is_save_as:
+            name_error = _validate_new_script_name(model_name)
+            if name_error:
+                return name_error
+        # Each engine's form posts to its own endpoint (the field sets differ).
+        try:
+            if config_manager.get_model_config(src).engine == "vllm":
+                return _error_modal("vLLM models are saved by the vLLM config editor.")
+        except FileNotFoundError:
+            return _error_modal(f"Model not found: {src}")
+
         # Parse core fields
         try:
             core_data = json.loads(core_json)
@@ -935,6 +872,7 @@ async def save_model_config_new(
         llama_path = core_data.get("llama_path", "default")
         if not llama_path or llama_path.strip() == "":
             llama_path = "default"
+        llama_bin = config_manager.app_config.llama_server_binary if llama_path == "default" else llama_path
 
         if not port:
             return _error_modal("Port is required")
@@ -975,11 +913,12 @@ async def save_model_config_new(
         # advanced for the launch_args dict. Running them through the schema
         # validator on top would re-flag any schema-type drift.
         CORE_FIELDS_SKIP = {"--host", "-h", "--port", "-p"}
+        flags = ((await asyncio.to_thread(_flags, "llamacpp", llama_bin)) or {}).get("flags")
         invalid_keys = []
         for key, value in advanced_data.items():
             if key in CORE_FIELDS_SKIP:
                 continue
-            is_valid, error_msg = validate_option(key, str(value))
+            is_valid, error_msg = validate_llama_option(key, str(value), flags)
             if not is_valid:
                 invalid_keys.append(key)
                 logger.warning(f"⚠ Invalid option in config: {key} ({error_msg})")
@@ -989,11 +928,13 @@ async def save_model_config_new(
         if invalid_keys:
             logger.info(f"⚠ Model {model_name} has invalid options: {invalid_keys}")
 
-        # Build launch_args from core + advanced
-        launch_args = {"--host": host, "--port": str(port), **advanced_data}
+        # Build launch_args from core + advanced. Rows the user typed may use
+        # short aliases (-c); canonicalize as the parser does so everything
+        # downstream sees one spelling.
+        launch_args = canonical_args({"--host": host, "--port": str(port), **advanced_data})
 
         # Validate --tensor-split if present: must be a comma-separated list of positive numbers.
-        ts_raw = launch_args.get("--tensor-split") or launch_args.get("-ts")
+        ts_raw = launch_args.get("--tensor-split")
         new_split_count = 1
         if ts_raw is not None and str(ts_raw).strip() != "":
             parts = [p.strip() for p in str(ts_raw).split(",") if p.strip()]
@@ -1007,35 +948,14 @@ async def save_model_config_new(
                 return _error_modal(
                     f"--tensor-split weights must all be positive: got {ts_raw!r}"
                 )
-            new_split_count = len(weights)
-
-        # A flexible-split model (--split-mode layer/row, no --tensor-split) can
-        # keep a CVD of any length, so its prior GPU assignment survives a save.
-        sm_raw = launch_args.get("--split-mode") or launch_args.get("-sm")
-        new_is_flexible_split = (
-            new_split_count == 1
-            and sm_raw is not None
-            and str(sm_raw).strip().lower() in ("layer", "row")
-        )
-
-        # Get existing model config to preserve model_path and (if still valid) CVD
-        existing_config = config_manager.get_model_config(model_name)
-        prior_cvd = existing_config.cuda_visible_devices  # captured before save_model_script clobbers it
-
-        # Resolve llama_bin: "default" -> use app config's binary
-        if llama_path == "default":
-            llama_bin = config_manager.app_config.llama_server_binary
-        else:
-            llama_bin = llama_path
 
         try:
-            model_config = config_manager.save_model_script(
-                model_name,
-                display_name=display_name or existing_config.display_name,
-                model_path=existing_config.model_path,
-                llama_bin=llama_bin,
+            model_config = config_manager.save_script_edits(
+                src, model_name,
                 args=launch_args,
+                display_name=display_name or config_manager.get_model_config(src).display_name,
                 health_timeout=health_timeout,
+                llama_bin=llama_bin,
             )
         except Exception as e:
             logger.error(f"✗ Failed to save script: {e}", exc_info=True)
@@ -1044,43 +964,32 @@ async def save_model_config_new(
         if not model_config:
             return _error_modal(f"Model {model_name} not found after save")
 
-        # Re-apply prior CVD if it survives validation against the new --tensor-split count.
-        # save_model_script wipes everything below the meta fence, so we must explicitly
-        # restore CVD that's still consistent with the saved split. Mismatched CVDs are
-        # silently dropped (the picker will surface re-pick at next load).
-        if prior_cvd is not None:
-            if new_is_flexible_split or len(prior_cvd) == new_split_count:
-                model_config = config_manager.save_cuda_visible_devices(model_name, prior_cvd)
-            else:
-                logger.info(
-                    f"⚠ Dropping stale CUDA_VISIBLE_DEVICES for {model_name}: "
-                    f"had {len(prior_cvd)} GPU(s), tensor-split now declares {new_split_count}"
-                )
+        # A GPU assignment that no longer fits the saved split is dropped; the
+        # picker asks again at the next load.
+        if model_config.cuda_visible_devices and not model_config.cvd_matches_split:
+            logger.info(
+                f"⚠ Dropping stale CUDA_VISIBLE_DEVICES for {model_name}: "
+                f"{len(model_config.cuda_visible_devices)} GPU(s) no longer match a "
+                f"{model_config.gpu_count}-GPU split"
+            )
+            model_config = config_manager.save_cuda_visible_devices(model_name, None)
 
         logger.info(f"✓ Script saved for {model_name}")
+        # Save-As and normal save both end on the confirmation popup.
         return _save_success_modal(model_config, invalid_keys=invalid_keys)
     except Exception as e:
-        logger.error(f"✗ Error in save_model_config_new: {type(e).__name__}: {e}", exc_info=True)
+        logger.error(f"✗ Error in save_llama_config: {type(e).__name__}: {e}", exc_info=True)
         return _error_modal(f"Error saving configuration: {str(e)}")
 
 
 def _save_success_modal(model_config: ModelConfig, invalid_keys=None) -> str:
-    """Helper to generate the save-success modal HTML.
+    """Save-confirmation modal.
 
-    If the model is currently loaded (or loading), surface a warning that the
-    running process is still using the prior args, and offer to unload now or
-    keep the prior load running until the user is ready to relaunch.
+    If the model is currently loaded (or loading), it warns that the running
+    process still uses the prior args and offers to unload now or keep it.
     """
     invalid_keys = invalid_keys or []
-    is_configured = model_config.is_configured
-
-    # Detect "currently in use" state: a session exists or model is RUNNING/LOADING.
-    is_loaded = (
-        model_config.name in gpu_manager.sessions
-        or gpu_manager.get_model_state(model_config.name) in (ModelState.RUNNING, ModelState.LOADING)
-    )
-
-    if is_configured:
+    if model_config.is_configured:
         status_text = "✓ Model is now configured!"
     elif invalid_keys:
         status_text = f"⚠ Configuration saved but model is unconfigured (invalid options: {', '.join(invalid_keys)})"
@@ -1088,91 +997,38 @@ def _save_success_modal(model_config: ModelConfig, invalid_keys=None) -> str:
         status_text = f"⚠ Configuration saved — {model_config.config_error}"
     else:
         status_text = "⚠ Configuration saved but model is still unconfigured"
-    status_color = "green" if is_configured else "yellow"
-
-    # Mode-specific block: loaded-model warning + actions, OR plain OK button
-    if is_loaded:
-        body_html = f"""
-            <div class="mt-2 mb-4 p-3 rounded border border-yellow-600 bg-yellow-900 bg-opacity-25">
-                <p class="text-sm text-yellow-300 font-bold mb-1">⚠ This model is currently loaded.</p>
-                <p class="text-xs text-gray-300">
-                    The running process is still using the previous launch args. Unload now to apply
-                    the new configuration on next load, or keep the prior load running.
-                </p>
-            </div>
-            <div class="flex gap-2">
-                <button onclick="document.getElementById('modal').remove(); refreshModelList();"
-                        class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                    Keep prior load
-                </button>
-                <button hx-get="/api/unload-confirm?model={model_config.name}"
-                        hx-target="#modal-container" hx-swap="innerHTML"
-                        class="flex-1 px-4 py-2 rounded bg-yellow-600 hover:bg-yellow-500 text-white font-bold transition-colors">
-                    Unload now
-                </button>
-            </div>
-        """
-    else:
-        body_html = f"""
-            <button onclick="closeModalAndRefresh();"
-                    class="w-full px-4 py-2 rounded bg-{status_color}-600 hover:bg-{status_color}-500 text-white font-bold transition-colors">
-                OK
-            </button>
-        """
-
-    return f"""
-    <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-         id="modal"
-         onclick="if(event.target.id === 'modal') closeModalAndRefresh();">
-        <div class="bg-gray-800 border border-{status_color}-600 rounded-lg p-6 w-full max-w-md"
-             onclick="event.stopPropagation()">
-            <div class="flex items-center space-x-3 mb-4">
-                <span class="text-2xl">{'✓' if is_configured else '⚠'}</span>
-                <h2 class="text-lg font-bold text-{status_color}-400">Configuration Saved</h2>
-            </div>
-            <p class="text-sm text-gray-400 mb-1">{model_config.display_name}</p>
-            <p class="text-sm text-gray-300 mb-4">{status_text}</p>
-            {body_html}
-        </div>
-    </div>
-    <script>
-    function refreshModelList() {{
-        setTimeout(() => {{
-            htmx.ajax('GET', '/api/model-list', {{ target: '#models-container', swap: 'innerHTML' }});
-        }}, 100);
-    }}
-    function closeModalAndRefresh() {{
-        document.getElementById('modal').remove();
-        refreshModelList();
-    }}
-    refreshModelList();
-    </script>
-    """
+    return _render(
+        "modals/save_success.html",
+        model_name=model_config.name,
+        display_name=model_config.display_name,
+        is_configured=model_config.is_configured,
+        status_text=status_text,
+        is_loaded=(
+            model_config.name in gpu_manager.sessions
+            or gpu_manager.get_model_state(model_config.name) in (ModelState.RUNNING, ModelState.LOADING)
+        ),
+    )
 
 
 def _error_modal(message: str) -> str:
-    """Helper to generate error modal HTML."""
-    return f"""
-    <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-         id="modal"
-         onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-        <div class="bg-gray-800 border border-red-600 rounded-lg p-6 w-full max-w-md"
-             onclick="event.stopPropagation()">
-            <div class="flex justify-between items-center mb-4">
-                <h2 class="text-lg font-bold text-red-400">Configuration Error</h2>
-                <button onclick="document.getElementById('modal').remove();"
-                        class="text-gray-400 hover:text-white text-2xl">
-                    ×
-                </button>
-            </div>
-            <p class="text-sm text-gray-300 mb-4">{message}</p>
-            <button onclick="document.getElementById('modal').remove();"
-                    class="w-full px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                Close
-            </button>
-        </div>
-    </div>
-    """
+    return _render("modals/message.html", tone="error", title="Configuration Error", message=message)
+
+
+# --- Save As helpers (shared by both structured-save endpoints) -------------
+
+def _validate_new_script_name(name: str) -> Optional[str]:
+    """Validate a Save-As target name. Returns an error-modal HTML string if the
+    name is unusable as a new script filename, else None. The name becomes the
+    <name>.sh filename, so it is restricted to filename-safe characters and must
+    not collide with an existing script."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        return _error_modal(
+            "New name may contain only letters, numbers, dot, dash and "
+            "underscore (it becomes the script filename)."
+        )
+    if config_manager.get_script_path(name).exists():
+        return _error_modal(f"A script named '{name}' already exists. Pick another name.")
+    return None
 
 
 # ============================================================================
@@ -1188,18 +1044,14 @@ def _stored_cvd_usability(model_config: ModelConfig, gpu_data: dict) -> tuple:
     slot is OK and the CVD count matches the model's split count.
     """
     cvd = model_config.cuda_visible_devices or []
-    if model_config.is_flexible_split:
-        # Flexible split: any CVD of length >= 1 is valid; the share is the total
-        # divided evenly across however many GPUs the CVD names.
-        fallback = model_config.total_vram or model_config.size_gb or 0
-        needs = model_config.per_gpu_vram(count=len(cvd)) or [fallback / max(1, len(cvd))] * max(1, len(cvd))
-        if len(cvd) < 1 or len(needs) != len(cvd):
-            return [], False
-    else:
-        needs = model_config.per_gpu_vram() or [model_config.total_vram or model_config.size_gb or 0]
-        if model_config.gpu_count != len(cvd) or len(needs) != len(cvd):
-            # Count mismatch (or no CVD): caller treats this as "force picker"
-            return [], False
+    # A count mismatch (or no CVD) makes the caller force the picker.
+    if not model_config.cvd_matches_split:
+        return [], False
+    needs = model_config.need_per_gpu(
+        [gpu_data[gid]["memory"] if gid in gpu_data else 0.0 for gid in cvd]
+    )
+    if len(needs) != len(cvd):
+        return [], False
 
     slots = []
     all_ok = True
@@ -1239,11 +1091,11 @@ async def gpu_selector(model: str, force_pick: int = 0):
     try:
         model_config = config_manager.get_model_config(model)
         if not model_config.is_configured:
-            return HTMLResponse('<div class="text-red-500 p-4">Model not configured</div>')
+            return _error_fragment("Model not configured", 200)
 
         gpu_data = gpu_manager.get_gpu_status()
         if not gpu_data:
-            return HTMLResponse('<div class="text-red-500 p-4">No GPUs detected</div>')
+            return _error_fragment("No GPUs detected", 200)
 
         for gid, info in gpu_data.items():
             info["memory_pct"] = (info["allocated"] / info["memory"]) * 100 if info["memory"] > 0 else 0
@@ -1275,7 +1127,7 @@ async def gpu_selector(model: str, force_pick: int = 0):
         # The user picks any set of GPUs (>=1); the model splits evenly across
         # them. Per-GPU need is computed live in the template as total / count.
         if model_config.is_flexible_split:
-            total_need = model_config.total_vram or model_config.size_gb or 0
+            total_need = model_config.total_need_gb
             template = jinja_env.get_template("modals/gpu_flex_picker.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -1287,9 +1139,10 @@ async def gpu_selector(model: str, force_pick: int = 0):
 
         # Multi-pick path: tensor-split present, no usable CVD (or forced)
         if gpu_count > 1:
-            per_gpu_need = model_config.per_gpu_vram() or [
-                (model_config.total_vram or model_config.size_gb or 0) / gpu_count
-            ] * gpu_count
+            # The GPUs aren't picked yet; size against the largest card, so a
+            # vLLM figure (which scales with capacity) errs high.
+            max_mem = max((g["memory"] for g in gpu_data.values()), default=0)
+            per_gpu_need = model_config.need_per_gpu([max_mem] * gpu_count)
             template = jinja_env.get_template("modals/gpu_multi_picker.html")
             return HTMLResponse(template.render(
                 model_name=model,
@@ -1299,20 +1152,26 @@ async def gpu_selector(model: str, force_pick: int = 0):
                 gpu_data=gpu_data,
             ))
 
-        # Single-GPU picker (unchanged behavior for non-split models)
+        # Single-GPU picker: the need on each candidate GPU on its own.
+        need_by_gpu = {
+            gid: model_config.need_per_gpu([info["memory"]])[0]
+            for gid, info in gpu_data.items()
+        }
+
         template = jinja_env.get_template("modals/gpu_selector.html")
         return HTMLResponse(template.render(
             model_name=model,
             model_config=model_config,
             display_name=model_config.display_name or model,
             gpu_data=gpu_data,
+            need_by_gpu=need_by_gpu,
         ))
     except FileNotFoundError as e:
         logger.error(f"✗ Model {model} not found: {e}")
-        return HTMLResponse('<div class="text-red-500 p-4">Model not found</div>', status_code=404)
+        return _error_fragment("Model not found", 404)
     except Exception as e:
         logger.error(f"✗ Error in gpu_selector: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/trigger-load", response_class=HTMLResponse)
@@ -1353,7 +1212,7 @@ document.getElementById("modal")?.remove();
 </script>'''
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.get("/api/unload-confirm", response_class=HTMLResponse)
@@ -1368,7 +1227,7 @@ async def unload_confirm(model: str):
         ))
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/trigger-unload", response_class=HTMLResponse)
@@ -1394,7 +1253,7 @@ document.getElementById("modal")?.remove();
 </script>'''
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.get("/api/cancel-confirm", response_class=HTMLResponse)
@@ -1409,7 +1268,7 @@ async def cancel_confirm(model: str):
         ))
     except Exception as e:
         logger.error(f"✗ Error: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/trigger-cancel", response_class=HTMLResponse)
@@ -1434,7 +1293,7 @@ document.getElementById("modal")?.remove();
 </script>'''
     except Exception as e:
         logger.error(f"✗ Error cancelling {model_name}: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/clear-error", response_class=HTMLResponse)
@@ -1470,7 +1329,105 @@ async def clear_error(model_name: str = Form(...)):
         return html
     except Exception as e:
         logger.error(f"✗ Error clearing error: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
+
+
+@app.get("/api/delete-script-confirm", response_class=HTMLResponse)
+async def delete_script_confirm(model: str):
+    """Confirmation modal for deleting a model's launch script."""
+    try:
+        model_config = config_manager.get_model_config(model)
+    except FileNotFoundError:
+        return _error_fragment("Model not found", 404)
+    state = gpu_manager.get_model_state(model)
+    running = state in (ModelState.RUNNING, ModelState.LOADING)
+    siblings = config_manager.sibling_script_count(model)
+    winfo = config_manager.model_weight_info(model)
+    # Deleting the weights is offered only when this is the sole script for them,
+    # nothing else references them (drafter/projector), and they aren't a symlink.
+    can_delete_weights = (
+        siblings == 0 and winfo["exists"]
+        and not winfo["referenced_by"] and not winfo["is_symlink"]
+    )
+    template = jinja_env.get_template("modals/delete_script_confirm.html")
+    return HTMLResponse(template.render(
+        model_name=model,
+        display_name=model_config.display_name or model,
+        running=running,
+        siblings=siblings,
+        sole=(siblings == 0),
+        weights_exist=winfo["exists"],
+        weight_size_gb=winfo["size_gb"],
+        weight_is_dir=winfo["is_dir"],
+        weight_is_symlink=winfo["is_symlink"],
+        weight_referenced_by=winfo["referenced_by"],
+        weight_path=winfo["path"] or "",
+        can_delete_weights=can_delete_weights,
+    ))
+
+
+@app.post("/api/delete-script", response_class=HTMLResponse)
+async def delete_script(model_name: str = Form(...)):
+    """Delete a model's launch script (weights untouched). Refuses while the
+    model is loaded. If it was the only script for an on-disk model, the model
+    is gone, so a rescan will not bring it back."""
+    logger.info(f"🗑 Delete script requested: {model_name}")
+    state = gpu_manager.get_model_state(model_name)
+    if state in (ModelState.RUNNING, ModelState.LOADING):
+        return _error_modal(
+            f"'{model_name}' is currently loaded. Unload it before deleting its script."
+        )
+    try:
+        result = config_manager.delete_script(model_name)
+    except FileNotFoundError:
+        return _error_modal(f"No script found for '{model_name}'.")
+    except Exception as e:
+        logger.error(f"✗ Delete failed for {model_name}: {e}", exc_info=True)
+        return _error_modal(f"Failed to delete script: {e}")
+    # Reflect the deletion in the loaded set.
+    await config_manager.load_all_models()
+    # Close the modal and refresh the table from the server.
+    return HTMLResponse(
+        '<script>'
+        'document.getElementById("modal")?.remove();'
+        'htmx.ajax("GET", "/api/model-list", {target: "#models-container", swap: "innerHTML"});'
+        '</script>'
+    )
+
+
+@app.post("/api/delete-model", response_class=HTMLResponse)
+async def delete_model(model_name: str = Form(...), confirm_name: str = Form("")):
+    """Delete a model's script AND its weights from disk. Irreversible for the
+    weights. Requires YES typed back, refuses while loaded, and refuses if
+    another script references the weights."""
+    logger.info(f"🗑💥 Delete MODEL (weights) requested: {model_name}")
+    if confirm_name.strip().upper() != "YES":
+        return _error_modal(
+            "Deletion not confirmed, so nothing was deleted. "
+            "To delete the weights, type YES in the confirmation box."
+        )
+    state = gpu_manager.get_model_state(model_name)
+    if state in (ModelState.RUNNING, ModelState.LOADING):
+        return _error_modal(
+            f"'{model_name}' is currently loaded. Unload it before deleting it."
+        )
+    try:
+        result = config_manager.delete_model(model_name)
+    except FileNotFoundError:
+        return _error_modal(f"No script found for '{model_name}'.")
+    except ValueError as e:
+        return _error_modal(f"Cannot delete: {e}.")
+    except Exception as e:
+        logger.error(f"✗ Delete model failed for {model_name}: {e}", exc_info=True)
+        return _error_modal(f"Failed to delete model: {e}")
+    await config_manager.load_all_models()
+    logger.info(f"✓ Deleted {model_name}: {result['gb']} GB freed")
+    return HTMLResponse(
+        '<script>'
+        'document.getElementById("modal")?.remove();'
+        'htmx.ajax("GET", "/api/model-list", {target: "#models-container", swap: "innerHTML"});'
+        '</script>'
+    )
 
 
 # ============================================================================
@@ -1549,7 +1506,7 @@ async def calculate_vram(
 ):
     """Calculate total VRAM needed for a model."""
     try:
-        kv_cache_gb = calculate_kv_cache_gb(block_count, ctx_size, kv_cache_multiplier, cache_type_k, cache_type_v)
+        kv_cache_gb = llama_kv_gb(block_count, ctx_size, kv_cache_multiplier, cache_type_k, cache_type_v)
         return {
             "total": round(size_gb + kv_cache_gb, 2),
             "weights": round(size_gb, 2),
@@ -1560,84 +1517,253 @@ async def calculate_vram(
         return {"error": str(e)}
 
 
+@app.post("/api/save-vllm-config", response_class=HTMLResponse)
+async def save_vllm_config(
+    model_name: str = Form(...),
+    display_name: str = Form(""),
+    health_timeout: str = Form(""),
+    args_json: str = Form(...),
+    env_json: str = Form("{}"),
+    source_model: str = Form(""),
+):
+    """Structured save for a vLLM model — rewrites only the exec line (§2.2).
+
+    The meta fence takes display_name / health_timeout; everything else is an
+    engine argument and goes into the invocation. The script's preamble (env
+    exports, tuning comments, variable defaults) is preserved byte-for-byte,
+    and arguments the user didn't change keep their original spelling, so
+    `$VAR` indirection survives.
+
+    'Save As': when source_model is set and differs from model_name, the current
+    (unsaved) form edits are applied to the SOURCE script's preamble and written
+    to a brand-new <model_name>.sh, leaving the source untouched.
+    """
+
+    src = source_model.strip() or model_name
+    is_save_as = bool(source_model.strip() and source_model.strip() != model_name)
+    if is_save_as:
+        logger.info(f"💾 Save-As vLLM: {src} → {model_name}")
+        name_error = _validate_new_script_name(model_name)
+        if name_error:
+            return name_error
+    else:
+        logger.info(f"💾 Saving vLLM config for: {model_name}")
+
+    try:
+        mc = config_manager.get_model_config(src)
+    except FileNotFoundError:
+        return _error_modal(f"Model not found: {src}")
+    if mc.engine != "vllm":
+        return _error_modal(f"{src} is not a vLLM model")
+
+    try:
+        args = json.loads(args_json)
+    except json.JSONDecodeError as e:
+        return _error_modal(f"Could not parse launch arguments: {e}")
+    if not isinstance(args, dict):
+        return _error_modal("Launch arguments must be an object")
+
+    ht: Optional[int] = None
+    if health_timeout.strip():
+        try:
+            ht = int(health_timeout)
+        except ValueError:
+            return _error_modal("Health-check timeout must be a whole number of seconds.")
+        from launch_script import HEALTH_TIMEOUT_MAX, HEALTH_TIMEOUT_MIN
+        if not (HEALTH_TIMEOUT_MIN <= ht <= HEALTH_TIMEOUT_MAX):
+            return _error_modal(
+                f"Health-check timeout must be between {HEALTH_TIMEOUT_MIN} and {HEALTH_TIMEOUT_MAX} seconds."
+            )
+
+    for key in ("--max-model-len", "--max-num-seqs", "--kv-cache-memory-bytes"):
+        value = args.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if int(value) <= 0:
+                return _error_modal(f"{key} must be a positive whole number.")
+        except (TypeError, ValueError):
+            return _error_modal(f"{key} must be a whole number, got {value!r}.")
+
+    # Refuse to write a configuration that would fill a card. Checked here
+    # rather than only at load time, because the damage is done by the config
+    # existing: a load that OOMs mid-GEMM can wedge the GPU entirely.
+    from kv_calc import DEFAULT_OVERHEAD_GB, GIB, headroom_ok, MIN_HEADROOM_GB
+    budget = args.get("--kv-cache-memory-bytes")
+    caps = [i["memory"] for i in (gpu_manager.get_gpu_status() or {}).values()]
+    if budget and caps:
+        profile = mc.parsed.load_profile
+        gpus = max(1, mc.gpu_count)
+        weights = profile["weights_max_gb"] or (mc.size_gb or 0.0) / gpus
+        overhead = profile["runtime_overhead_gb"]
+        if overhead is None:
+            overhead = DEFAULT_OVERHEAD_GB
+        peak = weights + overhead + int(budget) / GIB
+        fits, free = headroom_ok(peak, min(caps))
+        if not fits:
+            return _error_modal(
+                f"This configuration would leave only {free:.2f} GB free on the "
+                f"tightest GPU ({peak:.2f} of {min(caps):.1f} GB used), below the "
+                f"{MIN_HEADROOM_GB} GB floor. Reduce context or concurrency. "
+                f"Filling a card risks an allocation failure that can require a reboot."
+            )
+
+    # Environment assignments carry launch config with no CLI flag.
+    try:
+        env = json.loads(env_json) or {}
+    except json.JSONDecodeError:
+        env = {}
+    try:
+        updated = config_manager.save_script_edits(
+            src, model_name,
+            args=args,
+            display_name=display_name.strip() or None,
+            health_timeout=ht,
+            env=env,
+        )
+    except Exception as e:
+        logger.error(f"✗ vLLM save failed for {model_name}: {e}", exc_info=True)
+        return _error_modal(f"Failed to save: {e}")
+
+    if not updated:
+        return _error_modal(f"{model_name} could not be re-read after saving")
+    # Save-As and normal save both end on the confirmation popup; its OK button
+    # refreshes the table, which surfaces the new fork.
+    return _save_success_modal(updated)
+
+
+@app.post("/api/calculate-vllm-vram", response_class=JSONResponse)
+async def calculate_vllm_vram(
+    model: str = Form(...),
+    context_length: int = Form(0),
+    concurrency: int = Form(1),
+    vram_gb: float = Form(0.0),
+    solve_for: str = Form("vram"),
+    kv_cache_dtype: str = Form(""),
+):
+    """Both directions of the context/concurrency/VRAM relation (doc 21 §2.4).
+
+    solve_for='vram'    : context + concurrency -> total VRAM
+    solve_for='context' : VRAM budget + concurrency -> largest context that fits
+    solve_for='fit'     : the largest context the emptiest GPU can take while
+                          keeping the same spare room save_vllm_config demands
+                          (MIN_HEADROOM_GB on the smallest card), so a fitted
+                          value is always one the save accepts
+
+    One shared helper backs both so a round-trip returns to the same slider
+    position. Returns the pool token count and the KV budget to write into the
+    script as --kv-cache-memory-bytes.
+    """
+    from kv_calc import (
+        DEFAULT_KV_HEADROOM, DEFAULT_OVERHEAD_GB, GIB, MIN_HEADROOM_GB,
+        context_for_vram, vram_gb_for,
+    )
+    try:
+        mc = config_manager.get_model_config(model)
+    except FileNotFoundError:
+        return JSONResponse({"error": f"model not found: {model}"}, status_code=404)
+
+    # Measured figures, or empties when the profile was taken at a different GPU count.
+    profile = mc.parsed.load_profile
+    # The dialog sends its (possibly unsaved) KV cache dtype; default to the script's.
+    bpt, source = mc.kv_bytes_per_token_for(kv_cache_dtype or None)
+    if not bpt:
+        return JSONResponse({
+            "error": "KV bytes/token unknown for this model — load it once to calibrate",
+        }, status_code=422)
+
+    weights = mc.size_gb or 0.0
+    weights_per_gpu = profile["weights_max_gb"]
+    overhead = profile["runtime_overhead_gb"]
+    if overhead is None:
+        overhead = DEFAULT_OVERHEAD_GB
+    concurrency = max(1, concurrency)
+    fit = {}
+    if solve_for == "fit":
+        gpus = gpu_manager.get_gpu_status() or {}
+        if not gpus:
+            return JSONResponse({"error": "no GPUs detected"}, status_code=422)
+        gpu_id, info = max(gpus.items(), key=lambda kv: kv[1]["memory"] - kv[1]["allocated"])
+        free = info["memory"] - info["allocated"]
+        smallest = min(g["memory"] for g in gpus.values())
+        vram_gb = min(free, smallest) - MIN_HEADROOM_GB
+        fit = {"gpu_id": gpu_id, "free_gb": round(free, 1), "spare_gb": MIN_HEADROOM_GB}
+        solve_for = "context"
+    if solve_for == "context":
+        ctx = context_for_vram(
+            vram_gb=vram_gb, concurrency=concurrency, bytes_per_token=bpt,
+            weights_gb=weights, max_context=mc.max_context,
+            headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
+            overhead_gb=overhead, weights_per_gpu_gb=weights_per_gpu,
+        )
+        total, tokens = vram_gb_for(
+            context_length=ctx, concurrency=concurrency,
+            bytes_per_token=bpt, weights_gb=weights,
+            headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
+            overhead_gb=overhead, weights_per_gpu_gb=weights_per_gpu,
+        )
+    else:
+        ctx = max(0, context_length)
+        total, tokens = vram_gb_for(
+            context_length=ctx, concurrency=concurrency,
+            bytes_per_token=bpt, weights_gb=weights,
+            headroom=DEFAULT_KV_HEADROOM, gpu_count=mc.gpu_count,
+            overhead_gb=overhead, weights_per_gpu_gb=weights_per_gpu,
+        )
+
+    return JSONResponse({
+        "context_length": ctx,
+        "concurrency": concurrency,
+        "pool_tokens": tokens,
+        "bytes_per_token": bpt,
+        "bytes_per_token_source": source,
+        "weights_gb": round(weights, 2),
+        "overhead_gb": overhead,
+        "weights_per_gpu_gb": weights_per_gpu,
+        "measured": bool(weights_per_gpu),
+        "headroom": DEFAULT_KV_HEADROOM,
+        "kv_gb": round(tokens * bpt / GIB, 2),
+        "per_gpu_gb": total,
+        "gpu_count": mc.gpu_count,
+        "total_gb": round(total * mc.gpu_count, 2),
+        "kv_cache_memory_bytes": tokens * bpt,
+        **fit,
+    })
+
+
 @app.get("/api/get-current-settings", response_class=JSONResponse)
 async def get_current_settings():
     """Return current settings for settings modal population."""
-    # Format the schema-detected llama-server version like the per-model modal
-    # ("9244 (b28a2f372)"). Falls back to "unknown" if no schema is cached.
-    version_raw = config_manager.app_config.llama_schema_version
-    if version_raw:
-        parts = version_raw.split("_")
-        version_str = f"{parts[0]} ({parts[1]})" if len(parts) == 2 else version_raw
-    else:
-        version_str = "unknown"
+    # Same label as the per-model modal ("9244 (b28a2f372)"); cached after first probe.
+    version_str = _llama_version_label(
+        await asyncio.to_thread(_flags, "llamacpp", config_manager.app_config.llama_server_binary)
+    )
+    # `vllm --version` imports torch on a cold cache (tens of seconds), so it
+    # runs in a thread — never inline, or opening Settings freezes the app.
+    vllm_bin = config_manager.app_config.vllm_binary
+    vllm_version = ""
+    if vllm_bin:
+        vllm_version = await asyncio.to_thread(get_vllm_version, vllm_bin) or "unknown"
     return {
         "llama_server": config_manager.app_config.llama_server_binary,
         "llama_server_version": version_str,
+        "vllm_binary": vllm_bin or "",
+        "vllm_version": vllm_version,
         "models_directory": config_manager.app_config.models_directory,
         "webui_port": config_manager.app_config.webui_port,
     }
 
 
-@app.get("/api/config-paths", response_class=HTMLResponse)
-async def config_paths():
-    """Return configuration paths UI."""
-    try:
-        app_config = config_manager.app_config
-        llama_server_path = app_config.llama_server_binary
-        models_dir_path = app_config.models_directory
-        
-        html = f"""
-        <div class="space-y-4">
-            <!-- Llama Server Path -->
-            <div class="flex items-center gap-3">
-                <label class="w-32 text-sm font-bold text-gray-300">Llama Server:</label>
-                <input type="text" 
-                       value="{llama_server_path}"
-                       readonly
-                       class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
-                <button hx-get="/api/file-browser?path_type=llama_server&current_path={llama_server_path}"
-                        hx-target="#modal-container"
-                        hx-swap="innerHTML"
-                        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold transition-colors">
-                    Edit
-                </button>
-            </div>
-            
-            <!-- Models Directory -->
-            <div class="flex items-center gap-3">
-                <label class="w-32 text-sm font-bold text-gray-300">Models Dir:</label>
-                <input type="text" 
-                       value="{models_dir_path}"
-                       readonly
-                       class="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm text-gray-300 font-mono">
-                <button hx-get="/api/file-browser?path_type=models_directory&current_path={models_dir_path}"
-                        hx-target="#modal-container"
-                        hx-swap="innerHTML"
-                        class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold transition-colors">
-                    Edit
-                </button>
-            </div>
-        </div>
-        """
-        return html
-    except Exception as e:
-        logger.error(f"✗ Error in config_paths: {type(e).__name__}: {e}")
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
-
-
-
 @app.get("/api/file-browser", response_class=HTMLResponse)
-async def file_browser(path_type: str, current_path: str = "/", modal: str = None):
-    """Return file browser modal for selecting a directory.
+async def file_browser(path_type: str, current_path: str = "/"):
+    """Return the directory-picker fragment for the Settings / model-config modals.
 
-    Args:
-        path_type: 'llama_server' or 'models_directory'
-        current_path: Current directory path
-        modal: If 'settings', use callback to settings modal; else use form submission
+    Swapped into #file-browser-content; the caller supplies selectPath() and
+    closeFileBrowser(). Args: path_type is 'llama_server', 'vllm_binary', or
+    'models_directory'; current_path is where to start browsing.
     """
     try:
-        logger.info(f"📂 File browser requested for {path_type} at {current_path} (modal={modal})")
+        logger.info(f"📂 File browser requested for {path_type} at {current_path}")
         
         # Parse current path
         current_path_obj = Path(current_path)
@@ -1653,127 +1779,24 @@ async def file_browser(path_type: str, current_path: str = "/", modal: str = Non
         if current_path_obj.is_file():
             current_path_obj = current_path_obj.parent
         
-        # Get parent directory
-        parent_path = current_path_obj.parent if current_path_obj != current_path_obj.parent else current_path_obj
-        
-        # List directories
-        directories = []
+        # Parent link first (unless at /), then visible subdirectories.
+        entries = []
+        if current_path_obj != current_path_obj.parent:
+            entries.append(("../", str(current_path_obj.parent)))
         try:
-            items = sorted(current_path_obj.iterdir())
-            for item in items:
-                if item.is_dir() and not item.name.startswith('.'):
-                    directories.append(item)
+            entries += [
+                (f"{item.name}/", str(item))
+                for item in sorted(current_path_obj.iterdir())
+                if item.is_dir() and not item.name.startswith(".")
+            ]
         except PermissionError:
             logger.warning(f"⚠ Permission denied accessing {current_path_obj}")
-        
-        # Build directory list HTML
-        dir_html = ""
 
-        # Build modal parameter for nested calls
-        modal_param = f"&modal={modal}" if modal else ""
-
-        # Parent directory link
-        if current_path_obj != current_path_obj.parent:
-            dir_html += f"""
-            <button hx-get="/api/file-browser?path_type={path_type}&current_path={parent_path}{modal_param}"
-                    hx-target="#file-browser-content"
-                    hx-swap="innerHTML"
-                    class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors text-blue-400">
-                📁 ../
-            </button>
-            """
-
-        # Subdirectories
-        for directory in directories:
-            dir_html += f"""
-            <button hx-get="/api/file-browser?path_type={path_type}&current_path={directory}{modal_param}"
-                    hx-target="#file-browser-content"
-                    hx-swap="innerHTML"
-                    class="w-full text-left px-3 py-2 hover:bg-gray-700 rounded transition-colors text-gray-300">
-                📁 {directory.name}/
-            </button>
-            """
-        
-        # Build action buttons based on modal type
-        if modal == "settings":
-            # For settings modal, use onclick callback instead of form submission
-            html = f"""
-            <div class="flex justify-between items-center mb-4">
-                <h2 class="text-xl font-bold">Select Directory</h2>
-                <button type="button"
-                        onclick="closeFileBrowser()"
-                        class="text-gray-400 hover:text-white text-2xl">
-                    ×
-                </button>
-            </div>
-
-            <div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
-                <p class="text-xs text-gray-500 mb-1">Current Path:</p>
-                <p class="text-sm text-gray-300 font-mono">{current_path_obj}</p>
-            </div>
-
-            <div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
-                {dir_html if dir_html else '<div class="p-4 text-gray-500">No subdirectories</div>'}
-            </div>
-
-            <div class="flex gap-3">
-                <button type="button"
-                        onclick="closeFileBrowser()"
-                        class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                    Cancel
-                </button>
-                <button type="button"
-                        onclick="selectPath('{current_path_obj}')"
-                        class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                    Select
-                </button>
-            </div>
-            """
-        else:
-            # For default mode, use form submission
-            html = f"""
-            <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-                 id="modal"
-                 onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-                <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-2xl max-h-96 flex flex-col"
-                     onclick="event.stopPropagation()">
-                    <div class="flex justify-between items-center mb-4">
-                        <h2 class="text-xl font-bold">Select Directory</h2>
-                        <button onclick="document.getElementById('modal').remove();"
-                                class="text-gray-400 hover:text-white text-2xl">
-                            ×
-                        </button>
-                    </div>
-
-                    <div class="mb-4 p-3 bg-gray-900 rounded border border-gray-700">
-                        <p class="text-xs text-gray-500 mb-1">Current Path:</p>
-                        <p class="text-sm text-gray-300 font-mono">{current_path_obj}</p>
-                    </div>
-
-                    <div class="flex-1 overflow-y-auto mb-4 border border-gray-700 rounded">
-                        {dir_html if dir_html else '<div class="p-4 text-gray-500">No subdirectories</div>'}
-                    </div>
-
-                    <div class="flex gap-3">
-                        <button onclick="document.getElementById('modal').remove();"
-                                class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                            Cancel
-                        </button>
-                        <button hx-post="/api/update-config-path"
-                                hx-vals='{{"path_type": "{path_type}", "new_path": "{current_path_obj}"}}'
-                                hx-target="#modal-container"
-                                hx-swap="innerHTML"
-                                class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                            Select This Path
-                        </button>
-                    </div>
-                </div>
-            </div>
-            """
-        return html
+        return _render("snippets/file_browser.html", path_type=path_type,
+                       current_path=str(current_path_obj), entries=entries)
     except Exception as e:
         logger.error(f"✗ Error in file_browser: {type(e).__name__}: {e}", exc_info=True)
-        return HTMLResponse(f'<div class="text-red-500 p-4">Error: {str(e)}</div>', status_code=500)
+        return _error_fragment(f"Error: {e}")
 
 
 @app.post("/api/update-config-path", response_class=HTMLResponse)
@@ -1794,10 +1817,34 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
                     raise ValueError(f"No 'llama-server' binary found in {new_path}")
             if not new_path_obj.is_file():
                 raise ValueError(f"Path is not a file: {new_path_obj}")
+            # Probe (and cache) its options now; refuse a binary that can't be read.
+            if not await asyncio.to_thread(_flags, "llamacpp", str(new_path_obj)):
+                raise ValueError(f"Not a working llama-server (version/help could not be read): {new_path_obj}")
             config_manager.app_config.llama_server_binary = str(new_path_obj)
-
-            # Re-detect schema when llama_server path changes
-            await ensure_schema_for_binary(str(new_path_obj), config_manager, update_global=True)
+        elif path_type == "vllm_binary":
+            # Accept the executable directly, or a directory (venv root or its
+            # bin/) from which we locate `vllm`.
+            if new_path_obj.is_dir():
+                for candidate in (new_path_obj / "vllm", new_path_obj / "bin" / "vllm"):
+                    if candidate.is_file():
+                        new_path_obj = candidate
+                        break
+                else:
+                    raise ValueError(f"No 'vllm' executable found in {new_path}")
+            if not new_path_obj.is_file():
+                raise ValueError(f"Path is not a file: {new_path_obj}")
+            # Capture the engine's flag manifest now (its own `serve --help`) —
+            # generated args and arg parsing are drawn only from this.
+            manifest = await asyncio.to_thread(_flags, "vllm", str(new_path_obj))
+            if not manifest:
+                raise ValueError(
+                    f"Not a working vllm executable (--version or `serve --help` failed): {new_path_obj}"
+                )
+            config_manager.app_config.vllm_binary = str(new_path_obj)
+            logger.info(
+                f"✓ vLLM executable set: {new_path_obj} "
+                f"(version {manifest['version']}, {len(manifest['flags'])} flags)"
+            )
         elif path_type == "models_directory":
             if not new_path_obj.is_dir():
                 raise ValueError(f"Path is not a directory: {new_path}")
@@ -1809,55 +1856,16 @@ async def update_config_path(path_type: str = Form(...), new_path: str = Form(..
         else:
             raise ValueError(f"Unknown path type: {path_type}")
 
-        # Save updated config
-        config_file = PROJECT_ROOT / "config" / "app.json"
-        config_data = config_manager.app_config.model_dump()
-        with open(config_file, "w") as f:
-            json.dump(config_data, f, indent=2)
-
+        await config_manager.save_app_config()
         logger.info(f"✓ Config updated and saved: {path_type} = {new_path}")
-
-        # Return success message and refresh config section
-        html = f"""
-        <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-             id="modal"
-             onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-            <div class="bg-gray-800 border border-green-600 rounded-lg p-6 w-full max-w-md"
-                 onclick="event.stopPropagation()">
-                <div class="flex items-center space-x-3 mb-4">
-                    <span class="text-2xl">✓</span>
-                    <h2 class="text-lg font-bold text-green-400">Path Updated</h2>
-                </div>
-                <p class="text-sm text-gray-300 mb-4">
-                    <span class="font-bold text-gray-200">{path_type}:</span><br>
-                    <span class="font-mono text-xs text-gray-400">{new_path}</span>
-                </p>
-                <button onclick="document.getElementById('modal').remove(); htmx.ajax('GET', '/api/config-paths', '#config-paths')"
-                        class="w-full px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold transition-colors">
-                    OK
-                </button>
-            </div>
-        </div>
-        """
-        return html
+        return _render("modals/message.html", tone="success", title="✓ Path Updated",
+                       label=path_type, detail=new_path)
     except Exception as e:
         logger.error(f"✗ Error in update_config_path: {type(e).__name__}: {e}", exc_info=True)
-        error_html = f"""
-        <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-             id="modal"
-             onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-            <div class="bg-gray-800 border border-red-600 rounded-lg p-6 w-full max-w-md"
-                 onclick="event.stopPropagation()">
-                <h2 class="text-lg font-bold text-red-400 mb-4">Error Updating Path</h2>
-                <p class="text-sm text-gray-300 mb-4">{str(e)}</p>
-                <button onclick="document.getElementById('modal').remove();"
-                        class="w-full px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
-                    Close
-                </button>
-            </div>
-        </div>
-        """
-        return error_html
+        # The status stays 200 so htmx still swaps this into the modal; the
+        # data-config-error marker is what callers test to detect failure.
+        return _render("modals/message.html", tone="error", title="Error Updating Path",
+                       message=str(e), marker="config-error")
 
 
 @app.post("/api/update-webui-port", response_class=JSONResponse)
@@ -1871,12 +1879,7 @@ async def update_webui_port(port: int = Form(...)):
         # Update app config
         config_manager.app_config.webui_port = port
 
-        # Save updated config
-        config_file = PROJECT_ROOT / "config" / "app.json"
-        config_data = config_manager.app_config.model_dump()
-        with open(config_file, "w") as f:
-            json.dump(config_data, f, indent=2)
-
+        await config_manager.save_app_config()
         logger.info(f"✓ WebUI port updated to {port} and saved")
         return {
             "success": True,
@@ -1906,9 +1909,9 @@ async def validate_binary_path(path: str = Form(...)):
         if not path_obj.is_file():
             return {"version": None, "error": f"Path is not a file: {path_obj}"}
 
-        # Validate binary and ensure schema is cached
+        # Validate binary and cache its option schema
         resolved_path = str(path_obj)
-        version_str = await ensure_schema_for_binary(resolved_path, config_manager, update_global=False)
+        version_str = ((await asyncio.to_thread(_flags, "llamacpp", resolved_path)) or {}).get("version")
 
         if version_str is None:
             return {"version": None, "error": f"Invalid llama-server binary or unable to detect version: {resolved_path}"}
@@ -1965,6 +1968,69 @@ async def model_log_tail(model: str, lines: int = 30):
 
 
 # ============================================================================
+# Chat page - a minimal test chat for any OpenAI-compatible server (vLLM has no web UI)
+# ============================================================================
+
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page(model: Optional[str] = None, endpoint: Optional[str] = None):
+    """Standalone test chat for any OpenAI-compatible server.
+
+    Opened from a model row as /chat?model=<name>, it starts pointed at that
+    model's port; /chat?endpoint=host:port targets anything else. The server
+    box on the page can be changed and reconnected either way.
+    """
+    title = None
+    if model and model in config_manager.get_all_models():
+        mc = config_manager.get_model_config(model)
+        title = mc.display_name or model
+        if not endpoint and mc.port:
+            endpoint = f"localhost:{mc.port}"
+    template = jinja_env.get_template("chat.html")
+    return template.render(endpoint=endpoint or "", studio_title=title, app_version=APP_VERSION)
+
+
+@app.get("/api/chat/probe", response_class=JSONResponse)
+async def chat_probe(endpoint: str):
+    """Resolve a typed server:port and report the models it serves + its engine."""
+    try:
+        base_url, label = await chat_proxy.resolve_endpoint(endpoint)
+    except chat_proxy.EndpointError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    try:
+        info = await chat_proxy.probe(base_url)
+    except httpx.HTTPStatusError as e:
+        return JSONResponse({"ok": False, "endpoint": label,
+                             "error": f"{label}/v1/models returned HTTP {e.response.status_code}"}, status_code=502)
+    except httpx.HTTPError as e:
+        return JSONResponse({"ok": False, "endpoint": label,
+                             "error": f"No OpenAI-compatible server answering at {label} ({type(e).__name__})"}, status_code=502)
+    if not info["models"]:
+        return JSONResponse({"ok": False, "endpoint": label, "error": f"{label} reports no models"}, status_code=502)
+    return {"ok": True, "endpoint": label, **info}
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: Request):
+    """Forward one chat turn to the connected server and stream normalized NDJSON events."""
+    body = await request.json()
+    try:
+        base_url, _ = await chat_proxy.resolve_endpoint(body.get("endpoint", ""))
+    except chat_proxy.EndpointError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    messages = body.get("messages") or []
+    if not messages:
+        return JSONResponse({"error": "No messages"}, status_code=400)
+    payload = chat_proxy.build_payload(body.get("engine") or "openai", body.get("model"),
+                                       messages, body.get("sampling") or {})
+    return StreamingResponse(
+        chat_proxy.stream_chat(base_url, payload),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ============================================================================
 # API Routes - Status
 # ============================================================================
 
@@ -2002,7 +2068,10 @@ async def ws_status(websocket: WebSocket):
     await event_bus.connect(websocket)
     try:
         while True:
-            await websocket.receive_text()
+            # The page pings to prove the connection is alive; it reconnects
+            # when nothing at all arrives for a while.
+            if await websocket.receive_text() == "ping":
+                await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         event_bus.disconnect(websocket)
     except Exception:

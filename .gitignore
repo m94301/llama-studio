@@ -48,6 +48,8 @@ docs/
 # Configuration (user-specific)
 config/app.json
 config/llama-server/*.json
+config/vllm/*.json
+config/models/.backups/
 config/models/*.json
 config/models/*.json.old
 config/models/*.sh
@@ -64,3 +66,7 @@ config/models/*.sh.off
 # OS
 *.pid
 .pid
+
+# Local behavior snapshot (holds local paths)
+tests/.snapshot/
+CLAUDE.local.md

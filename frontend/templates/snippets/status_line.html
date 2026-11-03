@@ -1,0 +1,2 @@
+{# One-line inline status (rescan, store button errors). tone: info | ok | error #}
+<span class="{{ {'info': 'text-blue-300', 'ok': 'text-green-400', 'error': 'text-red-400'}[tone] }}{{ ' text-xs' if small }}">{{ text }}{% if code %}<code class="text-blue-200">{{ code }}</code>{% endif %}</span>

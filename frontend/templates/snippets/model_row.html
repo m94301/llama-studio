@@ -11,7 +11,7 @@
     <div id="model-status-{{ model_config.html_id }}"
          class="polling-wrapper"
          hx-get="/api/get-model-status-inner?model={{ model_name }}"
-         hx-trigger="load, every 30s"
+         hx-trigger="load, every 30s, studioResync from:body"
          hx-swap="innerHTML"
          hx-on::after-request="
             let row = this.closest('.model-row');
@@ -31,11 +31,11 @@
                         hx-target="#modal-container" hx-swap="innerHTML"
                         data-model-name="{{ model_name }}">UNLOAD</button>
             {% elif status == "failed" %}
-                <button class="btn-action btn-load"
+                <button class="btn-action btn-dismiss"
                         hx-post="/api/clear-error"
                         hx-vals='{"model_name": "{{ model_name }}"}'
                         hx-target="[data-model-name='{{ model_name }}']"
-                        hx-swap="outerHTML">CANCEL</button>
+                        hx-swap="outerHTML">DISMISS</button>
             {% elif model_config.is_configured %}
                 <button class="btn-action btn-load"
                         hx-get="/api/gpu-selector?model={{ model_name }}"
@@ -52,9 +52,13 @@
 
     <div class="column column-name">
         <span class="model-display-name">{{ model_config.display_name or model_name }}</span>
+        {% if model_config.engine == 'vllm' %}
+        <span class="inline-block ml-2 text-xs font-bold text-teal-300 bg-teal-900 bg-opacity-40 border border-teal-700 rounded px-1.5 py-0.5 align-middle"
+              title="Served by vLLM (claims ~{{ (model_config.gpu_memory_utilization * 100)|round(0)|int }}% of each visible GPU)">vLLM</span>
+        {% endif %}
         {% if model_config.gpu_count > 1 %}
         <span class="inline-block ml-2 text-xs font-bold text-purple-300 bg-purple-900 bg-opacity-40 border border-purple-700 rounded px-1.5 py-0.5 align-middle"
-              title="Tensor-split across {{ model_config.gpu_count }} GPUs">{{ model_config.gpu_count }} GPU</span>
+              title="{{ 'Parallel across' if model_config.engine == 'vllm' else 'Tensor-split across' }} {{ model_config.gpu_count }} GPUs">{{ model_config.gpu_count }} GPU</span>
         {% elif model_config.is_flexible_split %}
         <span class="inline-block ml-2 text-xs font-bold text-purple-300 bg-purple-900 bg-opacity-40 border border-purple-700 rounded px-1.5 py-0.5 align-middle"
               title="Splits across the GPUs you select (--split-mode {{ model_config.split_mode }})">split</span>
@@ -66,8 +70,10 @@
     </div>
     <div class="column column-port">{{ port_display }}</div>
     <div class="column column-actions">
+        <button class="btn-icon btn-chat" title="Open a test chat in a new tab"
+                onclick="window.open('/chat?model=' + encodeURIComponent(this.closest('.model-row').dataset.modelName), '_blank')">💬</button>
         <button class="btn-icon btn-edit-config"
-                hx-get="/api/config-modal-new?model={{ model_name }}"
+                hx-get="/api/config-modal?model={{ model_name }}"
                 hx-target="#modal-container" hx-swap="innerHTML">⚙</button>
     </div>
 

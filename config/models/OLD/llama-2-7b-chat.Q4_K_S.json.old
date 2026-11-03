@@ -1,0 +1,22 @@
+{
+  "name": "llama-2-7b-chat.Q4_K_S",
+  "display_name": "Llama 2 7b Chat.q4 K S",
+  "model_path": "/home/m6/models/drive1/TheBloke/Llama-2-7B-Chat-GGUF/llama-2-7b-chat.Q4_K_S.gguf",
+  "block_count": null,
+  "max_context": null,
+  "kv_cache_multiplier": null,
+  "llama_path": "default",
+  "launch_args": {
+    "--host": "0.0.0.0",
+    "--port": "8002",
+    "--ctx-size": "8192",
+    "--cache-type-k": "f16",
+    "--cache-type-v": "f16",
+    "--gpu-layers": "999",
+    "--batch-size": "512",
+    "--ubatch-size": "512",
+    "--threads": "12",
+    "--no-mmap": null,
+    "--direct-io": null
+  }
+}

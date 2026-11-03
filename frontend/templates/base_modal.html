@@ -1,12 +1,13 @@
 <!-- frontend/templates/base_modal.html -->
+{% set close_js = on_close|default("document.getElementById('modal').remove();") %}
 <div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-     id="modal"
-     onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
+     id="modal"{% if marker %} data-{{ marker }}="1"{% endif %}
+     onclick="if(event.target.id === 'modal') {{ close_js }}">
     <div class="bg-gray-800 border border-{{ border_color|default("gray-600") }} rounded-lg p-6 w-full max-w-{{ width|default("md") }}"
          onclick="event.stopPropagation()">
         <div class="flex justify-between items-center mb-4">
             <h2 class="text-xl font-bold {{ title_class|default("") }}">{{ title }}</h2>
-            <button onclick="document.getElementById('modal').remove();"
+            <button onclick="{{ close_js }}"
                     class="text-gray-400 hover:text-white text-2xl">
                 &times;
             </button>

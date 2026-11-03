@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# === llama-studio:meta BEGIN ===
+# display_name: Mistral 7B v0.3
+# block_count: 32
+# max_context: 32768
+# kv_cache_multiplier: 1024
+# === llama-studio:meta END ===
+LLAMA_BIN=/home/m6/projects/llama.cpp/build-cuda-avx1/bin/llama-server
+export CUDA_VISIBLE_DEVICES=0
+
+exec "$LLAMA_BIN" \
+  -m /home/m6/models/drive1/lmstudio-community/Mistral-7B-Instruct-v0.3-GGUF/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --ctx-size 32768 \
+  --cache-type-k f16 \
+  --cache-type-v f16

@@ -1,8 +1,8 @@
 """Configuration management for app and models.
 
 Models are stored as executable shell scripts at config/models/<name>.sh.
-Each script has a meta fence (display_name + GGUF-derived cache) and a
-launch-args fence (the llama-server invocation). See backend/launch_script.py.
+Each script has a meta fence (display_name + cached measurements) followed by
+the engine invocation. See backend/launch_script.py.
 """
 
 import asyncio
@@ -10,35 +10,62 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
+import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pydantic import BaseModel, Field, field_validator
 
 from gguf_metadata_parser import parse_gguf_metadata
+from kv_calc import (
+    DEFAULT_OVERHEAD_GB,
+    GIB,
+    bytes_per_token_from_config,
+    kv_dtype_bytes,
+    calibrate_from_log,
+    heaviest_rank_weights_from_log,
+    llama_cache_type_bytes,
+    llama_kv_gb,
+    max_context_from_config,
+)
 from launch_script import (
     ParsedScript,
     parse_script,
     render_skeleton_script,
+    render_vllm_skeleton_script,
     patch_meta_fence,
-    patch_launch_args_fence,
     patch_cuda_visible_devices,
+    patch_display_name_var,
+    patch_env_assignment,
+    patch_exec_invocation,
+    extract_assignments,
     DEFAULT_HEALTH_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
 
 
-KV_BYTES: Dict[str, float] = {
-    "f16": 2.0,
-    "q8_0": 1.0,
-    "q6_k": 0.75,
-    "q5_k": 0.625,
-    "q5_0": 0.625,
-    "q4_k": 0.5,
-    "q4_0": 0.5,
-    "q3_k": 0.375,
-}
+def _int_arg(args: Dict[str, Any], key: str) -> Optional[int]:
+    """An integer launch arg, or None when absent, empty or not a number."""
+    value = args.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _gguf_reference(args: Dict[str, Any], fallback_ctx: Optional[int] = None) -> Dict[str, Any]:
+    """parse_gguf_metadata kwargs: the context, batch and cache types the GGUF's
+    kv_cache_multiplier is baked against (the script's own settings)."""
+    return dict(
+        reference_ctx=_int_arg(args, "--ctx-size") or fallback_ctx,
+        reference_batch_size=_int_arg(args, "--batch-size"),
+        reference_k_bytes=llama_cache_type_bytes(args.get("--cache-type-k")),
+        reference_v_bytes=llama_cache_type_bytes(args.get("--cache-type-v")),
+    )
 
 
 # llama.cpp splits large models into shards named `<base>-00001-of-00004.gguf`.
@@ -48,25 +75,82 @@ KV_BYTES: Dict[str, float] = {
 _SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
 
 
+# Model scripts are user-authored config that the scanner rewrites in place
+# (engine-tag backfill, GGUF metadata backfill, UI saves). Those writes must
+# never be able to leave a truncated file behind, and a bad transform must be
+# recoverable — hence atomic replace plus a pruned snapshot of prior content.
+SCRIPT_BACKUP_DIRNAME = ".backups"
+SCRIPT_BACKUP_KEEP = 5
+
+
+def _snapshot_script(path: Path, content: str) -> None:
+    """Save the pre-write content to config/models/.backups/<name>.<timestamp>."""
+    try:
+        backup_dir = path.parent / SCRIPT_BACKUP_DIRNAME
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dest = backup_dir / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}"
+        if not dest.exists():
+            dest.write_text(content)
+        # Keep only the most recent N snapshots per script (names sort by time).
+        snapshots = sorted(backup_dir.glob(f"{path.name}.*"))
+        for stale in snapshots[:-SCRIPT_BACKUP_KEEP]:
+            stale.unlink(missing_ok=True)
+    except Exception as e:
+        # A failed backup must not block the write; surface it and move on.
+        logger.warning(f"⚠ Could not snapshot {path.name} before rewrite: {e}")
+
+
+def write_script_atomic(path: Path, text: str, *, backup: bool = True) -> bool:
+    """Write `text` to `path` via a temp file + atomic rename.
+
+    Returns True if the file was written, False if the content was already
+    identical (no write, no snapshot, no mtime churn). Existing permissions are
+    preserved; a crash mid-write leaves the original file intact because the
+    rename is the only step that touches it.
+    """
+    path = Path(path)
+    existing: Optional[str] = None
+    if path.exists():
+        try:
+            existing = path.read_text()
+        except Exception:
+            existing = None  # unreadable (encoding/permissions) — back up by copy below
+        if existing is not None and existing == text:
+            return False
+        if backup:
+            if existing is not None:
+                _snapshot_script(path, existing)
+            else:
+                # Unreadable as text — preserve the bytes verbatim instead.
+                try:
+                    backup_dir = path.parent / SCRIPT_BACKUP_DIRNAME
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, backup_dir / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}")
+                except Exception as e:
+                    logger.warning(f"⚠ Could not snapshot unreadable {path.name}: {e}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if path.exists():
+            shutil.copymode(path, tmp)  # keep the executable bit
+        os.replace(tmp, path)  # atomic within the same filesystem
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return True
+
+
 def parse_split_gguf(path: Path):
     """If `path` is a multipart GGUF shard, return (base_name, index, total); else None."""
     m = _SPLIT_RE.match(path.name)
     if not m:
         return None
     return m.group("base"), int(m.group("idx")), int(m.group("total"))
-
-
-def calculate_kv_cache_gb(
-    block_count: int,
-    ctx_size: int,
-    kv_cache_multiplier: int,
-    cache_type_k: str = "f16",
-    cache_type_v: str = "f16",
-) -> float:
-    """Compute KV cache size in GiB."""
-    k = KV_BYTES.get(cache_type_k, 2.0)
-    v = KV_BYTES.get(cache_type_v, 2.0)
-    return block_count * ctx_size * kv_cache_multiplier * (k + v) / (1024 ** 3)
 
 
 def _sanitize_html_id(name: str) -> str:
@@ -97,12 +181,91 @@ class ModelConfig:
         self.total_vram: Optional[float] = None
         self.is_configured: bool = False
         self.config_error: Optional[str] = None  # reason for unconfigured, surfaced in UI
+        # vLLM models have no GGUF; trained context comes from config.json.
+        self.vllm_max_context: Optional[int] = None
 
     # ---- proxies to parsed script ----
 
     @property
     def display_name(self) -> str:
         return self.parsed.display_name or self.name
+
+    @property
+    def engine(self) -> str:
+        return self.parsed.engine
+
+    @property
+    def gpu_memory_utilization(self) -> float:
+        return self.parsed.gpu_memory_utilization
+
+    @property
+    def kv_cache_memory_bytes(self) -> Optional[int]:
+        return self.parsed.kv_cache_memory_bytes
+
+    @property
+    def context_length(self) -> Optional[int]:
+        return self.parsed.context_length
+
+    @property
+    def concurrency(self) -> Optional[int]:
+        return self.parsed.concurrency
+
+    def needed_on_gpu(self, gpu_total_gb: float) -> float:
+        """VRAM a vLLM model will claim on one GPU of the given capacity.
+
+        With an explicit --kv-cache-memory-bytes the claim is bounded:
+        weights + overhead + that budget, split across the GPUs the model spans.
+        Without one, vLLM fills util × capacity on every visible GPU regardless
+        of model size, so the need depends on the target GPU rather than the
+        model (doc 21 decision 3 and §2.4).
+        """
+        gate = self.gpu_memory_utilization * gpu_total_gb
+        budget = self.kv_cache_memory_bytes
+        if budget is None:
+            return round(gate, 2)
+        per_gpu = max(1, self.gpu_count)
+        # Measured figures win where a real load has provided them: ranks are not
+        # equal, and the heaviest one decides whether a placement fits.
+        profile = self.parsed.load_profile
+        weights_share = profile["weights_max_gb"] or (self.size_gb or 0.0) / per_gpu
+        overhead = profile["runtime_overhead_gb"]
+        if overhead is None:
+            overhead = DEFAULT_OVERHEAD_GB
+        # --kv-cache-memory-bytes is per GPU; only the weights divide.
+        usage = weights_share + overhead + budget / GIB
+        # --gpu-memory-utilization is a startup gate as well as a sizing knob:
+        # vLLM refuses to launch unless `free >= util × capacity`, however little
+        # it then uses. Requiring only the predicted usage would green-light loads
+        # the engine rejects — which is exactly how a 4-card DSV4 start failed on
+        # a GPU with 62.07 GB free against a 62.24 GB gate. The config UI derives
+        # util from this same usage figure, so for a tool-written script the two
+        # numbers coincide and nothing is over-reserved.
+        return round(max(usage, gate), 2)
+
+    def kv_bytes_per_token_for(self, kv_cache_dtype: Optional[str] = None) -> Tuple[Optional[int], str]:
+        """vLLM KV bytes per token at `kv_cache_dtype` (default: the configured
+        one), with where the figure came from.
+
+        A measurement taken at that dtype wins. One taken at another dtype is
+        rescaled by element size: it already reflects the model's real KV shape,
+        which config.json may not describe (MLA models). Else config.json's
+        estimate; None when neither is available.
+        """
+        dtype = kv_cache_dtype or self.parsed.kv_cache_dtype
+        measured = self.parsed.load_profile["kv_bytes_per_token"]
+        if measured:
+            # Unstamped (older) measurements were taken at the configured dtype.
+            at = self.parsed.calibrated_kv_dtype or self.parsed.kv_cache_dtype
+            if at == dtype:
+                return measured, "measured"
+            src, dst = kv_dtype_bytes(at, self.model_path), kv_dtype_bytes(dtype, self.model_path)
+            if src and dst:
+                return int(measured * dst / src), f"scaled from {at} measurement"
+        if self.model_path:
+            estimate = bytes_per_token_from_config(self.model_path, dtype)
+            if estimate:
+                return estimate, "estimated"
+        return None, "unknown"
 
     @property
     def model_path(self) -> Optional[str]:
@@ -114,6 +277,9 @@ class ModelConfig:
 
     @property
     def max_context(self) -> Optional[int]:
+        """Trained context: GGUF metadata for llama.cpp, config.json for vLLM."""
+        if self.parsed.engine == "vllm":
+            return self.vllm_max_context
         return self.parsed.max_context
 
     @property
@@ -124,6 +290,12 @@ class ModelConfig:
     def health_timeout(self) -> Optional[int]:
         """Raw per-model timeout override from the meta fence, or None if absent."""
         return self.parsed.health_timeout
+
+    @property
+    def term_grace(self) -> float:
+        """Seconds a stop waits after SIGTERM before SIGKILL. vLLM's workers
+        need longer to release their GPUs cleanly."""
+        return 30.0 if self.engine == "vllm" else 5.0
 
     def effective_health_timeout(self) -> int:
         """Per-model timeout if set, else the global default. Always returns an int."""
@@ -173,40 +345,52 @@ class ModelConfig:
         return self.parsed.is_flexible_split
 
     @property
+    def weight_files(self) -> List[Path]:
+        """Every weights file the launch loads: the model plus a multimodal
+        projector (--mmproj) and a speculative draft model (--model-draft)."""
+        paths = [self.model_path] + [self.launch_args.get(k) for k in ("--mmproj", "--model-draft")]
+        return [Path(p) for p in paths if p]
+
+    @property
     def cuda_visible_devices(self) -> Optional[list]:
         return self.parsed.cuda_visible_devices
 
-    def per_gpu_vram(self, count: Optional[int] = None) -> Optional[list]:
-        """Return per-GPU VRAM share (in GB) as a list.
+    @property
+    def cvd_matches_split(self) -> bool:
+        """The stored CUDA_VISIBLE_DEVICES names as many GPUs as the model splits
+        across (a flexible split runs on any number). False when there is none."""
+        cvd = self.cuda_visible_devices
+        return bool(cvd) and (self.is_flexible_split or self.gpu_count == len(cvd))
 
-        Returns None if total_vram is unknown. Behavior by model type:
-        - tensor-split: total_vram * weight_i / sum(weights), one per weight.
-        - flexible split (--split-mode layer/row): total_vram divided evenly
-          across `count` GPUs (falls back to the stored CVD length, else 1).
-        - single-GPU: [total_vram].
+    @property
+    def total_need_gb(self) -> float:
+        """llama.cpp VRAM need in total: weights + KV when known, else the file size."""
+        return self.total_vram or self.size_gb or 0.0
 
-        `count` overrides the GPU count for the even-split cases (used by the
-        picker / load path where the user has chosen how many GPUs to use).
+    def need_per_gpu(self, gpu_caps: List[float]) -> List[float]:
+        """VRAM (GB) this model needs on each GPU it would run on.
+
+        `gpu_caps` are those GPUs' capacities in visible order; its length is the
+        number of GPUs. The one rule used by the pickers, the stored-CVD check
+        and the load path:
+        - vLLM: needed_on_gpu(capacity) for each GPU.
+        - llama.cpp with --tensor-split: the total split by its weights (one entry
+          per weight; callers check that against the GPU count).
+        - otherwise: the total divided evenly across the GPUs.
         """
-        if self.total_vram is None:
-            return None
+        if self.engine == "vllm":
+            return [self.needed_on_gpu(cap) for cap in gpu_caps]
+        total = self.total_need_gb
         weights = self.tensor_split_weights
         if weights is not None and len(weights) > 1:
-            total_weight = sum(weights)
-            if total_weight <= 0:
-                return [self.total_vram / len(weights)] * len(weights)
-            return [round(self.total_vram * w / total_weight, 2) for w in weights]
-        # Even-split path (flexible split or plain single-GPU).
-        n = count
-        if n is None:
-            if self.is_flexible_split and self.cuda_visible_devices:
-                n = len(self.cuda_visible_devices)
-            else:
-                n = 1
-        n = max(1, n)
+            weight_sum = sum(weights)
+            if weight_sum <= 0:
+                return [total / len(weights)] * len(weights)
+            return [round(total * w / weight_sum, 2) for w in weights]
+        n = max(1, len(gpu_caps))
         if n == 1:
-            return [self.total_vram]
-        return [round(self.total_vram / n, 2)] * n
+            return [total]
+        return [round(total / n, 2)] * n
 
 
 class AppConfig(BaseModel):
@@ -219,15 +403,22 @@ class AppConfig(BaseModel):
         default="/home/servers/llamacpp/bin/llama-server",
         description="Path to llama-server binary"
     )
-    llama_schema_version: Optional[str] = Field(
+    # vLLM support is dormant while unset: existing engine:vllm scripts still
+    # load (the script carries its own executable path), but directory
+    # discovery / skeleton generation is skipped.
+    vllm_binary: Optional[str] = Field(
         default=None,
-        description="Detected llama-server version (e.g., 9030_17df5830e)"
+        description="Path to a vllm executable (typically <venv>/bin/vllm)"
     )
     # Startup auto-load: list of model names to load at app startup.
     # gpu_ids are read from each model's CUDA_VISIBLE_DEVICES at load time
     # (not stored here — the script is the source of truth).
     startup_models: list = Field(default_factory=list, description="Model names to auto-load on startup")
     auto_load_on_startup: bool = Field(default=False, description="If True, load startup_models when the app starts")
+    # Leave engine processes running when Llama Studio stops (Ctrl+C, a
+    # --reload code change), and re-attach to them on the next start. Big
+    # vLLM models take many minutes to load; a restart shouldn't cost that.
+    keep_sessions_on_shutdown: bool = Field(default=True, description="Keep model servers running across Llama Studio restarts")
 
     @field_validator("webui_port")
     def webui_port_must_be_valid(cls, v):
@@ -323,8 +514,10 @@ class ConfigManager:
 
         # Step 1: find GGUFs to generate skeletons for if missing
         logger.info(f"🔍 Searching for GGUF files in: {models_root}")
-        gguf_files = list(models_root.rglob("*.gguf")) if models_root.exists() else []
+        gguf_files = ([p for p in models_root.rglob("*.gguf") if not self._in_hidden_dir(p, models_root)]
+                      if models_root.exists() else [])
         logger.info(f"   Found {len(gguf_files)} GGUF file(s)")
+        claimed_ggufs = self._claimed_gguf_paths(config_models_dir)
 
         for gguf_path in sorted(gguf_files):
             split = parse_split_gguf(gguf_path)
@@ -338,12 +531,64 @@ class ConfigManager:
                 model_name = base_name
             else:
                 model_name = gguf_path.stem
-            if model_name.startswith("mmproj"):
-                logger.debug(f"   Skipping mmproj model: {model_name}")
+            if model_name.startswith(self._AUX_GGUF_PREFIXES):
+                logger.debug(f"   Skipping auxiliary weights: {model_name}")
+                continue
+            try:
+                resolved = gguf_path.resolve()
+            except (OSError, ValueError):
+                resolved = gguf_path
+            if resolved in claimed_ggufs:
+                logger.debug(f"   Already covered by an existing script: {model_name}")
                 continue
             script_path = config_models_dir / f"{model_name}.sh"
             if not script_path.exists():
                 self._generate_skeleton(script_path, model_name, gguf_path)
+
+        # Step 1b: vLLM model discovery — HF-format directories (config.json +
+        # safetensors). Only when a vllm executable is configured (doc 21 §1.4).
+        if self.app_config.vllm_binary and models_root.exists():
+            vllm_flags = None  # captured lazily, only if a skeleton is needed
+            claimed_dirs = self._claimed_model_dirs(config_models_dir)
+            for cfg_file in models_root.rglob("config.json"):
+                if self._in_hidden_dir(cfg_file, models_root):
+                    continue
+                model_dir = cfg_file.parent
+                if not any(model_dir.glob("*.safetensors")):
+                    continue
+                model_name = model_dir.name
+                try:
+                    resolved_dir = model_dir.resolve()
+                except (OSError, ValueError):
+                    resolved_dir = model_dir
+                if resolved_dir in claimed_dirs:
+                    logger.debug(f"   Already covered by an existing script: {model_name}")
+                    continue
+                if self._is_draft_model_dir(cfg_file):
+                    logger.debug(f"   Skipping draft-model weights: {model_name}")
+                    continue
+                script_path = config_models_dir / f"{model_name}.sh"
+                if script_path.exists() or (config_models_dir / f"{model_name}.sh.old").exists():
+                    continue
+                if vllm_flags is None:
+                    # The engine's own `serve --help` is the only source of
+                    # truth for what flags a skeleton may contain.
+                    from engine_flags import get_vllm_serve_flags
+                    vllm_flags = get_vllm_serve_flags(
+                        self.app_config.vllm_binary, self.project_root / "config"
+                    ) or set()
+                try:
+                    text = render_vllm_skeleton_script(
+                        display_name=self._format_display_name(model_name),
+                        model_path=str(model_dir),
+                        vllm_bin=self.app_config.vllm_binary,
+                        available_flags=vllm_flags,
+                    )
+                    write_script_atomic(script_path, text, backup=False)  # brand new file
+                    script_path.chmod(0o755)
+                    logger.info(f"   Generated vLLM skeleton: {script_path.name}")
+                except Exception as e:
+                    logger.error(f"✗ Error generating vLLM skeleton {script_path}: {e}")
 
         # Step 2: load every .sh in config/models.
         # _load_one can trigger a GGUF re-parse (CPU-bound, ~1s/model on large
@@ -406,51 +651,41 @@ class ConfigManager:
         if not (st.st_mode & stat.S_IXUSR):
             script_path.chmod(st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
+        # Backfill the mandatory engine tag into scripts that predate it
+        # (one-line meta-fence patch; inserts the fence if missing entirely).
+        if not parsed.engine_declared:
+            # Merge semantics: this touches the engine line and nothing else.
+            new_text = patch_meta_fence(text, engine=parsed.engine)
+            if write_script_atomic(script_path, new_text):
+                logger.info(f"   Backfilled engine tag ({parsed.engine}) for {script_path.stem}")
+            text = new_text
+            parsed = parse_script(new_text)
+
+        if parsed.engine == "vllm":
+            return self._finish_vllm_model(script_path, parsed)
+
         # Backfill GGUF metadata if missing
         needs_backfill = (
             parsed.model_path
             and Path(parsed.model_path).exists()
             and any(getattr(parsed, f) is None for f in ("block_count", "max_context", "kv_cache_multiplier"))
         )
-        # Determine the ctx + batch + cache types the multiplier should be baked
-        # against, for both backfill and the forced-recompute path. Falls back to
-        # max_context when no ctx is set.
-        script_ctx = parsed.args.get("--ctx-size") or parsed.args.get("-c")
-        try:
-            script_ctx_int = int(script_ctx) if script_ctx else None
-        except (ValueError, TypeError):
-            script_ctx_int = None
-        reference_ctx = script_ctx_int or parsed.max_context
-        script_batch = parsed.args.get("--batch-size") or parsed.args.get("-b")
-        try:
-            script_batch_int = int(script_batch) if script_batch else None
-        except (ValueError, TypeError):
-            script_batch_int = None
-        ctk = parsed.args.get("--cache-type-k") or parsed.args.get("-ctk") or "f16"
-        ctv = parsed.args.get("--cache-type-v") or parsed.args.get("-ctv") or "f16"
-        k_bytes = KV_BYTES.get(str(ctk), 2.0)
-        v_bytes = KV_BYTES.get(str(ctv), 2.0)
-
-        _gguf_kwargs = dict(
-            reference_ctx=reference_ctx,
-            reference_batch_size=script_batch_int,
-            reference_k_bytes=k_bytes,
-            reference_v_bytes=v_bytes,
-        )
+        # The settings the multiplier is baked against, for both backfill and
+        # the forced-recompute path; ctx falls back to max_context when unset.
+        _gguf_kwargs = _gguf_reference(parsed.args, fallback_ctx=parsed.max_context)
 
         if needs_backfill:
             try:
                 meta = parse_gguf_metadata(parsed.model_path, **_gguf_kwargs)
+                # Only the GGUF-derived fields; everything else in the fence
+                # (display_name, health_timeout, engine, …) is left untouched.
                 new_text = patch_meta_fence(
                     text,
-                    display_name=parsed.display_name,
                     block_count=meta.block_count,
                     max_context=meta.max_context,
                     kv_cache_multiplier=meta.kv_cache_multiplier,
-                    # Preserve any existing user-tunable fields across backfill.
-                    health_timeout=parsed.health_timeout,
                 )
-                script_path.write_text(new_text)
+                write_script_atomic(script_path, new_text)
                 text = new_text
                 parsed = parse_script(new_text)
                 logger.debug(f"   Backfilled GGUF metadata for {script_path.stem}")
@@ -465,19 +700,14 @@ class ConfigManager:
                     and fresh.kv_cache_multiplier != parsed.kv_cache_multiplier
                 ):
                     new_text = patch_meta_fence(
-                        text,
-                        display_name=parsed.display_name,
-                        block_count=parsed.block_count,
-                        max_context=parsed.max_context,
-                        kv_cache_multiplier=fresh.kv_cache_multiplier,
-                        health_timeout=parsed.health_timeout,
+                        text, kv_cache_multiplier=fresh.kv_cache_multiplier
                     )
-                    script_path.write_text(new_text)
+                    write_script_atomic(script_path, new_text)
                     text = new_text
                     parsed = parse_script(new_text)
                     logger.info(
                         f"   Refreshed multiplier for {script_path.stem}: "
-                        f"{parsed.kv_cache_multiplier} (ref_ctx={reference_ctx})"
+                        f"{parsed.kv_cache_multiplier} (ref_ctx={_gguf_kwargs['reference_ctx']})"
                     )
             except Exception as e:
                 logger.warning(f"⚠ Could not refresh multiplier for {script_path.stem}: {e}")
@@ -491,14 +721,152 @@ class ConfigManager:
 
         # Compute size and total VRAM
         if mc.model_path and Path(mc.model_path).exists():
-            mc.size_gb = self._get_gguf_size_gb(Path(mc.model_path))
-            mc.total_vram = self._calculate_total_vram(mc)
+            mc.size_gb = round(sum(self._get_gguf_size_gb(p) for p in mc.weight_files if p.exists()), 1)
+            args = mc.launch_args
+            if mc.size_gb and mc.block_count and mc.kv_cache_multiplier and args:
+                ctx = _int_arg(args, "--ctx-size")
+                kv = llama_kv_gb(
+                    mc.block_count, 4096 if ctx is None else ctx, mc.kv_cache_multiplier,
+                    args.get("--cache-type-k"), args.get("--cache-type-v"),
+                )
+                mc.total_vram = round(mc.size_gb + kv, 2)
 
         # Configured check
         ok, reason = parsed.is_configured()
         mc.is_configured = ok
         mc.config_error = reason
         return mc
+
+    def calibrate_load_profile(self, model_name: str, peak_per_gpu_gb: Optional[float] = None) -> None:
+        """Record what a successful load actually cost, for the next prediction.
+
+        Two figures the even-split model cannot know: the heaviest pipeline
+        rank's weight share (vLLM prints one line per rank) and the runtime
+        overhead on that rank, derived from the measured peak minus weights and
+        the KV budget we asked for.
+        """
+
+        mc = self.models.get(model_name)
+        if mc is None or mc.engine != "vllm":
+            return
+        try:
+            log_text = self.get_log_path(model_name).read_text(errors="replace")
+        except Exception:
+            return
+
+        weights_max = heaviest_rank_weights_from_log(log_text)
+        overhead = None
+        if peak_per_gpu_gb and weights_max:
+            budget_gb = (mc.kv_cache_memory_bytes or 0) / GIB
+            overhead = round(max(0.0, peak_per_gpu_gb - weights_max - budget_gb), 2)
+
+        updates = {}
+        if weights_max and weights_max != mc.parsed.weights_max_gb:
+            updates["weights_max_gb"] = weights_max
+        if overhead is not None and overhead != mc.parsed.runtime_overhead_gb:
+            updates["runtime_overhead_gb"] = overhead
+        if updates:
+            updates.update(self._calibration_stamp(mc))
+        if not updates:
+            return
+        try:
+            script_path = self.get_script_path(model_name)
+            new_text = patch_meta_fence(script_path.read_text(), **updates)
+            if write_script_atomic(script_path, new_text):
+                logger.info(f"   Load profile for {model_name}: {updates}")
+            self.rescan_model(model_name)
+        except Exception as e:
+            logger.warning(f"⚠ Could not store load profile for {model_name}: {e}")
+
+    def calibrate_kv_bytes_per_token(self, model_name: str) -> Optional[int]:
+        """Read the exact KV bytes/token back from a successful load's log.
+
+        vLLM reports both the KV pool size in GiB and in tokens; their ratio is
+        exact, and it is the only trustworthy figure for architectures whose KV
+        shape isn't the standard one. Cached in the meta fence (a measurement,
+        not a setting) and only written when it actually changes.
+        """
+
+        mc = self.models.get(model_name)
+        if mc is None or mc.engine != "vllm":
+            return None
+        try:
+            log_path = self.get_log_path(model_name)
+            measured = calibrate_from_log(
+                log_path.read_text(errors="replace"), mc.kv_cache_memory_bytes
+            )
+        except Exception as e:
+            logger.debug(f"   Could not calibrate KV for {model_name}: {e}")
+            return None
+        if not measured:
+            return measured
+        updates = self._calibration_stamp(mc)
+        if measured != mc.parsed.kv_bytes_per_token:
+            updates["kv_bytes_per_token"] = measured
+        if not updates:
+            return measured
+        try:
+            script_path = self.get_script_path(model_name)
+            new_text = patch_meta_fence(script_path.read_text(), **updates)
+            if write_script_atomic(script_path, new_text):
+                logger.info(f"   Calibrated KV for {model_name}: {measured} bytes/token")
+            self.rescan_model(model_name)
+        except Exception as e:
+            logger.warning(f"⚠ Could not store calibrated KV for {model_name}: {e}")
+        return measured
+
+    @staticmethod
+    def _calibration_stamp(mc: ModelConfig) -> Dict[str, Any]:
+        """Meta-fence fields recording the setup a measurement was taken at, where
+        they differ from what is stored. ParsedScript.load_profile discards the
+        figures once the setup changes (GPU count, layer split, KV cache dtype)."""
+        p = mc.parsed
+        current = {
+            "calibrated_gpus": mc.gpu_count,
+            "calibrated_partition": ",".join(str(n) for n in (p.pp_layer_partition or [])) or None,
+            "calibrated_kv_dtype": p.kv_cache_dtype,
+        }
+        stored = {
+            "calibrated_gpus": p.calibrated_gpus,
+            "calibrated_partition": p.calibrated_partition,
+            "calibrated_kv_dtype": p.calibrated_kv_dtype,
+        }
+        return {k: v for k, v in current.items() if v != stored[k]}
+
+    def _finish_vllm_model(self, script_path: Path, parsed: ParsedScript) -> ModelConfig:
+        """Build a ModelConfig for an engine:vllm script.
+
+        No GGUF metadata, no KV-cache math: size comes from the vram_gb meta
+        field or a safetensors sum, and total_vram stays None (fitting uses
+        gpu_memory_utilization × GPU capacity instead — doc 21 decision 3).
+        """
+        mc = ModelConfig(
+            name=script_path.stem,
+            script_path=script_path,
+            parsed=parsed,
+            default_llama_bin=self.app_config.llama_server_binary if self.app_config else None,
+        )
+        if parsed.vram_gb is not None:
+            mc.size_gb = parsed.vram_gb
+        elif parsed.model_path and Path(parsed.model_path).is_dir():
+            mc.size_gb = self._get_safetensors_size_gb(Path(parsed.model_path))
+        # Trained context bounds the calculator's slider, exactly as the GGUF
+        # max_context does for llama.cpp. Read live rather than cached: it is a
+        # property of the model directory, not something the user configures.
+        if parsed.model_path and Path(parsed.model_path).is_dir():
+            mc.vllm_max_context = max_context_from_config(parsed.model_path)
+        ok, reason = parsed.is_configured()
+        mc.is_configured = ok
+        mc.config_error = reason
+        return mc
+
+    def _get_safetensors_size_gb(self, model_dir: Path) -> Optional[float]:
+        try:
+            total = sum(p.stat().st_size for p in model_dir.rglob("*.safetensors"))
+            return round(total / (1024 ** 3), 1) if total else None
+        except Exception as e:
+            logger.warning(f"⚠ Could not size {model_dir}: {e}")
+            return None
 
     def _sync_disabled_scripts(self, config_dir: Path) -> None:
         """Rename `.sh` ↔ `.sh.old` based on whether each script's model file exists.
@@ -563,7 +931,7 @@ class ConfigManager:
                 max_context=meta.max_context,
                 kv_cache_multiplier=meta.kv_cache_multiplier,
             )
-            script_path.write_text(text)
+            write_script_atomic(script_path, text, backup=False)  # brand new file
             script_path.chmod(0o755)
             logger.debug(f"   Generated skeleton: {script_path}")
         except Exception as e:
@@ -586,107 +954,85 @@ class ConfigManager:
             logger.error(f"✗ Error rescanning {model_name}: {e}")
             return None
 
-    def save_model_script(
+    def save_script_edits(
         self,
-        model_name: str,
+        source: str,
+        dest: str,
         *,
-        display_name: str,
-        model_path: str,
-        llama_bin: str,
         args: Dict[str, Optional[str]],
-        health_timeout: Optional[int] = None,
-    ) -> ModelConfig:
-        """Update a model's script by patching the launch-args and meta fences in place.
+        display_name=None,
+        health_timeout=None,
+        llama_bin: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Optional[ModelConfig]:
+        """Apply structured edits to `source`'s script and write the result as `dest`.
 
-        Preserves any user content outside the fences. If the script doesn't
-        exist yet, creates one from scratch.
+        The one save path for both engines (dest != source is Save-As). Only the
+        launch line, the meta fence and assignments that actually changed are
+        rewritten; every other line — comments, exports, CUDA_VISIBLE_DEVICES —
+        is kept byte-for-byte, and unchanged arguments keep their spelling.
 
-        `health_timeout`: optional per-model override (seconds). Pass None to
-        omit the line from the meta fence (load uses DEFAULT_HEALTH_TIMEOUT).
-
-        Side effect: for SWA-architecture models, re-parses the GGUF with the
-        saved --ctx-size as the reference context, so the cached
-        `kv_cache_multiplier` is accurate for the just-saved configuration.
-        Non-SWA models also re-parse (cheap and harmless) so any architectural
-        refinements in the parser propagate on save.
+        - `llama_bin`: a new llama-server path. Written to the script's
+          LLAMA_BIN= assignment when the exec line uses it, else to the exec line.
+        - `env`: the full set of preamble assignments the user kept (vLLM);
+          removed ones are deleted, changed ones rewritten.
+        - llama.cpp: the GGUF is re-read against the saved ctx/batch/cache types,
+          so the fence's kv_cache_multiplier matches the new configuration.
         """
-        script_path = self.project_root / "config" / "models" / f"{model_name}.sh"
-        script_path.parent.mkdir(parents=True, exist_ok=True)
+        mc = self.get_model_config(source)
+        parsed = mc.parsed
+        text = mc.script_path.read_text()
 
-        # Pull GGUF metadata for the meta fence (use existing parsed as fallback)
-        existing = self.models.get(model_name)
-        block_count = existing.block_count if existing else None
-        max_context = existing.max_context if existing else None
-        kv_cache_multiplier = existing.kv_cache_multiplier if existing else None
+        binary = None
+        if llama_bin and llama_bin != parsed.llama_bin:
+            if "LLAMA_BIN" in extract_assignments(text):
+                text = patch_env_assignment(text, "LLAMA_BIN", llama_bin)
+            else:
+                binary = llama_bin
+        text = patch_exec_invocation(text, args=args, parsed=parsed, binary=binary)
 
-        # Re-parse GGUF using the about-to-be-saved ctx + batch + cache types so
-        # SWA models get an accurate multiplier AND the compute-buffer overhead
-        # is baked for the user's actual config. Falls back to cached values if
-        # the file is missing or parsing fails.
-        new_ctx = args.get("--ctx-size") or args.get("-c")
-        try:
-            new_ctx_int = int(new_ctx) if new_ctx not in (None, "") else None
-        except (ValueError, TypeError):
-            new_ctx_int = None
-        new_batch = args.get("--batch-size") or args.get("-b")
-        try:
-            new_batch_int = int(new_batch) if new_batch not in (None, "") else None
-        except (ValueError, TypeError):
-            new_batch_int = None
-        ctk = args.get("--cache-type-k") or args.get("-ctk") or "f16"
-        ctv = args.get("--cache-type-v") or args.get("-ctv") or "f16"
-        k_bytes = KV_BYTES.get(str(ctk), 2.0)
-        v_bytes = KV_BYTES.get(str(ctv), 2.0)
-        if model_path and Path(model_path).exists():
+        if env:
+            for gone in set(parsed.env_assignments) - set(env):
+                text = patch_env_assignment(text, gone, None)
+            for name, value in env.items():
+                if parsed.env_assignments.get(name) != value:
+                    text = patch_env_assignment(text, name, value)
+
+        meta = {}
+        if mc.engine != "vllm":
+            meta = self._gguf_meta_for(mc, args)
+        text = patch_meta_fence(text, display_name=display_name, health_timeout=health_timeout, **meta)
+        if display_name and "$DISPLAY_NAME" in text:
+            text = patch_display_name_var(text, display_name)
+
+        dest_path = self.get_script_path(dest)
+        is_new = not dest_path.exists()
+        write_script_atomic(dest_path, text)
+        if is_new:
+            dest_path.chmod(0o755)
+        return self.rescan_model(dest)
+
+    def _gguf_meta_for(self, mc: ModelConfig, args: Dict[str, Optional[str]]) -> Dict[str, Any]:
+        """GGUF meta-fence fields re-read for the settings about to be saved.
+
+        SWA models' kv_cache_multiplier depends on the context and the compute
+        buffer on batch/cache types, so both are baked for the saved values.
+        Falls back to the cached figures if the file is missing or unreadable.
+        """
+        meta = {
+            "block_count": mc.block_count,
+            "max_context": mc.max_context,
+            "kv_cache_multiplier": mc.kv_cache_multiplier,
+        }
+        if mc.model_path and Path(mc.model_path).exists():
             try:
-                fresh = parse_gguf_metadata(
-                    model_path,
-                    reference_ctx=new_ctx_int,
-                    reference_batch_size=new_batch_int,
-                    reference_k_bytes=k_bytes,
-                    reference_v_bytes=v_bytes,
-                )
-                if fresh.block_count is not None:
-                    block_count = fresh.block_count
-                if fresh.max_context is not None:
-                    max_context = fresh.max_context
-                if fresh.kv_cache_multiplier is not None:
-                    kv_cache_multiplier = fresh.kv_cache_multiplier
+                fresh = parse_gguf_metadata(mc.model_path, **_gguf_reference(args))
+                for key in meta:
+                    if getattr(fresh, key) is not None:
+                        meta[key] = getattr(fresh, key)
             except Exception as e:
-                logger.warning(f"⚠ GGUF re-parse on save failed for {model_name}: {e}")
-
-        if script_path.exists():
-            text = script_path.read_text()
-            text = patch_meta_fence(
-                text,
-                display_name=display_name,
-                block_count=block_count,
-                max_context=max_context,
-                kv_cache_multiplier=kv_cache_multiplier,
-                health_timeout=health_timeout,
-            )
-            text = patch_launch_args_fence(
-                text,
-                llama_bin=llama_bin,
-                model_path=model_path,
-                args=args,
-            )
-        else:
-            from launch_script import render_script
-            text = render_script(
-                display_name=display_name,
-                block_count=block_count,
-                max_context=max_context,
-                kv_cache_multiplier=kv_cache_multiplier,
-                llama_bin=llama_bin,
-                model_path=model_path,
-                args=args,
-                health_timeout=health_timeout,
-            )
-
-        script_path.write_text(text)
-        script_path.chmod(0o755)
-        return self.rescan_model(model_name)
+                logger.warning(f"⚠ GGUF re-parse on save failed for {mc.name}: {e}")
+        return meta
 
     def save_cuda_visible_devices(self, model_name: str, ids: Optional[list]) -> Optional[ModelConfig]:
         """Update the script's CUDA_VISIBLE_DEVICES line, no-op if unchanged.
@@ -708,8 +1054,7 @@ class ConfigManager:
                 return existing
         text = script_path.read_text()
         new_text = patch_cuda_visible_devices(text, ids)
-        if new_text != text:
-            script_path.write_text(new_text)
+        if write_script_atomic(script_path, new_text):
             logger.info(f"✓ Updated CVD for {model_name}: {ids}")
         return self.rescan_model(model_name)
 
@@ -719,11 +1064,199 @@ class ConfigManager:
     def get_script_text(self, model_name: str) -> str:
         return self.get_script_path(model_name).read_text()
 
+    # --- Deleting scripts -----------------------------------------------------
+
+    def delete_script(self, model_name: str) -> dict:
+        """Move a model's launch script to config/models/.trash/. Weights are
+        never touched, so if this was the model's only script a rescan (or the
+        next startup) regenerates a fresh skeleton for it.
+
+        Returns {trashed, remaining, target}. Raises FileNotFoundError if there
+        is no such script.
+        """
+        path = self.get_script_path(model_name)
+        if not path.exists():
+            raise FileNotFoundError(f"No script for model: {model_name}")
+
+        mc = self.models.get(model_name)
+        target = None
+        if mc and mc.model_path:
+            try:
+                target = Path(mc.model_path).resolve()
+            except (OSError, ValueError):
+                target = None
+
+        remaining = self.sibling_script_count(model_name)
+
+        dest = self._trash_script(path)
+        self.models.pop(model_name, None)
+        logger.info(
+            f"🗑 Deleted script {path.name} → {dest.name} (remaining refs: {remaining})"
+        )
+        return {"trashed": str(dest), "remaining": remaining,
+                "target": str(target) if target else None}
+
+    @staticmethod
+    def _trash_script(path: Path) -> Path:
+        trash = path.parent / ".trash"
+        trash.mkdir(exist_ok=True)
+        dest = trash / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}"
+        path.rename(dest)
+        return dest
+
+    def _referencing_scripts(self, config_dir: Path, target: Path, exclude: str) -> list:
+        """Names of OTHER scripts whose text mentions this resolved path anywhere
+        (primary -m/serve, --model-draft, or --mmproj). A substring match on the
+        absolute path, so it catches drafter/projector reuse across engines."""
+        try:
+            needle = str(target.resolve())
+        except (OSError, ValueError):
+            needle = str(target)
+        out = []
+        for script in config_dir.glob("*.sh*"):
+            if script.name.endswith(".sh"):
+                name = script.name[:-3]
+            elif script.name.endswith(".sh.old"):
+                name = script.name[:-7]
+            else:
+                continue
+            if name == exclude:
+                continue
+            try:
+                if needle in script.read_text(errors="replace"):
+                    out.append(name)
+            except OSError:
+                continue
+        return out
+
+    def _weight_files(self, target: Path):
+        """(files to delete, total bytes). Split GGUF → all shards; single GGUF →
+        itself; directory → everything under it. A shared mmproj-* projector is
+        never included for a GGUF model (it belongs to the folder, not this config)."""
+        files = []
+        if target.is_dir():
+            files = [f for f in target.rglob("*") if f.is_file()]
+        else:
+            split = parse_split_gguf(target)
+            if split is not None:
+                base, _idx, total = split
+                for i in range(1, total + 1):
+                    part = target.with_name(f"{base}-{i:05d}-of-{total:05d}.gguf")
+                    if part.exists():
+                        files.append(part)
+            elif target.exists():
+                files.append(target)
+        total_bytes = 0
+        for f in files:
+            try:
+                total_bytes += f.stat().st_size
+            except OSError:
+                continue
+        return files, total_bytes
+
+    def model_weight_info(self, model_name: str) -> dict:
+        """Everything the delete-model confirmation needs: the resolved weight
+        path, whether it is a directory / symlink, its size, the shard/file count,
+        and any OTHER scripts referencing it (which block deletion)."""
+        config_dir = self.project_root / "config" / "models"
+        mc = self.models.get(model_name)
+        info = {"has_target": False, "path": None, "exists": False,
+                "is_dir": False, "is_symlink": False, "size_gb": 0.0,
+                "file_count": 0, "referenced_by": []}
+        if not (mc and mc.model_path):
+            return info
+        p = Path(mc.model_path)
+        info.update(has_target=True, path=str(p))
+        if not p.exists():
+            return info
+        info["exists"] = True
+        info["is_symlink"] = p.is_symlink()
+        info["is_dir"] = p.is_dir()
+        info["referenced_by"] = self._referencing_scripts(config_dir, p, model_name)
+        files, total = self._weight_files(p)
+        info["file_count"] = len(files)
+        info["size_gb"] = round(total / (1024 ** 3), 2)
+        return info
+
+    def delete_model(self, model_name: str) -> dict:
+        """Delete a model's launch script AND its weights from disk. Guards:
+        refuses if another script references the weights (primary or drafter),
+        if another script still serves the same model path, or if the path is a
+        symlink (its real target may be shared). The script is trashed; the
+        weights are unlinked (they are the point of this operation).
+        """
+        config_dir = self.project_root / "config" / "models"
+        path = self.get_script_path(model_name)
+        if not path.exists():
+            raise FileNotFoundError(f"No script for model: {model_name}")
+
+        info = self.model_weight_info(model_name)
+        if info["referenced_by"]:
+            raise ValueError(
+                "weights are referenced by other script(s): "
+                + ", ".join(info["referenced_by"])
+            )
+        if self.sibling_script_count(model_name) > 0:
+            raise ValueError("another script still serves this model")
+        if info["exists"] and info["is_symlink"]:
+            raise ValueError(
+                "the model path is a symlink; delete its real target manually "
+                "to avoid removing shared data"
+            )
+
+        target = Path(info["path"]) if info["path"] else None
+
+        # Trash the script; the weights are being removed below.
+        self._trash_script(path)
+        self.models.pop(model_name, None)
+
+        removed_files, removed_bytes = 0, 0
+        if target and target.exists():
+            files, _ = self._weight_files(target)
+            for f in files:
+                try:
+                    b = f.stat().st_size
+                    f.unlink()
+                    removed_files += 1
+                    removed_bytes += b
+                except OSError as e:
+                    logger.warning(f"⚠ Could not remove {f}: {e}")
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+
+        gb = round(removed_bytes / (1024 ** 3), 2)
+        logger.info(
+            f"🗑💥 Deleted model {model_name}: removed {removed_files} file(s), "
+            f"{gb} GB from {target}"
+        )
+        return {"removed_files": removed_files, "gb": gb,
+                "target": str(target) if target else None}
+
+    def sibling_script_count(self, model_name: str) -> int:
+        """How many OTHER loaded scripts serve the same model path as this one."""
+        mc = self.models.get(model_name)
+        if not mc or not mc.model_path:
+            return 0
+        try:
+            target = Path(mc.model_path).resolve()
+        except (OSError, ValueError):
+            return 0
+        count = 0
+        for name, other in self.models.items():
+            if name == model_name or not other.model_path:
+                continue
+            try:
+                if Path(other.model_path).resolve() == target:
+                    count += 1
+            except (OSError, ValueError):
+                continue
+        return count
+
     def save_script_text(self, model_name: str, text: str) -> ModelConfig:
         """Overwrite a model's script with raw text (used by the 'raw script' editor tab)."""
         path = self.get_script_path(model_name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        write_script_atomic(path, text)
         path.chmod(0o755)
         return self.rescan_model(model_name)
 
@@ -746,24 +1279,91 @@ class ConfigManager:
             logger.warning(f"⚠ Could not get size for {gguf_path}: {e}")
             return 0.0
 
-    def _calculate_total_vram(self, mc: ModelConfig) -> Optional[float]:
-        if not mc.size_gb or not mc.block_count or not mc.kv_cache_multiplier:
-            return None
-        args = mc.launch_args
-        if not args:
-            return None
-        ctx_size = args.get("--ctx-size") or args.get("-c") or 4096
-        cache_type_k = args.get("--cache-type-k") or args.get("-ctk") or "f16"
-        cache_type_v = args.get("--cache-type-v") or args.get("-ctv") or "f16"
+    # GGUF stems that are never a servable model on their own: multimodal
+    # projectors and MTP/speculative drafter weights, which exist only to be
+    # referenced by another script (--mmproj / --model-draft).
+    _AUX_GGUF_PREFIXES = ("mmproj", "mtp")
+
+    def _claimed_gguf_paths(self, config_dir: Path) -> set:
+        """Resolved paths of every GGUF already referenced by an existing script.
+
+        A script's filename is user-owned and routinely diverges from the GGUF
+        stem — a vendor prefix dropped, a variant suffix added — and drafter
+        GGUFs are only ever named on a --model-draft line. Claiming by the
+        referenced path rather than by filename keeps the scanner from dropping
+        a duplicate skeleton next to the curated script that already covers it.
+        """
+        claimed = set()
+        for script in config_dir.glob("*.sh*"):  # .sh plus disabled .sh.old
+            try:
+                text = script.read_text(errors="replace")
+            except OSError:
+                continue
+            for ref in re.findall(r"""[^\s"'=]+\.gguf""", text):
+                try:
+                    claimed.add(Path(ref).resolve())
+                except (OSError, ValueError):
+                    continue
+        return claimed
+
+    def _claimed_model_dirs(self, config_dir: Path) -> set:
+        """Resolved model directories already served by, or drafting for, a script.
+
+        The vLLM counterpart of `_claimed_gguf_paths`. Claiming by filename alone
+        (`<dir name>.sh`) regenerated a duplicate skeleton whenever a script's
+        name stopped matching its weights directory: Save As + deleting the
+        original, a rename, or a script written by hand under a better name.
+        The parsed model path is used rather than a regex over the text because
+        vLLM scripts commonly name the model through a variable
+        (`MODEL="${X:-/path}"`, `serve "$MODEL"`). A speculative-config drafter
+        directory counts too, so it never gets a skeleton of its own.
+        """
+        claimed = set()
+        for script in config_dir.glob("*.sh*"):  # .sh plus disabled .sh.old
+            try:
+                ps = parse_script(script.read_text(errors="replace"))
+            except Exception:
+                continue
+            refs = [ps.model_path]
+            spec = ps.args.get("--speculative-config")
+            if spec:
+                try:
+                    refs.append((json.loads(spec) or {}).get("model"))
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    pass
+            for ref in refs:
+                if not ref:
+                    continue
+                try:
+                    claimed.add(Path(ref).resolve())
+                except (OSError, ValueError):
+                    continue
+        return claimed
+
+    # Architectures that only exist to propose tokens for a target model
+    # (DFlash2DraftModel, EagleLlamaForCausalLM, ...): never servable alone.
+    _DRAFT_ARCH_RE = re.compile(r"Draft|Eagle|Medusa|DFlash", re.IGNORECASE)
+
+    def _is_draft_model_dir(self, cfg_file: Path) -> bool:
         try:
-            ctx_size = int(ctx_size)
-        except (ValueError, TypeError):
-            ctx_size = 4096
-        kv = calculate_kv_cache_gb(
-            mc.block_count, ctx_size, mc.kv_cache_multiplier,
-            str(cache_type_k), str(cache_type_v),
-        )
-        return round(mc.size_gb + kv, 2)
+            cfg = json.loads(cfg_file.read_text())
+        except Exception:
+            return False
+        archs = cfg.get("architectures") or []
+        return any(self._DRAFT_ARCH_RE.search(str(a)) for a in archs)
+
+    @staticmethod
+    def _in_hidden_dir(path: Path, root: Path) -> bool:
+        """True under a dot-directory: desktop trash (.Trash-1000), HF .cache, etc.
+
+        Weights moved to the trash are still on disk, and a skeleton for them
+        would resurrect a model the user deliberately threw away.
+        """
+        try:
+            parts = path.relative_to(root).parts[:-1]
+        except ValueError:
+            return False
+        return any(part.startswith(".") for part in parts)
 
     def _format_display_name(self, filename: str) -> str:
         name = filename.replace('.gguf', '')

@@ -1,21 +1,14 @@
-<div class="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50"
-     id="modal"
-     onclick="if(event.target.id === 'modal') document.getElementById('modal').remove();">
-    <div class="bg-gray-800 border border-gray-600 rounded-lg p-6 w-full max-w-3xl max-h-[90vh] flex flex-col"
-         onclick="event.stopPropagation()">
+{% extends "modals/config_modal_base.html" %}
+{% set form_id = "llama-config-form" %}
 
-        <div class="flex justify-between items-center mb-4">
-            <h2 class="text-xl font-bold">Edit Model Configuration</h2>
-            <button onclick="document.getElementById('modal').remove();"
-                    class="text-gray-400 hover:text-white text-2xl">×</button>
-        </div>
-
-        <form hx-post="/api/save-model-config-new"
+{% block fields %}
+        <form id="llama-config-form"
+              hx-post="/api/save-llama-config"
               hx-target="#modal-container"
               hx-swap="innerHTML"
-              class="flex flex-col flex-1 gap-6 overflow-y-auto pr-2">
+              class="flex flex-col gap-6">
 
-            <input type="hidden" name="model_name" value="{{ model_name }}">
+            <input type="hidden" id="modal-model-name" name="model_name" value="{{ model_name }}">
 
             <!-- CORE FIELDS SECTION -->
             <fieldset>
@@ -362,23 +355,10 @@
                           class="w-full h-40 px-2 py-1 bg-gray-900 border border-gray-700 rounded text-xs font-mono text-gray-300"></textarea>
             </fieldset>
 
-            <!-- Buttons -->
-            <div class="flex gap-3 mt-6">
-                <button type="button"
-                        onclick="document.getElementById('modal').remove();"
-                        class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold">
-                    Cancel
-                </button>
-                <button type="submit"
-                        onclick="serializeFormData(); return true;"
-                        class="flex-1 px-4 py-2 rounded bg-green-600 hover:bg-green-500 text-white font-bold">
-                    Save Configuration
-                </button>
-            </div>
         </form>
-    </div>
-</div>
+{% endblock %}
 
+{% block overlays %}
 <!-- Paste Script nested modal -->
 <div id="paste-script-modal"
      class="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center z-[70] hidden"
@@ -443,10 +423,34 @@
         </div>
     </div>
 </div>
+{% endblock %}
 
-<script>
+{% block engine_js %}
 // Get all option schema from backend (injected in template)
 window.OPTION_SCHEMA = {{ option_schema | tojson }};
+
+// Footer Save button calls this before submitting the primary form.
+function modalSerialize() { serializeFormData(); }
+
+// Save-As hooks consumed by the shared dialog (_saveas_dialog.html).
+window.SAVEAS = {
+    saveUrl: '/api/save-llama-config',
+    sourceName: () => document.getElementById('modal-model-name').value,
+    currentPort: () => parseInt(document.querySelector('input[name="port"]').value) || 8000,
+    currentDisplay: () => document.querySelector('input[name="display_name"]').value,
+    collect: ({ port, displayName }) => {
+        serializeFormData();  // fills #core-json-field and #advanced-json-field
+        let core = {};
+        try { core = JSON.parse(document.getElementById('core-json-field').value) || {}; } catch (e) {}
+        core.display_name = (displayName || '').trim() || null;
+        const p = parseInt(port);
+        if (p) core.port = p;                     // fork gets its own port
+        return {
+            core_json: JSON.stringify(core),
+            advanced_json: document.getElementById('advanced-json-field').value,
+        };
+    },
+};
 
 function addLaunchArg() {
     const table = document.getElementById('launch-args-table');
@@ -784,17 +788,9 @@ document.getElementById('ctx-slider')?.addEventListener('input', runBatchAdvisor
 // VRAM Calculator
 // ============================================================================
 
-window.KV_BYTES = {
-    'f16': 2.0,
-    'q8_0': 1.0,
-    'q6_k': 0.75,
-    'q5_k': 0.625,
-    'q5_0': 0.625,
-    'q4_k': 0.5,
-    'q4_0': 0.5,
-    'q3_k': 0.375
-};
-
+// Always overwrite — stale values from a previously-opened modal cause cross-model
+// VRAM miscalcs (the new modal's slider/dropdowns are fresh, but block_count etc.
+// would silently inherit from the prior model).
 window.VRAM_CONFIG = {
     kv_cache_multiplier: {{ kv_cache_multiplier or 0 }},
     block_count: {{ block_count or 0 }},
@@ -923,7 +919,17 @@ window.validateLlamaPath = async function() {
 
 window.openConfigFileBrowser = function(pathType) {
     const currentPath = document.getElementById('llama-path-input').value || '';
-    const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}&modal=settings`;
+    const url = `/api/file-browser?path_type=${pathType}&current_path=${encodeURIComponent(currentPath)}`;
+
+    // The file browser is shared with the Settings modal, so register where this
+    // pick should land instead of redefining the global selectPath — doing that
+    // used to leave Settings permanently broken once a model config was opened.
+    window.filePickerOnSelect = function(path) {
+        document.getElementById('llama-path-input').value = path;
+        document.getElementById('file-browser-modal').classList.add('hidden');
+        window.filePickerOnSelect = null;
+        validateLlamaPath();
+    };
 
     htmx.ajax('GET', url, {
         target: '#file-browser-content',
@@ -932,13 +938,7 @@ window.openConfigFileBrowser = function(pathType) {
     document.getElementById('file-browser-modal').classList.remove('hidden');
 };
 
-window.selectPath = function(path) {
-    document.getElementById('llama-path-input').value = path;
-    document.getElementById('file-browser-modal').classList.add('hidden');
-    validateLlamaPath();
-};
-
-// Initial calculations and checks on load
+// Run calculation on modal load
 updateVramEstimate();
 loadScriptPreview();
 runBatchAdvisorCheck();
@@ -1091,4 +1091,4 @@ function addAdvancedRow(key, value) {
     }
     table.appendChild(row);
 }
-</script>
+{% endblock %}

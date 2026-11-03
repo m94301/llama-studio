@@ -8,17 +8,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from launch_script import (  # noqa: E402
+    canonical_args,
     parse_script,
     parse_pasted_script,
     render_script,
     render_skeleton_script,
     patch_meta_fence,
-    patch_launch_args_fence,
     patch_cuda_visible_devices,
     META_BEGIN,
     META_END,
-    ARGS_BEGIN,
-    ARGS_END,
 )
 
 
@@ -34,7 +32,6 @@ CANONICAL = """#!/usr/bin/env bash
 
 LLAMA_BIN=/home/servers/llamacpp/bin/llama-server
 
-# === llama-studio:launch-args BEGIN ===
 exec "$LLAMA_BIN" \\
   -m /home/models/Qwen3.6-27B-Q4_K_M.gguf \\
   --host 0.0.0.0 \\
@@ -43,7 +40,6 @@ exec "$LLAMA_BIN" \\
   --cache-type-k q8_0 \\
   --cache-type-v q8_0 \\
   --no-mmap
-# === llama-studio:launch-args END ===
 """
 
 
@@ -65,11 +61,11 @@ def test_meta_fence_missing_warns():
     assert any("meta fence missing" in w for w in ps.warnings)
 
 
-# ---------- launch-args fence ----------
+# ---------- launch invocation ----------
 
-def test_args_fence_parses_canonical():
+def test_invocation_parses_canonical():
     ps = parse_script(CANONICAL)
-    assert ps.has_args_fence is True
+    assert ps.has_invocation is True
     assert ps.llama_bin == "/home/servers/llamacpp/bin/llama-server"
     assert ps.model_path == "/home/models/Qwen3.6-27B-Q4_K_M.gguf"
     assert ps.host == "0.0.0.0"
@@ -201,9 +197,6 @@ def test_render_basic():
     assert "#!/usr/bin/env bash" in text
     assert META_BEGIN in text
     assert META_END in text
-    # New format: no launch-args fence markers
-    assert ARGS_BEGIN not in text
-    assert ARGS_END not in text
     assert "display_name: Test" in text
     assert "-m /m.gguf" in text
     assert "--port 8100" in text
@@ -311,64 +304,6 @@ def test_patch_meta_fence_updates_in_place():
     assert ps.kv_cache_multiplier == 30
     # Launch args fence untouched
     assert ps.port == 8100
-
-
-def test_patch_args_fence_updates_in_place():
-    text = render_script(
-        display_name="X",
-        block_count=64,
-        max_context=4096,
-        kv_cache_multiplier=128,
-        llama_bin="/bin/llama-server",
-        model_path="/m.gguf",
-        args={"--port": "8100"},
-    )
-    new = patch_launch_args_fence(
-        text,
-        llama_bin="/bin/llama-server",
-        model_path="/other.gguf",
-        args={"--port": "9000", "--ctx-size": "8192"},
-    )
-    ps = parse_script(new)
-    assert ps.model_path == "/other.gguf"
-    assert ps.port == 9000
-    assert ps.args["--ctx-size"] == "8192"
-    # Meta fence untouched
-    assert ps.display_name == "X"
-    assert ps.block_count == 64
-
-
-def test_patch_overwrites_body_below_meta_fence():
-    """New contract: form-saves rewrite everything below the meta fence wholesale.
-
-    User content (custom env exports, sourced files) between meta and the exec
-    line is intentionally clobbered — preserved decision when dropping the
-    launch-args fence markers. The meta fence itself must survive untouched.
-    """
-    text = render_script(
-        display_name="X",
-        block_count=42,
-        max_context=None,
-        kv_cache_multiplier=None,
-        llama_bin="/bin/llama-server",
-        model_path="/m.gguf",
-        args={"--port": "8100"},
-    )
-    new = patch_launch_args_fence(
-        text,
-        llama_bin="/bin/llama-server",
-        model_path="/m.gguf",
-        args={"--port": "9999"},
-    )
-    # Meta fence preserved
-    ps = parse_script(new)
-    assert ps.display_name == "X"
-    assert ps.block_count == 42
-    # New port reflected in the rewritten invocation
-    assert ps.port == 9999
-    # No legacy fence markers in output
-    assert ARGS_BEGIN not in new
-    assert ARGS_END not in new
 
 
 # ---------- migration round-trip: legacy JSON shapes ----------
@@ -616,7 +551,13 @@ def test_patch_meta_fence_adds_health_timeout():
     assert ps.port == 8100
 
 
-def test_patch_meta_fence_strips_health_timeout_when_omitted():
+def test_patch_meta_fence_strips_health_timeout_when_explicitly_none():
+    """Passing None clears a field — this is how the UI empties the timeout box.
+
+    (Before the merge-semantics fix, *omitting* the kwarg also cleared it, which
+    meant any caller that forgot a field silently destroyed it. Omission now
+    preserves; see test_patch_meta_fence_preserves_omitted_fields.)
+    """
     text = render_script(
         display_name="X",
         block_count=64,
@@ -627,16 +568,30 @@ def test_patch_meta_fence_strips_health_timeout_when_omitted():
         args={"--port": "8100"},
         health_timeout=300,
     )
-    new = patch_meta_fence(
-        text,
+    new = patch_meta_fence(text, health_timeout=None)
+    assert "health_timeout" not in new
+    ps = parse_script(new)
+    assert ps.health_timeout is None
+
+
+def test_patch_meta_fence_preserves_omitted_fields():
+    text = render_script(
         display_name="X",
         block_count=64,
         max_context=4096,
         kv_cache_multiplier=128,
+        llama_bin="/bin/llama-server",
+        model_path="/m.gguf",
+        args={"--port": "8100"},
+        health_timeout=300,
     )
-    assert "health_timeout" not in new
+    new = patch_meta_fence(text, block_count=99)  # mentions one field only
     ps = parse_script(new)
-    assert ps.health_timeout is None
+    assert ps.block_count == 99
+    assert ps.display_name == "X"
+    assert ps.max_context == 4096
+    assert ps.kv_cache_multiplier == 128
+    assert ps.health_timeout == 300
 
 
 # ---------- migration round-trip: legacy JSON shapes ----------
@@ -727,3 +682,10 @@ def test_tensor_split_short_alias():
     ps = parse_script(_script_with_args("  -ts 2,1 \\\n"))
     assert ps.gpu_count == 2
     assert ps.tensor_split_weights == [2.0, 1.0]
+
+
+def test_canonical_args_matches_parser_spelling():
+    # Form rows may use short aliases; they must end up in the same long form
+    # the parser produces, keeping order, with a later duplicate winning.
+    args = canonical_args({"--ctx-size": "4096", "-ts": "1,1", "--no-mmap": None, "-c": "8192"})
+    assert args == {"--ctx-size": "8192", "--tensor-split": "1,1", "--no-mmap": None}

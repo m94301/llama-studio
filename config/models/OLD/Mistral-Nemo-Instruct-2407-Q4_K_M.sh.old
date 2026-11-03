@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# === llama-studio:meta BEGIN ===
+# display_name: Mistral Nemo Instruct 2407 Q4 K M
+# block_count: 40
+# max_context: 1024000
+# kv_cache_multiplier: 1092
+# === llama-studio:meta END ===
+LLAMA_BIN=/home/m6/projects/llama.cpp/build-cuda-avx1/bin/llama-server
+export CUDA_VISIBLE_DEVICES=0
+
+exec "$LLAMA_BIN" \
+  -m /home/m6/models/drive1/lmstudio-community/Mistral-Nemo-Instruct-2407-GGUF/Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
+  --host 0000 \
+  --port 8012 \
+  --ctx-size 294400 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --gpu-layers 999 \
+  --batch-size 512 \
+  --threads 12

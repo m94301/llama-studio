@@ -1,0 +1,49 @@
+<!-- frontend/templates/modals/save_success.html -->
+{% extends "base_modal.html" %}
+{% set color = "green" if is_configured else "yellow" %}
+{% set title = ("✓ " if is_configured else "⚠ ") ~ "Configuration Saved" %}
+{% set title_class = "text-" ~ color ~ "-400" %}
+{% set border_color = color ~ "-600" %}
+{% set on_close = "closeModalAndRefresh();" %}
+
+{% block content %}
+<p class="text-sm text-gray-400 mb-1">{{ display_name }}</p>
+<p class="text-sm text-gray-300 mb-4">{{ status_text }}</p>
+{% if is_loaded %}
+<div class="mt-2 mb-4 p-3 rounded border border-yellow-600 bg-yellow-900 bg-opacity-25">
+    <p class="text-sm text-yellow-300 font-bold mb-1">⚠ This model is currently loaded.</p>
+    <p class="text-xs text-gray-300">
+        The running process is still using the previous launch args. Unload now to apply
+        the new configuration on next load, or keep the prior load running.
+    </p>
+</div>
+<div class="flex gap-2">
+    <button onclick="closeModalAndRefresh();"
+            class="flex-1 px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white font-bold transition-colors">
+        Keep prior load
+    </button>
+    <button hx-get="/api/unload-confirm?{{ {'model': model_name}|urlencode }}"
+            hx-target="#modal-container" hx-swap="innerHTML"
+            class="flex-1 px-4 py-2 rounded bg-yellow-600 hover:bg-yellow-500 text-white font-bold transition-colors">
+        Unload now
+    </button>
+</div>
+{% else %}
+<button onclick="closeModalAndRefresh();"
+        class="w-full px-4 py-2 rounded bg-{{ color }}-600 hover:bg-{{ color }}-500 text-white font-bold transition-colors">
+    OK
+</button>
+{% endif %}
+<script>
+function refreshModelList() {
+    setTimeout(() => {
+        htmx.ajax('GET', '/api/model-list', { target: '#models-container', swap: 'innerHTML' });
+    }, 100);
+}
+function closeModalAndRefresh() {
+    document.getElementById('modal').remove();
+    refreshModelList();
+}
+refreshModelList();
+</script>
+{% endblock %}

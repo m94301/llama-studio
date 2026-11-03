@@ -1,0 +1,4 @@
+<div class="text-center py-8 {{ 'text-yellow-400' if warn else 'text-gray-400' }}">
+    <p>{{ message }}</p>
+    {% if hint %}<p class="text-sm text-gray-400 mt-2">{{ hint }}</p>{% endif %}
+</div>
